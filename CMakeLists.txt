@@ -316,6 +316,22 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${dispatch_threads_shader_header}")
+
+set(draw_args_shader_source "${gpu_tiler_shader_dir}/draw_args_convert.comp")
+set(draw_args_shader_spv "${gpu_tiler_generated_dir}/draw_args_convert.spv")
+set(draw_args_shader_header "${gpu_tiler_generated_dir}/draw_args_convert_spv.h")
+add_custom_command(
+	OUTPUT "${draw_args_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${draw_args_shader_spv}" "${draw_args_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${draw_args_shader_spv}
+	        -DOUTPUT=${draw_args_shader_header} -DSYMBOL=DRAW_ARGS_CONVERT_SPV
+	        -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${draw_args_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${draw_args_shader_header}")
 foreach(shader_name IN ITEMS color_clear color_clear_store color_clear_fill)
 	set(shader_source "${gpu_tiler_shader_dir}/${shader_name}.comp")
 	set(shader_spv "${gpu_tiler_generated_dir}/${shader_name}.spv")
@@ -777,8 +793,16 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
 	add_test(NAME pm4_lookahead_prefetch
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pm4-lookahead-only)
+	add_test(NAME indirect_draw_gpu_args
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-draw-args-only)
 	add_test(NAME gpu_flat_copy
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-flat-copy-only)
+	add_test(NAME feed_idle_gpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --feed-idle-gpu-only)
+	add_test(NAME guest_ordered_barriers
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --guest-ordered-barriers-only)
+	add_test(NAME native_indirect_dispatch
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --native-indirect-only)
 	add_test(NAME gpu_tiler
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
 	add_test(NAME image_transfer_layout

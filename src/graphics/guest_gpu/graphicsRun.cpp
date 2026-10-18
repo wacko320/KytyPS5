@@ -209,6 +209,8 @@ void CommandProcessor::Reset() {
 	m_index_buffer_size                = 0;
 	m_index_base_addr                  = 0;
 	m_num_instances                    = 1;
+	m_num_instances_capture            = {};
+	m_num_instances_unknown            = false;
 	m_predicate_skip                   = false;
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
 	m_draw_indirect_args_base_addr     = 0;
@@ -237,6 +239,8 @@ void CommandProcessor::CopyRegisterState(const CommandProcessor& other) {
 	m_draw_indirect_args_base_addr     = other.m_draw_indirect_args_base_addr;
 	m_dispatch_indirect_args_base_addr = other.m_dispatch_indirect_args_base_addr;
 	m_num_instances                    = other.m_num_instances;
+	m_num_instances_capture            = other.m_num_instances_capture;
+	m_num_instances_unknown            = other.m_num_instances_unknown;
 	m_predicate_skip                   = other.m_predicate_skip;
 }
 
@@ -320,6 +324,7 @@ void CommandProcessor::WriteConstRam(uint32_t offset, const uint32_t* src, uint3
 
 void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_num) {
 	const auto bytes = static_cast<size_t>(dw_num) * 4;
+	EndThreadWindow();
 	m_renderer.GpuThreadGuestWrite(reinterpret_cast<uint64_t>(dst), bytes, [&](void* to) {
 		memcpy(to, m_const_ram + offset / 4, bytes);
 	});
@@ -376,6 +381,9 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	// A CPU write before the one this wait observed is ordered before the commands after it, also
 	// when the wait passes on arrival (a resumed wait begins a new slice as well).
 	m_renderer.GetBufferCache().Epoch().Acquire();
+	// So is the GPU work before it: labels are written when their packet is processed, before
+	// the work they follow completes on the host GPU.
+	RequestGuestBarrier(GuestSync::WaitRegMem);
 }
 
 template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, uint32_t, uint32_t,
@@ -406,6 +414,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	if (m_renderer.TryWriteGpuOrdered(reinterpret_cast<uint64_t>(dst), data, bytes)) {
 		return;
 	}
+	EndThreadWindow();
 	m_renderer.GpuThreadGuestWrite(reinterpret_cast<uint64_t>(dst), bytes, [&](void* to) {
 		auto* words = static_cast<uint32_t*>(to);
 		if (write_one_address) {
@@ -425,6 +434,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		     num_bytes);
 	}
 	const auto value = Sync::ReadReferenceClock();
+	EndThreadWindow();
 	m_renderer.GpuThreadGuestWrite(dst_address, num_bytes,
 	                               [&](void* to) { std::memcpy(to, &value, num_bytes); });
 	static std::atomic<uint32_t> clock_log_count {0};
@@ -438,6 +448,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 void CommandProcessor::WriteLodStats(void* dst, uint32_t num_bytes) {
 	// No statistics are gathered: the buffer reads as zero, with its first dword (the ready
 	// label) set. Hack?
+	EndThreadWindow();
 	m_renderer.GpuThreadGuestWrite(reinterpret_cast<uint64_t>(dst), num_bytes, [&](void* to) {
 		memset(to, 0, num_bytes);
 		if (num_bytes >= sizeof(uint32_t)) {
@@ -453,6 +464,8 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
                                uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes,
                                uint8_t wait_for_previous, uint8_t write_confirm,
                                uint8_t block_engine) {
+	// The command processor writes memory: arguments scanned ahead may change.
+	EndThreadWindow();
 	EXIT_NOT_IMPLEMENTED(engine > 1);
 	if (num_bytes == 0) {
 		return;
@@ -625,6 +638,8 @@ bool GuestGpu::Process(Submission& submission) {
 		cp.SetSubmitId(++m_submit_id);
 		cp.ResetDeCe();
 		cp.SetFlip({});
+		// A submission does not overlap the work submitted before it.
+		cp.RequestGuestBarrier(CommandProcessor::GuestSync::Submission);
 	}
 
 	cp.BufferInit();
@@ -734,6 +749,7 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	if (m_lookahead != nullptr) {
 		m_lookahead->Reset();
 	}
+	EndThreadWindow();
 	// Every command-buffer slice begins an epoch: CPU writes made before it reach the buffers
 	// once here, so its read bindings only translate guest addresses (CoherenceEpoch).
 	m_renderer.GetBufferCache().Epoch().Acquire();
@@ -911,7 +927,26 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 		num_instances = 1;
 	}
 
-	m_num_instances = num_instances;
+	m_num_instances         = num_instances;
+	m_num_instances_capture = {};
+	m_num_instances_unknown = false;
+}
+
+void CommandProcessor::SetIndirectInstances(uint32_t instance_count) {
+	m_num_instances         = instance_count;
+	m_num_instances_capture = {};
+	m_num_instances_unknown = false;
+}
+
+uint32_t CommandProcessor::NumInstances() {
+	// InstanceCountMayBeRead found no reader before the state is set again.
+	EXIT_IF(m_num_instances_unknown);
+	if (m_num_instances_capture.tick != 0) {
+		m_num_instances = m_renderer.GetRenderExecutor().ReadCapturedInstances(
+		    m_num_instances_capture);
+		m_num_instances_capture = {};
+	}
+	return m_num_instances;
 }
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
@@ -968,7 +1003,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
-		args.instance_count = m_num_instances;
+		args.instance_count = NumInstances();
 	}
 	if (GraphicsRunDebugDumpEnabled() && (args.base_vertex != 0 || args.first_instance != 0)) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
@@ -1008,6 +1043,140 @@ static void PatchIndirectDrawOffsets(CommandProcessor& cp, IndirectDrawRegisters
 	write(registers.index_offset, first_index);
 }
 
+bool CommandProcessor::InstanceCountMayBeRead() const {
+	if (m_packet_commands.empty()) {
+		// Not executing a packet of a stream (tests): nothing to scan.
+		return true;
+	}
+	constexpr uint32_t MaxScanWords = 4096;
+	const auto         total        = static_cast<uint32_t>(m_packet_commands.size());
+	auto     scan   = m_packet_offset + Pm4::PacketSizeDw(m_packet_commands[m_packet_offset]);
+	uint32_t budget = MaxScanWords;
+	// Mirrors ProcessPm4's framing, as the lookahead does.
+	while (scan < total && budget != 0) {
+		const auto* packet    = m_packet_commands.data() + scan;
+		const auto  remaining = total - scan;
+		const auto  header    = packet[0];
+		uint32_t    length    = 1;
+		const bool  one_dword = header == 0x80000000u || Pm4::PacketSizeDw(header) == 1u;
+		if (!one_dword) {
+			if (remaining < 2) {
+				return true;
+			}
+			length = (header >> 30u) == 0u   ? ((header >> 16u) & 0x3fffu) + 2u
+			         : (header >> 30u) == 3u ? Pm4::PacketSizeDw(header)
+			                                 : 0u;
+			if (length == 0 || length > remaining) {
+				return true;
+			}
+		}
+		const bool skipped = one_dword || (header >> 30u) == 0u ||
+		                     ((header & 1u) != 0 && m_predicate_skip);
+		if (!skipped) {
+			const auto exact = header & ~1u;
+			switch ((exact >> 8u) & 0xffu) {
+				case Pm4::IT_NUM_INSTANCES:
+					if (exact == 0xc0002f00u) {
+						return false;
+					}
+					return true;
+				case Pm4::IT_DRAW_INDIRECT:
+				case Pm4::IT_DRAW_INDEX_INDIRECT:
+					// Either path sets the state.
+					if (exact == 0xc0032400u || exact == 0xc0032500u) {
+						return false;
+					}
+					return true;
+				case Pm4::IT_DRAW_INDEX_2:
+				case Pm4::IT_DISPATCH_DRAW_PREAMBLE:
+					// The long form takes its own instance count when it is not 0.
+					if (exact == 0xc0073a00u && packet[7] != 0) {
+						break;
+					}
+					return true;
+				default:
+					switch (Pm4Lookahead::Classify(packet)) {
+						case Pm4Lookahead::PacketKind::Register:
+						case Pm4Lookahead::PacketKind::Transparent:
+						case Pm4Lookahead::PacketKind::Dispatch: break;
+						case Pm4Lookahead::PacketKind::Draw:
+						case Pm4Lookahead::PacketKind::Barrier: return true;
+					}
+					break;
+			}
+		}
+		scan += length;
+		budget -= std::min(budget, length);
+	}
+	return true;
+}
+
+CommandProcessor::IndirectArgsRoute CommandProcessor::DrawIndirectGpu(uint64_t args_addr,
+                                                                      bool indexed, bool last) {
+	using Common::FrameProfiler::Counter;
+	Common::FrameProfiler::Add(Counter::DrawIndirectDraws);
+	const uint64_t size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+	// A CPU read of arguments the GPU may have written waits for that work to finish. Arguments
+	// outside mapped guest memory no GPU work wrote.
+	if (!m_renderer.IsMapped(args_addr, size) ||
+	    !m_renderer.GetBufferCache().IsRegionGpuModified(args_addr, size)) {
+		return IndirectArgsRoute::Cpu;
+	}
+	Common::FrameProfiler::Add(Counter::DrawIndirectArgsGpuModified);
+	const auto refuse = [](Counter reason) {
+		Common::FrameProfiler::Add(reason);
+		Common::FrameProfiler::Add(Counter::DrawIndirectCpuArgs);
+		return IndirectArgsRoute::Refused;
+	};
+	if (m_renderer.GetTextureCache().IsRegionGpuModified(args_addr, size)) {
+		// A GPU-written image holds them, not the buffer the draw would read.
+		return refuse(Counter::DrawIndirectBlockedImage);
+	}
+	if ((args_addr & 3u) != 0) {
+		return refuse(Counter::DrawIndirectBlockedAlignment);
+	}
+	auto&       executor = m_renderer.GetRenderExecutor();
+	const bool  capture  = last && InstanceCountMayBeRead();
+	GpuArgsDraw draw;
+	if (indexed) {
+		uint64_t index_size = 0;
+		switch (m_index_type_and_size) {
+			case 0: index_size = 2; break;
+			case 1: index_size = 4; break;
+			case 2: index_size = 1; break;
+			default: EXIT("unknown index_type_and_size: %u\n", m_index_type_and_size);
+		}
+		if (m_index_buffer_size == 0) {
+			// No bound range for the draw's first index and count.
+			return refuse(Counter::DrawIndirectBlockedIndexSize);
+		}
+		if (!m_renderer.IsMapped(m_index_base_addr, m_index_buffer_size * index_size)) {
+			return refuse(Counter::DrawIndirectBlockedIndexRange);
+		}
+		draw = executor.DrawIndex(
+		    m_submit_id, CurrentBuffer(),
+		    {.index_addr          = reinterpret_cast<const void*>(m_index_base_addr),
+		     .index_type_and_size = m_index_type_and_size,
+		     .offset_source       = DrawOffsetSource::IndirectArgs,
+		     .gpu_args            = {args_addr, capture},
+		     .index_buffer_size   = m_index_buffer_size});
+	} else {
+		draw = executor.DrawAuto(m_submit_id, CurrentBuffer(),
+		                         {.offset_source = DrawOffsetSource::IndirectArgs,
+		                          .gpu_args      = {args_addr, capture}});
+	}
+	if (!draw.recorded) {
+		// The renderer counted why.
+		Common::FrameProfiler::Add(Counter::DrawIndirectCpuArgs);
+		return IndirectArgsRoute::Refused;
+	}
+	Common::FrameProfiler::Add(Counter::DrawIndirectGpuArgs);
+	EXIT_IF(capture != (draw.instances.tick != 0));
+	m_num_instances_capture = draw.instances;
+	m_num_instances_unknown = !capture;
+	return IndirectArgsRoute::Gpu;
+}
+
 void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
                                     uint32_t draw_initiator, bool indexed) {
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
@@ -1021,6 +1190,16 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
+	// A count GPU work wrote: its read waits for that work. The draws then read their arguments
+	// on the CPU as well (vkCmdDrawIndexedIndirectCount would take both on the GPU).
+	const auto count_vaddr = reinterpret_cast<uint64_t>(count_addr);
+	const bool gpu_count =
+	    count_addr != nullptr && m_renderer.IsMapped(count_vaddr, sizeof(uint32_t)) &&
+	    m_renderer.GetBufferCache().IsRegionGpuModified(count_vaddr, sizeof(uint32_t));
+	// Arguments patched into user SGPRs are needed on the CPU.
+	const bool sgpr_destination = registers.vertex_offset != Pm4::SH_NOP ||
+	                              registers.instance_offset != Pm4::SH_NOP ||
+	                              registers.index_offset != Pm4::SH_NOP;
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
 		draw_count = *count_addr;
@@ -1047,15 +1226,34 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 	}
 
+	// Each draw sets the NUM_INSTANCES state the next one replaces: only the last one's may be
+	// read.
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto args_addr = m_draw_indirect_args_base_addr + data_offset +
 		                       static_cast<uint64_t>(i) * stride_in_bytes;
+
+		if (gpu_count || sgpr_destination) {
+			using Common::FrameProfiler::Counter;
+			Common::FrameProfiler::Add(Counter::DrawIndirectDraws);
+			const uint64_t size =
+			    indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+			if (m_renderer.IsMapped(args_addr, size) &&
+			    m_renderer.GetBufferCache().IsRegionGpuModified(args_addr, size)) {
+				Common::FrameProfiler::Add(Counter::DrawIndirectArgsGpuModified);
+				Common::FrameProfiler::Add(gpu_count ? Counter::DrawIndirectBlockedGpuCount
+				                                     : Counter::DrawIndirectBlockedSgprDestination);
+				Common::FrameProfiler::Add(Counter::DrawIndirectCpuArgs);
+			}
+		} else if (DrawIndirectGpu(args_addr, indexed, i + 1 == draw_count) ==
+		           IndirectArgsRoute::Gpu) {
+			continue;
+		}
 
 		if (!indexed) {
 			auto* args = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
 			PatchIndirectDrawOffsets(*this, registers, args->start_vertex_location,
 			                         args->start_instance_location, 0);
-			m_num_instances = args->instance_count;
+			SetIndirectInstances(args->instance_count);
 			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
 			               .instance_count = args->instance_count,
 			               .first_vertex   = args->start_vertex_location,
@@ -1073,7 +1271,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 		const uint32_t index_count =
 		    (m_index_buffer_size != 0
-		         ? std::min(args->index_count_per_instance, m_index_buffer_size)
+		         ? std::min(args->index_count_per_instance,
+		                    m_index_buffer_size -
+		                        std::min(args->start_index_location, m_index_buffer_size))
 		         : args->index_count_per_instance);
 		if (GraphicsRunDebugDumpEnabled() && index_count != args->index_count_per_instance) {
 			static std::atomic<uint32_t> log_count {0};
@@ -1084,7 +1284,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			}
 		}
 
-		m_num_instances = args->instance_count;
+		SetIndirectInstances(args->instance_count);
 		DrawIndex({.index_count    = index_count,
 		           .index_addr     = index_addr,
 		           .instance_count = args->instance_count,
@@ -1120,21 +1320,70 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			}
 		}
 
+		auto batch = PlanThreadBatch(false);
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
-		                                              thread_group_y, thread_group_z, mode, IsAsyncComputeQueue());
+		                                              thread_group_y, thread_group_z, mode,
+		                                              IsAsyncComputeQueue(), &batch);
+		NoteThreadBatch(batch);
 	}
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	const bool threads = (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	auto       batch   = PlanThreadBatch(threads);
 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode,
-	                                                IsAsyncComputeQueue());
+	                                                IsAsyncComputeQueue(), &batch);
+	NoteThreadBatch(batch);
+}
+
+ThreadDispatchBatch CommandProcessor::PlanThreadBatch(bool indirect_threads) {
+	ThreadDispatchBatch batch;
+	if (m_packet_commands.empty()) {
+		// Not executing a packet of a stream (tests): no window to scan.
+		return batch;
+	}
+	auto&      window = m_thread_window;
+	const auto offset = m_packet_offset;
+	if (window.valid && window.commands == m_packet_commands.data() && offset >= window.begin &&
+	    offset < window.end) {
+		batch.serial = window.serial;
+		return batch;
+	}
+	// A dispatch heads a window when a guest barrier precedes it: the batch then shares that
+	// barrier. Later in a window, only an indirect thread-dimension dispatch starts a batch.
+	auto& scheduler = GetScheduler();
+	if (!indirect_threads && !scheduler.GuestBarrierPending() && scheduler.UnorderedCompute()) {
+		return batch;
+	}
+	if (m_thread_scan == nullptr) {
+		m_thread_scan = std::make_unique<Pm4ThreadDispatchScan>(m_renderer, m_interrupt_event_id);
+	}
+	const auto t0  = Common::FrameProfiler::Start();
+	const auto end = m_thread_scan->Scan(*this, m_packet_commands, offset, m_thread_requests);
+	if (t0 != 0) {
+		Common::FrameProfiler::Add(Common::FrameProfiler::Counter::ComputeIndirectThreadScans);
+		Common::FrameProfiler::Add(Common::FrameProfiler::Counter::ComputeIndirectThreadScanTime,
+		                           Common::FrameProfiler::Ticks() - t0);
+	}
+	window         = {m_packet_commands.data(), offset, end, 0, true};
+	batch.requests = m_thread_requests;
+	return batch;
+}
+
+void CommandProcessor::NoteThreadBatch(const ThreadDispatchBatch& batch) {
+	if (batch.requests.empty()) {
+		return;
+	}
+	// A dispatch that returned before recording the batch leaves the window to the next one.
+	m_thread_window.serial = batch.serial;
+	m_thread_window.valid  = batch.serial != 0;
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
-		args.instance_count = m_num_instances;
+		args.instance_count = NumInstances();
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 }
@@ -1199,6 +1448,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		auto  data = static_cast<uint32_t>(value);
 		EXIT_IF(dst == nullptr);
 		(void)command.Handle();
+		EndThreadWindow();
 		m_renderer.GpuThreadGuestWrite(reinterpret_cast<uint64_t>(dst), sizeof(data),
 		                               [&](void* to) { std::memcpy(to, &data, sizeof(data)); });
 
@@ -1213,6 +1463,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				if (eop_event_type == 0x2f && cache_action == 0x00 && event_index == 0x06) {
 					auto* dst = static_cast<uint32_t*>(dst_gpu_addr);
 					SynchronizeGpu();
+					EndThreadWindow();
 					m_renderer.GpuThreadGuestWrite(
 					    reinterpret_cast<uint64_t>(dst), uint64_t {value >> 16u} * sizeof(uint32_t),
 					    [&](void* to) {
@@ -1247,6 +1498,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					EXIT_IF(dst == nullptr);
 					(void)command.Handle();
+					EndThreadWindow();
 					m_renderer.GpuThreadGuestWrite(
 					    reinterpret_cast<uint64_t>(dst), sizeof(value),
 					    [&](void* to) { std::memcpy(to, &value, sizeof(value)); });
@@ -1352,18 +1604,21 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 
 void CommandProcessor::EmitGlobalBarrier() {
 	Common::LockGuard lock(m_renderer.GetMutex());
+	GetScheduler().GlobalBarrier();
+}
 
-	vk::MemoryBarrier2 barrier {};
-	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
-	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
-
-	vk::DependencyInfo dependency {};
-	dependency.memoryBarrierCount = 1;
-	dependency.pMemoryBarriers    = &barrier;
-	GetScheduler().EndRendering();
-	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+void CommandProcessor::RequestGuestBarrier(GuestSync sync) {
+	using Common::FrameProfiler::Counter;
+	static constexpr Counter Counters[] = {
+	    Counter::GuestSyncPacketsPartialFlush, Counter::GuestSyncPacketsOther,
+	    Counter::GuestSyncPacketsReleaseMem,   Counter::GuestSyncPacketsAcquireMem,
+	    Counter::GuestSyncPacketsWaitRegMem,   Counter::GuestSyncSubmissions};
+	static_assert(std::size(Counters) == static_cast<size_t>(GuestSync::Submission) + 1);
+	Common::FrameProfiler::Add(Counters[static_cast<uint32_t>(sync)]);
+	Common::FrameProfiler::Rec(Common::FrameProfiler::Event::GuestSync,
+	                           static_cast<uint64_t>(sync));
+	GetScheduler().RequestGuestBarrier();
+	EndThreadWindow();
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
@@ -1389,7 +1644,10 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 		// CsPartialFlush, GsPartialFlush, PsPartialFlush.
 		case 0x00000007:
 		case 0x0000000f:
-		case 0x00000010: EmitGlobalBarrier(); break;
+		case 0x00000010:
+			RequestGuestBarrier(GuestSync::PartialFlush);
+			EmitGlobalBarrier();
+			break;
 		// CbDbDataWritebackInvalidate, CbDataWritebackInvalidate.
 		case 0x00000016:
 		case 0x00000031:
@@ -1397,6 +1655,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				EXIT("unknown event type: 0x%08" PRIx32 ", 0x%08" PRIx32 "\n", event_type,
 				     event_index);
 			}
+			RequestGuestBarrier(GuestSync::CacheEvent);
 			EmitGlobalBarrier();
 			break;
 		// DbDataWritebackInvalidate, DbMetadataWritebackInvalidate, CbMetadataWritebackInvalidate.
@@ -1407,6 +1666,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				EXIT("unknown event type: 0x%08" PRIx32 ", 0x%08" PRIx32 "\n", event_type,
 				     event_index);
 			}
+			RequestGuestBarrier(GuestSync::CacheEvent);
 			EmitGlobalBarrier();
 			break;
 		case 0x0000000d:
@@ -1443,6 +1703,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			constexpr uint32_t db_count     = 16u;
 			constexpr uint64_t results_size = uint64_t {db_count} * 2u * sizeof(uint64_t);
 			const auto         value        = ready_bit | m_synthetic_occlusion_counter;
+			EndThreadWindow();
 			m_renderer.GpuThreadGuestWrite(event_address, results_size, [&](void* to) {
 				auto* results = static_cast<volatile uint64_t*>(to);
 				for (uint32_t db = 0; db < db_count; db++) {
@@ -1482,6 +1743,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	}
 
 	EXIT_IF(dst_gpu_addr == nullptr);
+	EndThreadWindow();
 	m_renderer.GpuThreadGuestWrite(reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value),
 	                               [&](void* to) { std::memcpy(to, &value, sizeof(value)); });
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
@@ -1509,6 +1771,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 		EXIT("unknown event type\n");
 	}
 	EXIT_IF(dst_gpu_addr == nullptr);
+	EndThreadWindow();
 	m_renderer.GpuThreadGuestWrite(reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value),
 	                               [&](void* to) { std::memcpy(to, &value, sizeof(value)); });
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,

@@ -1,0 +1,40 @@
+#version 450
+
+// DRAW_INDIRECT / DRAW_INDEX_INDIRECT arguments that earlier GPU work in the same submission may
+// still be writing. Copy them into a slot for vkCmdDraw*Indirect, clamping an indexed draw's
+// index count so first index + count stays within INDEX_BUFFER_SIZE, as the CPU path does, and
+// zeroing the vertex and instance offsets of a draw whose shader takes them from patched user
+// SGPRs instead (native fetch), as the CPU path draws it; the other dwords are copied unchanged.
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer draw_args {
+    uint args[];
+};
+
+layout(std430, binding = 1) writeonly buffer converted_args {
+    uint converted[];
+};
+
+layout(push_constant) uniform constants {
+    uint args_index;
+    uint converted_index;
+    uint dwords;
+    // 0: no clamp.
+    uint index_limit;
+    // The first offset dword to zero (base vertex or first vertex); 0: none.
+    uint offsets_from;
+} pc;
+
+void main() {
+    for (uint i = 0u; i < pc.dwords; i++) {
+        uint value = args[pc.args_index + i];
+        if (i == 0u && pc.index_limit != 0u) {
+            value = min(value, pc.index_limit - min(args[pc.args_index + 2u], pc.index_limit));
+        }
+        if (pc.offsets_from != 0u && i >= pc.offsets_from) {
+            value = 0u;
+        }
+        converted[pc.converted_index + i] = value;
+    }
+}

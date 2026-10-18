@@ -3,7 +3,11 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/frameProfiler.h"
+#include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+
+#include <cinttypes>
+#include <cstdio>
 
 namespace Libs::Graphics {
 
@@ -48,14 +52,32 @@ void MasterSemaphore::Wait(uint64_t tick, Common::FrameProfiler::WaitSite site,
 	}
 
 	const Common::FrameProfiler::ScopedWait profile(false, site, location, tick);
+	// Counted here, not in WaitUnprofiled: the priority thread waits there on every tick.
+	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
+	                                         Common::DebugCounters::Counter::GpuWaitNs);
+	WaitUnprofiled(tick);
+}
+
+void MasterSemaphore::WaitUnprofiled(uint64_t tick) {
+	if (IsFree(tick)) {
+		return;
+	}
 	vk::SemaphoreWaitInfo wait_info {};
 	wait_info.semaphoreCount = 1;
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
-	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
-	                                         Common::DebugCounters::Counter::GpuWaitNs);
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	if (result != vk::Result::eSuccess) {
+		// The priority thread waits here on every submitted tick: name it before exiting, as the
+		// recording thread's own failure report may come later.
+		LOGF("vkWaitSemaphores failed: %s (%d), tick=%" PRIu64 " known=%" PRIu64 "\n",
+		     vk::to_string(result).c_str(), static_cast<int>(result), tick, KnownGpuTick());
+		std::printf("vkWaitSemaphores failed: %s (%d), tick=%" PRIu64 " known=%" PRIu64 "\n",
+		            vk::to_string(result).c_str(), static_cast<int>(result), tick,
+		            KnownGpuTick());
+		std::fflush(stdout);
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();
 }

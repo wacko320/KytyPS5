@@ -260,6 +260,8 @@ enum class Kind : uint8_t { Sum, Max };
 	X(ComputeIndirectThreadFallbackUpload, Count, Sum, "compute: alone, args uploaded or joined")  \
 	X(ComputeIndirectThreadFallbackWritten, Count, Sum, "compute: alone, args GPU-written since")  \
 	X(ThreadCountRingWaits, Count, Sum, "compute: thread-count ring segment waits")                \
+	X(ComputeLdsBarriers, Count, Sum, "compute: barriers between LDS-storage dispatches")          \
+	X(ComputeLdsIndirectUnsized, Count, Sum, "compute: LDS storage bound whole (GPU-sized)")      \
 	X(GlobalBarriers, Count, Sum, "barriers: global barriers (guest packets, requests)")           \
 	X(GuestSyncPacketsPartialFlush, Count, Sum, "guest sync: partial flushes")                     \
 	X(GuestSyncPacketsReleaseMem, Count, Sum, "guest sync: releases (RELEASE_MEM, EOP, EOS)")      \
@@ -279,6 +281,7 @@ enum class Kind : uint8_t { Sum, Max };
 	X(DrawIndirectBlockedIndexRange, Count, Sum, "draw indirect: CPU, index range unmapped")       \
 	X(DrawIndirectBlocked8Bit, Count, Sum, "draw indirect: CPU, 8-bit indices")                    \
 	X(DrawIndirectBlockedGpuCount, Count, Sum, "draw indirect: CPU, MULTI count GPU-modified")     \
+	X(DrawIndirectBlockedSgprDestination, Count, Sum, "draw indirect: CPU, offsets into SGPRs")   \
 	X(DrawIndirectBlockedSpecial, Count, Sum, "draw indirect: CPU, metadata/copy/resolve draw")    \
 	X(DrawIndirectBlockedTopology, Count, Sum, "draw indirect: CPU, rect/quad/patch topology")     \
 	X(DrawIndirectBlockedRestart, Count, Sum, "draw indirect: CPU, non-native restart index")      \

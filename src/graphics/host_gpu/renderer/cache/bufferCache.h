@@ -131,6 +131,19 @@ public:
 	[[nodiscard]] uint64_t WriteNotes() const;
 	// Any thread: whether a watched range overlaps the range.
 	[[nodiscard]] bool     OverlapsWatchedWrites(uint64_t vaddr, uint64_t size) const;
+	// GPU thread. Ranges (vaddr, size) a caller has just read on the GPU for commands it records
+	// later, and needs unchanged until then: each later note of a possible change marks the ones
+	// it overlaps. A written binding (bound now, or re-noted once its command is recorded) and an
+	// untracked store keep the change serial they got (a caller tells the writes of its own
+	// command from earlier ones); an upload, a buffer creation or join, a command-processor write
+	// or an image sync is any other write. WatchUnchanged replaces the set; index i is ranges[i].
+	struct RangeChanges {
+		uint64_t first_gpu_write = 0; // change serial, 0: none
+		bool     other_write     = false;
+	};
+	void WatchUnchanged(std::span<const std::pair<uint64_t, uint64_t>> ranges);
+	[[nodiscard]] RangeChanges UnchangedRangeChanges(size_t index) const;
+	[[nodiscard]] uint64_t     ChangeSerial() const noexcept { return m_change_serial; }
 	// GPU thread: a command-processor write into pages the GPU owns, recorded after the GPU work
 	// before it instead of draining the GPU to merge it into guest memory. False (nothing
 	// recorded) unless every tracker page of the range is GPU-dirty.
@@ -189,7 +202,9 @@ private:
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	// Moves the generation of the watched ranges overlapping a range whose buffer bytes may
 	// have changed (WriteGeneration).
-	void NoteBufferWrite(uint64_t vaddr, uint64_t size);
+	// `gpu`: a written binding (WatchUnchanged).
+	void NoteBufferWrite(uint64_t vaddr, uint64_t size, bool gpu = false);
+	void NoteUnchangedWrite(uint64_t vaddr, uint64_t size, bool gpu);
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
@@ -376,6 +391,19 @@ private:
 	uint64_t                                          m_write_watch_largest = 0;
 	uint64_t                                          m_write_generation    = 0;
 	uint64_t                                          m_write_notes         = 0;
+	// GPU thread only. WatchUnchanged's ranges sorted by begin, their changes by index, and the
+	// span all of them cover.
+	struct UnchangedRange {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		size_t   index = 0;
+	};
+	std::vector<UnchangedRange>                       m_unchanged;
+	std::vector<RangeChanges>                         m_unchanged_changes;
+	uint64_t                                          m_unchanged_begin   = 0;
+	uint64_t                                          m_unchanged_end     = 0;
+	uint64_t                                          m_unchanged_largest = 0;
+	uint64_t                                          m_change_serial     = 0;
 };
 
 } // namespace Libs::Graphics

@@ -22,6 +22,14 @@ struct GraphicContext;
                                                           const DepthFormatPolicy& policy,
                                                           bool has_stencil, uint32_t samples);
 
+namespace HW {
+class Context;
+} // namespace HW
+
+// Whether the registers ask for a depth or stencil copy draw (DB_RENDER_OVERRIDE forcing the read
+// surface's state into a different write surface): RenderExecutor::DepthStencilCopy runs it.
+[[nodiscard]] bool DepthStencilCopyRequested(const HW::Context& hw);
+
 inline constexpr bool depth_htile_stencil_acceleration_compatible(bool has_stencil, bool has_htile,
                                                                   bool htile_stencil_disabled) {
 	return !has_stencil || htile_stencil_disabled || has_htile;

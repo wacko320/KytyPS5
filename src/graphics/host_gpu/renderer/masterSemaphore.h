@@ -35,6 +35,8 @@ public:
 	void Wait(uint64_t                        tick,
 	          Common::FrameProfiler::WaitSite site     = Common::FrameProfiler::WaitSite::Other,
 	          std::source_location            location = std::source_location::current());
+	// As Wait, not counted as a frame-profiler wait: for a thread that only watches the GPU.
+	void WaitUnprofiled(uint64_t tick);
 
 private:
 	GraphicContext&       m_graphics;

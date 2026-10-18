@@ -437,6 +437,7 @@ void BufferCache::CommitWrittenRanges() {
 	// the one it was noted in).
 	for (const auto [vaddr, size]: m_written_pending) {
 		NoteOpenWrite(vaddr, size);
+		NoteUnchangedWrite(vaddr, size, true);
 	}
 	if (m_writeback_hot_pages.empty()) {
 		m_written_pending.clear();
@@ -1092,6 +1093,9 @@ const RangeSet& BufferCache::OpenWrites() {
 }
 
 void BufferCache::NoteUntrackedWrites() {
+	if (!m_unchanged.empty()) {
+		NoteUnchangedWrite(m_unchanged_begin, m_unchanged_end - m_unchanged_begin, true);
+	}
 	m_untracked_write_tick = m_scheduler.CurrentTick();
 	m_scheduler.RequestHostBarrier();
 }
@@ -1441,7 +1445,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	if (is_written) {
 		NoteOpenWrite(vaddr, size);
-		NoteBufferWrite(vaddr, size);
+		NoteBufferWrite(vaddr, size, true);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -1660,7 +1664,54 @@ bool BufferCache::OverlapsWatchedWrites(uint64_t vaddr, uint64_t size) const {
 	return false;
 }
 
-void BufferCache::NoteBufferWrite(uint64_t vaddr, uint64_t size) {
+void BufferCache::WatchUnchanged(std::span<const std::pair<uint64_t, uint64_t>> ranges) {
+	m_unchanged.clear();
+	m_unchanged_changes.assign(ranges.size(), {});
+	m_unchanged_begin   = UINT64_MAX;
+	m_unchanged_end     = 0;
+	m_unchanged_largest = 0;
+	for (size_t i = 0; i < ranges.size(); i++) {
+		const auto [vaddr, size] = ranges[i];
+		m_unchanged.push_back({vaddr, vaddr + size, i});
+		m_unchanged_begin   = std::min(m_unchanged_begin, vaddr);
+		m_unchanged_end     = std::max(m_unchanged_end, vaddr + size);
+		m_unchanged_largest = std::max(m_unchanged_largest, size);
+	}
+	std::sort(m_unchanged.begin(), m_unchanged.end(),
+	          [](const auto& a, const auto& b) { return a.begin < b.begin; });
+}
+
+BufferCache::RangeChanges BufferCache::UnchangedRangeChanges(size_t index) const {
+	EXIT_IF(index >= m_unchanged_changes.size());
+	return m_unchanged_changes[index];
+}
+
+void BufferCache::NoteUnchangedWrite(uint64_t vaddr, uint64_t size, bool gpu) {
+	m_change_serial++;
+	const auto end = vaddr + size;
+	if (m_unchanged.empty() || vaddr >= m_unchanged_end || end <= m_unchanged_begin) {
+		return;
+	}
+	// Ranges are at most m_unchanged_largest long: none beginning before `from` reaches vaddr.
+	const auto from  = vaddr > m_unchanged_largest ? vaddr - m_unchanged_largest : uint64_t {0};
+	const auto first =
+	    std::lower_bound(m_unchanged.begin(), m_unchanged.end(), from,
+	                     [](const auto& range, uint64_t at) { return range.begin < at; });
+	for (auto it = first; it != m_unchanged.end() && it->begin < end; ++it) {
+		if (it->end <= vaddr) {
+			continue;
+		}
+		auto& changes = m_unchanged_changes[it->index];
+		if (!gpu) {
+			changes.other_write = true;
+		} else if (changes.first_gpu_write == 0) {
+			changes.first_gpu_write = m_change_serial;
+		}
+	}
+}
+
+void BufferCache::NoteBufferWrite(uint64_t vaddr, uint64_t size, bool gpu) {
+	NoteUnchangedWrite(vaddr, size, gpu);
 	if (!m_write_watches_any.load(std::memory_order_relaxed)) {
 		return;
 	}

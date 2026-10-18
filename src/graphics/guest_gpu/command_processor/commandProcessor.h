@@ -15,6 +15,7 @@
 namespace Libs::Graphics {
 
 class Pm4Lookahead;
+class Pm4ThreadDispatchScan;
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
 
@@ -91,6 +92,25 @@ public:
 		return m_dispatch_indirect_args_base_addr;
 	}
 	void SetNumInstances(uint32_t num_instances);
+	// The NUM_INSTANCES state for a draw that takes it.
+	[[nodiscard]] uint32_t NumInstances();
+	// The NUM_INSTANCES state an indirect draw with CPU-read arguments leaves.
+	void SetIndirectInstances(uint32_t instance_count);
+	// Whether a draw may take its instance count from the NUM_INSTANCES state the indirect draw
+	// packet executing now leaves: true unless a NUM_INSTANCES packet or another indirect draw
+	// sets it first in the rest of the stream, before any draw or any packet the scan does not
+	// follow.
+	[[nodiscard]] bool InstanceCountMayBeRead() const;
+	// How an indirect draw took its arguments.
+	enum class IndirectArgsRoute {
+		Cpu,     // not GPU-modified: the CPU reads them cheaply
+		Refused, // GPU-modified, but the draw needs them on the CPU
+		Gpu,     // the draw is recorded with the GPU reading them
+	};
+	// Records the indirect draw at args_addr with its arguments read by the GPU, when they are
+	// GPU-modified and the draw allows it. `last`: the packet's last draw, whose instance count
+	// a later draw may read (InstanceCountMayBeRead, scanned only for a GPU-route draw).
+	[[nodiscard]] IndirectArgsRoute DrawIndirectGpu(uint64_t args_addr, bool indexed, bool last);
 	void DrawIndex(DrawIndexArgs args);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
 	void DrawIndexAuto(DrawAutoArgs args);
@@ -114,6 +134,18 @@ public:
 	void PrepareCpuFlip(uint64_t request_id);
 	void SynchronizeGpu();
 	void EmitGlobalBarrier();
+	// Guest synchronisation packets: each orders the next dispatch, or the next draw after
+	// unordered dispatches, after all earlier work (CommandScheduler::RequestGuestBarrier).
+	// Counted for the compute-ordering census.
+	enum class GuestSync {
+		PartialFlush,
+		CacheEvent,
+		ReleaseMem,
+		AcquireMem,
+		WaitRegMem,
+		Submission
+	};
+	void RequestGuestBarrier(GuestSync sync);
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
@@ -165,6 +197,13 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
+	// The thread-dimension batch for the dispatch packet executing now: a new one when the
+	// dispatch heads a guest synchronisation window or is an indirect thread-dimension dispatch
+	// the current batch does not cover (ThreadDispatchBatch::requests), else the covering one.
+	[[nodiscard]] ThreadDispatchBatch PlanThreadBatch(bool indirect_threads);
+	void                              NoteThreadBatch(const ThreadDispatchBatch& batch);
+	// The command processor writes memory: the batch's window ends.
+	void EndThreadWindow() noexcept { m_thread_window.valid = false; }
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
@@ -181,7 +220,12 @@ private:
 	uint64_t         m_draw_indirect_args_base_addr     = 0;
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;
 	// Persistent draw state: indirect draws update it for subsequent draws.
-	uint32_t m_num_instances = 1;
+	// One whose arguments the GPU reads leaves the count on the GPU: in m_num_instances_capture,
+	// read when a later draw needs it (NumInstances), or nowhere when the stream sets it again
+	// before any draw reads it (m_num_instances_unknown).
+	uint32_t            m_num_instances = 1;
+	DrawInstanceCapture m_num_instances_capture;
+	bool                m_num_instances_unknown = false;
 
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;
@@ -201,6 +245,17 @@ private:
 	// The packet a handler is executing, within its command buffer (empty outside ProcessPm4).
 	std::span<const uint32_t> m_packet_commands;
 	uint32_t                  m_packet_offset = 0;
+	// The span of the stream the last thread-dimension window scan covered, and its batch.
+	struct ThreadWindow {
+		const uint32_t* commands = nullptr;
+		uint32_t        begin    = 0;
+		uint32_t        end      = 0;
+		uint64_t        serial   = 0;
+		bool            valid    = false;
+	};
+	ThreadWindow                           m_thread_window;
+	std::unique_ptr<Pm4ThreadDispatchScan> m_thread_scan;
+	std::vector<ThreadDispatchRequest>     m_thread_requests;
 };
 
 } // namespace Libs::Graphics

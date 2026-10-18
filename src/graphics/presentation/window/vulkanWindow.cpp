@@ -621,6 +621,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.largePoints                          = VK_TRUE;
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                      = VK_TRUE;
+	// Optional: without it indirect draws read their arguments on the CPU.
+	device_features.drawIndirectFirstInstance = supported_features2.features.drawIndirectFirstInstance;
+	graphics.draw_indirect_first_instance_enabled =
+	    supported_features2.features.drawIndirectFirstInstance == VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;

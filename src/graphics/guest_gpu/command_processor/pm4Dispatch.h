@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <span>
 
 namespace Libs::Graphics {
 
@@ -35,6 +36,11 @@ void GraphicsInitJmpTables();
 void GraphicsInitJmpTablesCxIndirect();
 void GraphicsInitJmpTablesShIndirect();
 void GraphicsInitJmpTablesUcIndirect();
+
+// Whether the handler of an indirect register load (SET_CONTEXT_REG_INDIRECT,
+// SET_SH_REG_INDIRECT or SET_UCONFIG_REG_INDIRECT) runs to the end for these (offset, value)
+// pairs: it stops the emulator on a register it does not know.
+[[nodiscard]] bool IndirectRegistersKnown(uint32_t opcode, std::span<const uint32_t> pairs);
 
 uint32_t HwCtxSetRenderControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetDepthMetadataRegisters(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,

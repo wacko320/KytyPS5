@@ -81,6 +81,10 @@ public:
 		return image;
 	}
 	void MarkGpuWritten(ImageId id);
+	// Whether the GPU owns the image's contents: it wrote them last and no guest write or buffer
+	// write is pending over them (Image::SafeToDownload), so a GPU write that changes nothing
+	// leaves its state as it was.
+	[[nodiscard]] bool IsGpuOwned(ImageId id);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);

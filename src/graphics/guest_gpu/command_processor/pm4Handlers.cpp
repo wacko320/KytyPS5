@@ -1291,6 +1291,8 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0065800);
+	// Caches are coherent on the host; the acquire still orders the work after it.
+	cp.RequestGuestBarrier(CommandProcessor::GuestSync::AcquireMem);
 	return KYTY_PM4_LEN(cmd_id) - 1;
 }
 
@@ -1759,6 +1761,9 @@ KYTY_CP_OP_PARSER(CpOpEventWriteEop) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0044700);
+	// The label is written now, not when the work before it completes: the work after the
+	// release, whoever waits on the label, is ordered after that work.
+	cp.RequestGuestBarrier(CommandProcessor::GuestSync::ReleaseMem);
 
 	uint32_t cache_policy       = (buffer[0] >> 25u) & 0x3u;
 	uint32_t event_write_dest   = ((buffer[0] >> 23u) & 0x10u) | ((buffer[2] >> 16u) & 0x01u);
@@ -1781,6 +1786,7 @@ KYTY_CP_OP_PARSER(CpOpEventWriteEos) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0034802);
+	cp.RequestGuestBarrier(CommandProcessor::GuestSync::ReleaseMem);
 
 	uint32_t cache_policy       = (buffer[0] >> 25u) & 0x3u;
 	uint32_t event_write_dest   = 0;
@@ -1931,6 +1937,37 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw}, (control & (1u << 20u)) != 0);
 
 	return 3;
+}
+
+bool IndirectRegistersKnown(uint32_t opcode, std::span<const uint32_t> pairs) {
+	for (size_t i = 0; i + 1 < pairs.size(); i += 2) {
+		const auto raw_cmd_offset = pairs[i];
+		const auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
+		const auto value          = pairs[i + 1];
+		bool       known          = false;
+		switch (opcode) {
+			case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+				known = HwCtxIsFakeRegister(cmd_offset) || raw_cmd_offset == 0xffffffffu ||
+				        cmd_offset >= Pm4::CX_NUM ||
+				        g_hw_ctx_indirect_func[cmd_offset & (Pm4::CX_NUM - 1)] != nullptr ||
+				        (raw_cmd_offset == 0x24au && value == 0u);
+				break;
+			case Pm4::IT_SET_SH_REG_INDIRECT:
+				known = cmd_offset == Pm4::SH_NOP || raw_cmd_offset == 0xffffffffu ||
+				        (cmd_offset < Pm4::SH_NUM && g_hw_sh_indirect_func[cmd_offset] != nullptr);
+				break;
+			case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+				known = cmd_offset == Pm4::UC_NOP ||
+				        (cmd_offset < Pm4::UC_NUM &&
+				         g_hw_uc_indirect_func[cmd_offset & (Pm4::UC_NUM - 1)] != nullptr);
+				break;
+			default: break;
+		}
+		if (!known) {
+			return false;
+		}
+	}
+	return true;
 }
 
 KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
@@ -2220,6 +2257,9 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0061060);
+	// Also the bottom-of-pipe form without cache actions, which emits no barrier below: the label
+	// is written now, so only this barrier orders the release's work before the work after it.
+	cp.RequestGuestBarrier(CommandProcessor::GuestSync::ReleaseMem);
 
 	uint32_t cache_policy       = (buffer[0] >> 25u) & 0x3u;
 	uint32_t eop_event_type     = buffer[0] & 0x3fu;

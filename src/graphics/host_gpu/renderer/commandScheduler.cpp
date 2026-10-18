@@ -98,7 +98,8 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 }
 
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics, bool present)
-    : m_master(graphics), m_context(context), m_graphics(graphics), m_timestamps(graphics, present),
+    : m_master(graphics), m_context(context), m_present(present), m_graphics(graphics),
+      m_timestamps(graphics, present),
       m_command_pool(graphics, m_master), m_command(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
 
@@ -133,6 +134,11 @@ void CommandScheduler::Shutdown() {
 	PopPendingOperations();
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
+	{
+		// Orders the stop before the priority thread's predicate check.
+		std::lock_guard lock(m_operation_mutex);
+	}
+	m_priority_wake.notify_one();
 	m_operation_available.notify_all();
 	if (m_priority_thread.joinable()) {
 		m_priority_thread.join();
@@ -161,6 +167,96 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 
 void CommandScheduler::BeginRendering(const RenderState& state) {
 	Current().BeginRendering(state);
+}
+
+void CommandScheduler::GlobalBarrier(GlobalBarrierSite site) {
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	// Memory reads include indirect command reads (eDrawIndirect is among all commands).
+	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &barrier;
+	EndRendering();
+	Current().Handle().pipelineBarrier2(dependency);
+	m_guest_barrier_requested       = false;
+	m_barrier_since_dispatch        = true;
+	m_dispatches_at_global_barrier  = m_guest_dispatches;
+	m_dispatches_at_compute_barrier = m_guest_dispatches;
+	m_indirect_args_reads_unordered = false;
+	m_global_barriers++;
+	Common::FrameProfiler::Add(Common::FrameProfiler::Counter::GlobalBarriers);
+	Common::FrameProfiler::Rec(Common::FrameProfiler::Event::GlobalBarrier,
+	                           static_cast<uint64_t>(site));
+}
+
+void CommandScheduler::OrderIndirectArgsReads(vk::PipelineStageFlags stages) {
+	EXIT_IF(!stages);
+	if (!m_indirect_args_reads_unordered) {
+		return;
+	}
+	// An execution dependency: a write after a read needs no memory barrier.
+	EndRendering();
+	Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eDrawIndirect, stages, {}, 0,
+	                                   nullptr, 0, nullptr, 0, nullptr);
+	m_indirect_args_reads_unordered = false;
+	m_indirect_args_read_barriers++;
+	Common::FrameProfiler::Add(Common::FrameProfiler::Counter::DrawIndirectReadBarriers);
+}
+
+void CommandScheduler::BeforeGuestDispatch() {
+	if (m_guest_barrier_requested) {
+		GlobalBarrier(GlobalBarrierSite::Dispatch);
+	}
+}
+
+void CommandScheduler::BeforeGuestDraw() {
+	// A draw after a guest synchronisation reads what the unordered dispatches before it wrote.
+	// Before the draw's preparation, so internal work it records is ordered too.
+	if (m_guest_barrier_requested && UnorderedCompute()) {
+		GlobalBarrier(GlobalBarrierSite::Draw);
+	}
+}
+
+void CommandScheduler::CountGuestDispatch() {
+	using Common::FrameProfiler::Counter;
+	m_open_work++;
+	m_guest_dispatches++;
+	const bool ordered       = m_barrier_since_dispatch;
+	m_barrier_since_dispatch = false;
+	if (ordered) {
+		m_ordered_dispatches++;
+	}
+	const auto syncs          = m_guest_syncs - m_guest_syncs_at_dispatch;
+	m_guest_syncs_at_dispatch = m_guest_syncs;
+	if (!Common::FrameProfiler::Active()) {
+		return;
+	}
+	if (ordered) {
+		Common::FrameProfiler::Add(Counter::ComputeDispatchesAfterGlobalBarrier);
+	}
+	if (syncs != 0) {
+		Common::FrameProfiler::Add(Counter::ComputeDispatchesAfterGuestSync);
+	}
+	Common::FrameProfiler::Rec(Common::FrameProfiler::Event::GuestDispatch, ordered ? 1u : 0u,
+	                           syncs);
+}
+
+void CommandScheduler::FeedIdleGpu() {
+	// An atomic load: the priority thread refreshes the known GPU tick when the last submitted
+	// command buffer completes.
+	if (m_present || m_open_work < m_feed_min_work ||
+	    m_master.KnownGpuTick() < m_submitted.load(std::memory_order_acquire) || !Active() ||
+	    m_command.IsInvalid() || m_in_pre_submit || InDeferredOperation()) {
+		return;
+	}
+	Common::FrameProfiler::Rec(Common::FrameProfiler::Event::Feed, m_open_work);
+	Common::FrameProfiler::Add(Common::FrameProfiler::Counter::FeedSubmits);
+	m_feed_submits++;
+	Flush();
 }
 
 void CommandScheduler::EndRendering() {
@@ -260,7 +356,7 @@ void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, 
 		queue.push({std::move(operation), CurrentTick()});
 		lock.unlock();
 		if (priority) {
-			m_operation_available.notify_one();
+			m_priority_wake.notify_one();
 		}
 		return;
 	}
@@ -278,23 +374,42 @@ bool CommandScheduler::HasPendingPriorityOperations() {
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+	// The last submitted tick this thread waited for without an operation.
+	uint64_t watched = 0;
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
+		uint64_t         last_submitted = 0;
 		{
 			std::unique_lock lock(m_operation_mutex);
-			m_operation_available.wait(lock, [this, &stop] {
-				return stop.stop_requested() || !m_priority_operations.empty();
+			m_priority_wake.wait(lock, [this, &stop, watched] {
+				return stop.stop_requested() || !m_priority_operations.empty() ||
+				       (!m_present && m_submitted.load(std::memory_order_acquire) > watched);
 			});
 			if (stop.stop_requested()) {
 				return;
 			}
-			operation = std::move(m_priority_operations.front());
-			m_priority_operations.pop();
-			m_priority_active      = true;
-			m_priority_active_tick = operation.tick;
+			if (m_priority_operations.empty()) {
+				// Only the main scheduler wakes for a submit (FeedIdleGpu). Not an operation:
+				// m_priority_active stays clear, so nothing that waits for operations waits here.
+				last_submitted = m_submitted.load(std::memory_order_acquire);
+			} else {
+				operation = std::move(m_priority_operations.front());
+				m_priority_operations.pop();
+				m_priority_active      = true;
+				m_priority_active_tick = operation.tick;
+			}
+		}
+		if (last_submitted != 0) {
+			// No operation is due before it: a later one has a later tick. Keeps the known GPU
+			// tick current for FeedIdleGpu without a query on the recording thread.
+			m_master.WaitUnprofiled(last_submitted);
+			watched = last_submitted;
+			NoteQueueEmpty();
+			continue;
 		}
 		m_master.Wait(operation.tick, WaitSite::PriorityFence);
 		Common::FrameProfiler::Rec(Common::FrameProfiler::Event::Fence, operation.tick);
+		NoteQueueEmpty();
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
 		}
@@ -305,6 +420,20 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 		}
 		m_operation_available.notify_all();
 	}
+}
+
+void CommandScheduler::NoteQueueEmpty() {
+	if (m_present || !Common::FrameProfiler::Active()) {
+		return;
+	}
+	const auto known = m_master.KnownGpuTick();
+	if (known < m_submitted.load(std::memory_order_acquire) ||
+	    m_empty_tick.load(std::memory_order_relaxed) == known) {
+		return;
+	}
+	m_empty_since.store(Common::FrameProfiler::Ticks(), std::memory_order_relaxed);
+	m_empty_tick.store(known, std::memory_order_release);
+	Common::FrameProfiler::Rec(Common::FrameProfiler::Event::QueueEmpty, known);
 }
 
 void CommandScheduler::DrainPriorityOperations() {
@@ -364,6 +493,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 void CommandScheduler::BeginRecording() {
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	m_open_work = 0;
 	m_dynamic_state.Invalidate();
 	// Reads the timestamps of command buffers already known complete: never a wait.
 	m_timestamps.Poll(m_master.KnownGpuTick());
@@ -419,6 +549,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	vk::Result result;
 	uint64_t   tick;
+	uint64_t   submit_t0 = 0;
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();
@@ -440,8 +571,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
-		const uint64_t submit_t0 = Common::FrameProfiler::Start();
-		result                   = graphics.queue.submit(1, &submit_info, nullptr);
+		submit_t0 = Common::FrameProfiler::Start();
+		result    = graphics.queue.submit(1, &submit_info, nullptr);
 		if (submit_t0 != 0) {
 			const auto ticks = Common::FrameProfiler::Ticks() - submit_t0;
 			Common::FrameProfiler::Add(Common::FrameProfiler::Counter::VkSubmitTime, ticks);
@@ -459,9 +590,25 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_submitted.store(tick, std::memory_order_release);
+	if (!m_present) {
+		// Wakes the priority thread to watch for this tick's completion (taking the mutex orders
+		// the store before its predicate check).
+		{
+			std::lock_guard lock(m_operation_mutex);
+		}
+		m_priority_wake.notify_one();
+	}
 	m_timestamps.Submitted(timing, tick);
 	if (profile.t0 != 0) {
 		using Common::FrameProfiler::Counter;
+		// The host queue was empty from when the priority thread saw the previous tick complete
+		// to vkQueueSubmit (a lower bound: completions it was too busy to see are not counted).
+		if (m_empty_tick.load(std::memory_order_acquire) == tick - 1) {
+			const auto since = m_empty_since.load(std::memory_order_relaxed);
+			if (since != 0 && submit_t0 != 0 && since < submit_t0) {
+				Common::FrameProfiler::Add(Counter::GpuQueueEmptyTime, submit_t0 - since);
+			}
+		}
 		// SubmitsCommand is the rest of QueueSubmits (the capture reads the debug counters).
 		if (m_command.m_registers == nullptr || pre_submit) {
 			Common::FrameProfiler::Add(m_command.m_registers == nullptr ? Counter::SubmitsOther

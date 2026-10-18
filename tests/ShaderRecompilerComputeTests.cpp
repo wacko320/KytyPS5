@@ -175,6 +175,16 @@ static_assert(BlitHelper::ColorToMsDepthLayout ==
               vk::ImageLayout::eDepthStencilAttachmentOptimal);
 
 struct BufferCacheTestAccess {
+  static bool IsOpenWrite(BufferCache &cache, uint64_t address, uint64_t size) {
+    return cache.OpenWrites().Intersects(address, size);
+  }
+
+  // The submit that last wrote the range, or 0 once its tick was pruned (GPU thread only).
+  static uint64_t WriteTick(BufferCache &cache, uint64_t address, uint64_t size) {
+    (void)cache.OpenWrites();
+    return cache.m_write_ticks.Max(address, address + size);
+  }
+
   // GPU-thread readbacks read from a buffer's host mapping so far (TryReadDirect).
   static uint64_t DirectReadbacks(const BufferCache &cache) {
     return cache.m_direct_readbacks.load(std::memory_order_relaxed);
@@ -267,6 +277,16 @@ struct BufferCacheTestAccess {
     std::lock_guard lock(cache.m_writeback_mutex);
     const auto entry = cache.m_writeback_pages.find(address >> 12u);
     return entry == cache.m_writeback_pages.end() ? 0 : entry->second;
+  }
+};
+
+struct CommandSchedulerTestAccess {
+  // Guest draws and dispatches FeedIdleGpu waits for.
+  static void SetFeedMinWork(CommandScheduler &scheduler, uint32_t work) {
+    scheduler.m_feed_min_work = work;
+  }
+  static void ResetFeedMinWork(CommandScheduler &scheduler) {
+    scheduler.m_feed_min_work = CommandScheduler::FeedMinWork;
   }
 };
 
@@ -485,6 +505,24 @@ struct TextureCacheTestAccess {
 };
 
 struct RenderExecutorTestAccess {
+  static void ReplaceIndirectThreads(RenderExecutor &executor, uint32_t slots) {
+    executor.m_thread_batch.clear();
+    executor.m_thread_batch_serial++;
+    executor.m_indirect_threads = std::make_unique<IndirectThreadDispatch>(
+        executor.m_context.GetGraphics(), executor.m_context.GetCommandScheduler(), slots);
+  }
+
+  static RenderExecutor::ThreadBatchStats ThreadBatchStats(const RenderExecutor &executor) {
+    return executor.m_thread_stats;
+  }
+
+  static uint64_t ThreadRingWaits(RenderExecutor &executor) {
+    return executor.IndirectThreads().RingWaitCount();
+  }
+
+  // Barriers between LDS-storage dispatches with no global barrier between them.
+  static uint64_t LdsBarriers(const RenderExecutor &executor) { return executor.m_lds_barriers; }
+
   static uint64_t FullTextureResolves(const RenderExecutor &executor) {
     return executor.m_full_texture_resolves;
   }
@@ -11417,12 +11455,17 @@ public:
   }
 
   // Runs a command-buffer slice with `code` as the compute shader.
+  // Each slice stands for a submission (GuestGpu::Process), which orders it after the work
+  // before: dispatches carry no barriers of their own (CommandScheduler::RequestGuestBarrier).
   static void RunEpochSlice(const char *name, CommandProcessor &processor,
                             const std::vector<u32> &code, u32 sgprs,
-                            const std::vector<u32> &commands) {
+                            const std::vector<u32> &commands, bool submission = true) {
     processor.GetShCtx().SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
                                       .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
                                       .wave_size = 64, .user_sgpr = static_cast<uint8_t>(sgprs)});
+    if (submission) {
+      processor.RequestGuestBarrier(CommandProcessor::GuestSync::Submission);
+    }
     Pm4Execution execution;
     Require(name, "command stream",
             processor.Process(execution, commands) == Pm4ProcessResult::Complete,
@@ -12221,6 +12264,9 @@ public:
           if (same_tick) {
             // Records and commits the page's range in the tick the wrap submits.
             dispatch2(commands, first, EpochDwordBuffer(spare, sizeof(u32)), first_value);
+            // The guest orders the two writes of the dword (CS_PARTIAL_FLUSH): dispatches carry
+            // no barriers of their own.
+            commands.insert(commands.end(), {KYTY_PM4(2, Pm4::IT_EVENT_WRITE, 0), 0x07u | (4u << 8u)});
           }
           dispatch2(commands, first, EpochDwordBuffer(uploaded, sizeof(u32)), second_value);
           const auto before_dispatch = scheduler.CurrentTick();
@@ -13826,6 +13872,9 @@ public:
           Require(name, "GPU-authored LDS dispatch arguments",
                   cache.HasGpuDirtyBytes(lds_args, 3 * sizeof(u32)),
                   "indirect LDS dimensions were already visible on the CPU");
+          // Dispatches carry no barriers of their own: the guest orders the indirect dispatch
+          // after the one writing its arguments (CommandScheduler::RequestGuestBarrier).
+          processor.RequestGuestBarrier(CommandProcessor::GuestSync::PartialFlush);
         }
         shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(lds_shader.data()),
                              .num_thread_x = 128, .num_thread_y = 1, .num_thread_z = 1,
@@ -13852,6 +13901,37 @@ public:
                   "64-KiB LDS lost upper bytes, workgroup isolation, or cross-wave writes");
         }
       }
+      // Back to back, with no guest synchronisation: both use the same LDS storage, so the
+      // second waits for the first (one LDS barrier), and each keeps its workgroups' values.
+      {
+        constexpr auto second_output = base + 0xd0000;
+        cache.FillBuffer(lds_output, lds_words * sizeof(u32), sentinel, false);
+        cache.FillBuffer(second_output, lds_words * sizeof(u32), sentinel, false);
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(lds_shader.data()),
+                             .num_thread_x = 128, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true,
+                             .tgid_y_en = true, .tgid_z_en = true, .lds_size = 128});
+        auto &executor = context.GetRenderExecutor();
+        set_buffer(0, lds_output, lds_words * sizeof(u32));
+        processor.DispatchDirect(2, 2, 2, 0x41u);
+        const auto lds_barriers = RenderExecutorTestAccess::LdsBarriers(executor);
+        set_buffer(0, second_output, lds_words * sizeof(u32));
+        processor.DispatchDirect(2, 2, 2, 0x41u);
+        Require(name, "back-to-back LDS barrier",
+                RenderExecutorTestAccess::LdsBarriers(executor) == lds_barriers + 1,
+                "two LDS-storage dispatches with no barrier between them shared the storage");
+        for (const auto output : {lds_output, second_output}) {
+          cache.ReadMemory(output, lds_words * sizeof(u32));
+          std::array<u32, lds_words> actual{};
+          Require(name, "back-to-back LDS readback",
+                  LibKernel::Memory::TryReadBacking(output, actual.data(), sizeof(actual)),
+                  "LDS result buffer could not be read back");
+          for (u32 word = 0; word < actual.size(); word++) {
+            Require(name, "back-to-back LDS isolation", actual[word] == (word ^ 64u) + 1u,
+                    "back-to-back LDS dispatches overlapped in their storage");
+          }
+        }
+      }
       host_lds_limit = saved_lds_limit;
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
@@ -13865,6 +13945,1183 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "indirect argument allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A GPU-thread readback in the middle of a stream (as materialization makes), of a dispatch
+  // recorded with no synchronisation after it, in the open command buffer: the download waits
+  // for the dispatch, and a dispatch recorded after the readback, still with no
+  // synchronisation, reads its output too. Then the materialization readback itself: a V# a
+  // dispatch wrote, loaded by the next one's scalar load.
+  void CheckMidStreamReadbackAfterUnsynced() {
+    constexpr const char *name = "MidStreamReadbackAfterUnsynced";
+    constexpr uintptr_t base = 0x0000000219000000ull;
+    constexpr uint64_t size = 0x100000;
+    const uint64_t input = base + 0x1000;
+    const uint64_t produced = base + 0x2000;
+    const uint64_t consumed = base + 0x3000;
+    const uint64_t vsharp_table = base + 0x10000;
+    const uint64_t vsharp_targets = base + 0x20000;
+    constexpr u32 Loops = 400000;
+    // Stores s4..s7 to the dwords 0..3 of s[0:3].
+    static const std::vector<u32> table_writer = [] {
+      std::vector<u32> code;
+      for (u32 i = 0; i < 4; i++) {
+        code.push_back(EncodeVop1(0x01u, 1, 4 + i));               // v_mov_b32 v1, s[4 + i]
+        code.push_back(EncodeMubuf0(0x1cu, 4 * i, false, false)); // buffer_store_dword v1
+        code.push_back(EncodeMubuf1(1, 0, 0));
+      }
+      AppendEnd(&code);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+      return code;
+    }();
+    // Stores s2 through the V# at s[0:1].
+    static const std::vector<u32> vsharp_reader = [] {
+      std::vector<u32> code;
+      code.push_back(EncodeSmem0(0x02, 8, 0)); // s_load_dwordx4 s[8:11], s[0:1], 0
+      code.push_back(EncodeSmem1(0, 0x7d));
+      code.push_back(EncodeVop1(0x01u, 1, 2)); // v_mov_b32 v1, s2
+      code.push_back(EncodeMubuf0(0x1cu, 0, false, false)); // buffer_store_dword v1, s[8:11]
+      code.push_back(EncodeMubuf1(1, 2, 0));
+      AppendEnd(&code);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+      return code;
+    }();
+    // out[lane] = in[lane] + s8 + s9 after s9 (at least one) loop iterations; s[0:3] in, s[4:7]
+    // out.
+    static const std::vector<u32> loop = [] {
+      std::vector<u32> code;
+      code.push_back(EncodeVop2(0x1au, 1, InlineU32(2), Vgpr(0))); // v_lshlrev_b32 v1, 2, v0
+      code.push_back(EncodeVop1(0x01u, 3, InlineU32(0)));          // v_mov_b32 v3, 0
+      code.push_back(EncodeSMovB32(11, InlineU32(0)));             // s_mov_b32 s11, 0
+      const auto top = static_cast<int32_t>(code.size());
+      code.push_back(EncodeVop2(0x25u, 3, InlineU32(1), 3));       // v_add_nc_u32 v3, 1, v3
+      code.push_back(EncodeSop2(0x00u, 11, 11, InlineU32(1)));     // s_add_u32 s11, s11, 1
+      code.push_back(EncodeSopc(0x0au, 11, 9));                    // s_cmp_lt_u32 s11, s9
+      const auto next = static_cast<int32_t>(code.size()) + 1;
+      code.push_back(EncodeSopp(0x05u, static_cast<u32>(top - next) & 0xffffu)); // s_cbranch_scc1
+      code.push_back(EncodeMubuf0(0x0cu));                         // buffer_load_dword v2, v1
+      code.push_back(EncodeMubuf1(2, 0, 1));
+      code.push_back(EncodeSopp(0x0cu, 0));                        // s_waitcnt 0
+      code.push_back(EncodeVop2(0x25u, 2, 8, 2));                  // v_add_nc_u32 v2, s8, v2
+      code.push_back(EncodeVop2(0x25u, 2, Vgpr(3), 2));            // v_add_nc_u32 v2, v3, v2
+      code.push_back(EncodeMubuf0(0x1cu));                         // buffer_store_dword v2, v1
+      code.push_back(EncodeMubuf1(2, 1, 1));
+      AppendEnd(&code);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+      return code;
+    }();
+    const auto dispatch = [](uint64_t from, uint64_t to, u32 constant, u32 loops) {
+      const auto in = EpochDwordBuffer(from, sizeof(u32));
+      const auto out = EpochDwordBuffer(to, sizeof(u32));
+      return std::vector<u32>{KYTY_PM4(12, Pm4::IT_SET_SH_REG, Pm4::R_ZERO),
+                              Pm4::COMPUTE_USER_DATA_0, in.fields[0], in.fields[1],
+                              in.fields[2], in.fields[3], out.fields[0], out.fields[1],
+                              out.fields[2], out.fields[3], constant, loops,
+                              KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u,
+                              0x41u};
+    };
+    RunEpochFixture(
+        name, base, size, [] {},
+        [&](RenderContext &context, CommandProcessor &processor) {
+          RunEpochSlice(name, processor, loop, 10, dispatch(input, produced, 0x1000, Loops));
+          const auto word = ReadEpochDword(name, context, produced);
+          Require(name, "readback", word == 0x1000 + Loops,
+                  "the readback returned " + Hex(word) + ", expected " + Hex(0x1000 + Loops) +
+                      ": it did not wait for the dispatch before it");
+          // No synchronisation before the consumer either: only the readback orders it.
+          RunEpochSlice(name, processor, loop, 10, dispatch(produced, consumed, 0x20, 1), false);
+          FinishWithCompletions(context.GetCommandScheduler());
+          const auto consumer = ReadEpochDword(name, context, consumed);
+          Require(name, "consumer", consumer == 0x1000 + Loops + 0x20 + 1,
+                  "the consumer read " + Hex(consumer) + ", expected " +
+                      Hex(0x1000 + Loops + 0x20 + 1));
+          // A V# the GPU wrote, loaded by the next dispatch's scalar load: its materialization
+          // reads the V# back mid-stream. Twice, the first time where the program is compiled.
+          for (u32 round = 0; round < 2; round++) {
+            const uint64_t target = vsharp_targets + round * 0x1000ull;
+            const u32 value = 0x5e1f0000u + round;
+            const auto target_vsharp = EpochDwordBuffer(target, sizeof(u32));
+            const auto table_vsharp = EpochDwordBuffer(vsharp_table, 16);
+            RunEpochSlice(name, processor, table_writer, 8,
+                          {KYTY_PM4(10, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+                           table_vsharp.fields[0], table_vsharp.fields[1],
+                           table_vsharp.fields[2], table_vsharp.fields[3],
+                           target_vsharp.fields[0], target_vsharp.fields[1],
+                           target_vsharp.fields[2], target_vsharp.fields[3],
+                           KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u,
+                           0x41u});
+            RunEpochSlice(name, processor, vsharp_reader, 3,
+                          {KYTY_PM4(5, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+                           static_cast<u32>(vsharp_table),
+                           static_cast<u32>(vsharp_table >> 32u), value,
+                           KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u,
+                           0x41u});
+            FinishWithCompletions(context.GetCommandScheduler());
+            const auto stored = ReadEpochDword(name, context, target);
+            Require(name, "scalar-loaded V#", stored == value,
+                    "round " + std::to_string(round) + ": the dispatch stored " + Hex(stored) +
+                        " through the GPU-written V#, expected " + Hex(value));
+          }
+        });
+  }
+
+  // A batch whose prediction is wrong (as when the scan's shadow state is not the one execution
+  // reaches): the dispatch it does not cover converts its own arguments, correctly; a right
+  // prediction is taken.
+  void CheckThreadDimIndirectMismatchFallback() {
+    constexpr const char *name = "ThreadDimIndirectMismatchFallback";
+    constexpr uintptr_t base = 0x0000000218000000ull;
+    constexpr uint64_t size = 0x100000;
+    const uint64_t arguments = base + 0x1000;
+    const uint64_t output = base + 0x10000;
+    constexpr u32 Words = 256;
+    constexpr std::array<u32, 3> counts{77, 1, 1};
+    // out[group * 64 + thread] = group * 64 + thread + s4, over 64-thread groups (s5: group id).
+    static const std::vector<u32> fill = [] {
+      std::vector<u32> code;
+      AppendVop3(&code, 0x346u, 1, 5, InlineU32(6), Vgpr(0));
+      code.push_back(EncodeVop2(0x25u, 2, 4, 1));
+      code.push_back(EncodeVop2(0x1au, 1, InlineU32(2), 1));
+      code.push_back(EncodeMubuf0(0x1cu));
+      code.push_back(EncodeMubuf1(2, 0, 1));
+      AppendEnd(&code);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+      return code;
+    }();
+    RunEpochFixture(
+        name, base, size,
+        [&] { std::memcpy(reinterpret_cast<void *>(arguments), counts.data(), sizeof(counts)); },
+        [&](RenderContext &context, CommandProcessor &processor) {
+          auto &scheduler = context.GetCommandScheduler();
+          auto &executor = context.GetRenderExecutor();
+          auto &shaders = processor.GetShCtx();
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(fill.data()),
+                               .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
+                               .wave_size = 64, .user_sgpr = 5, .tgid_x_en = true});
+          const auto dispatch = [&](uint64_t out, u32 constant,
+                                    std::span<const ThreadDispatchRequest> predicted) {
+            ShaderBufferResource descriptor{};
+            descriptor.UpdateAddress48(out);
+            descriptor.fields[2] = Words * sizeof(u32);
+            descriptor.fields[3] =
+                DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+            for (u32 i = 0; i < 4; i++) {
+              shaders.SetCsUserSgpr(i, descriptor.fields[i], HW::UserSgprType::Unknown);
+            }
+            shaders.SetCsUserSgpr(4, constant, HW::UserSgprType::Unknown);
+            ThreadDispatchBatch batch{predicted, 0};
+            executor.DispatchIndirect(0, scheduler.Current(), arguments, 0x61u, false, &batch);
+            Require(name, "batch recorded", batch.serial != 0, "the batch was not recorded");
+          };
+          const auto check = [&](uint64_t out, u32 constant) {
+            context.GetBufferCache().ReadMemory(out, Words * sizeof(u32));
+            for (u32 i = 0; i < Words; i++) {
+              u32 word = 0;
+              (void)LibKernel::Memory::TryReadBacking(out + i * 4ull, &word, sizeof(word));
+              const u32 expected = i < counts[0] ? i + constant : 0;
+              Require(name, "thread count", word == expected,
+                      "word " + std::to_string(i) + " is " + Hex(word) + ", expected " +
+                          Hex(expected));
+            }
+          };
+          const auto before = RenderExecutorTestAccess::ThreadBatchStats(executor);
+          // Wrong arguments and a wrong group size: neither entry is this dispatch's.
+          const std::array<ThreadDispatchRequest, 2> wrong{
+              ThreadDispatchRequest{arguments + 12, {64, 1, 1}},
+              ThreadDispatchRequest{arguments, {32, 1, 1}}};
+          dispatch(output, 0x100, wrong);
+          const auto mismatched = RenderExecutorTestAccess::ThreadBatchStats(executor);
+          Require(name, "mismatch",
+                  mismatched.fallbacks[1] - before.fallbacks[1] == 1 &&
+                      mismatched.batched == before.batched,
+                  "the dispatch took an entry of a batch that did not predict it");
+          const std::array<ThreadDispatchRequest, 1> right{
+              ThreadDispatchRequest{arguments, {64, 1, 1}}};
+          dispatch(output + Words * sizeof(u32), 0x200, right);
+          const auto matched = RenderExecutorTestAccess::ThreadBatchStats(executor);
+          Require(name, "match", matched.batched - mismatched.batched == 1,
+                  "the dispatch did not take the batch entry that predicted it");
+          FinishWithCompletions(scheduler);
+          check(output, 0x100);
+          check(output + Words * sizeof(u32), 0x200);
+        });
+  }
+
+  enum class FeedIdleCase {
+    // About 200 dependent dispatches, each adding 1 to the dword the one before wrote: the
+    // feeds split them over command buffers (counted exactly for the first five) and the chain
+    // ends exact.
+    Chain,
+    // A dispatch writes thread-dimension arguments, a feed submits it, and the indirect
+    // dispatch after the feed uses them.
+    Indirect,
+    // A submitted command buffer held behind a host event: no feed until it completes.
+    Busy,
+    // A dword written before a feed point, read after the fed command buffer completed: the
+    // direct path (BufferCache::TryReadDirect), without a submit.
+    Readback,
+  };
+  void CheckFeedIdleGpu(FeedIdleCase variant) {
+    using Case = FeedIdleCase;
+    const char *name = [variant] {
+      switch (variant) {
+      case Case::Chain:
+        return "FeedIdleGpuChain";
+      case Case::Indirect:
+        return "FeedIdleGpuIndirect";
+      case Case::Busy:
+        return "FeedIdleGpuBusy";
+      case Case::Readback:
+        return "FeedIdleGpuReadback";
+      }
+      return "FeedIdleGpu";
+    }();
+    const uintptr_t base = 0x0000000216000000ull + static_cast<uint64_t>(variant) * 0x200000ull;
+    constexpr uint64_t size = 0x100000;
+    constexpr u32 chain_links = 200;
+    constexpr u32 chain_start = 0x0c4a0000u;
+    const uint64_t chain = base + 0x100;
+    const uint64_t arguments = base + 0x10000;
+    const uint64_t output = base + 0x20000;
+    const uint64_t first = base + 0x30100;
+    constexpr u32 sentinel = 0xa5a5a5a5u;
+    constexpr u32 indirect_threads = 10;
+    // The dword at s[0:3] plus 1, to s[4:7].
+    static const std::vector<u32> increment = [] {
+      std::vector<u32> code;
+      code.push_back(EncodeMubuf0(0x0cu, 0, false, false)); // buffer_load_dword v1, off, s[0:3]
+      code.push_back(EncodeMubuf1(1, 0, 0));
+      code.push_back(EncodeVop2(0x25u, 1, InlineU32(1), 1)); // v_add_nc_u32 v1, 1, v1
+      code.push_back(EncodeMubuf0(0x1cu, 0, false, false)); // buffer_store_dword v1, off, s[4:7]
+      code.push_back(EncodeMubuf1(1, 1, 0));
+      AppendEnd(&code);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+      return code;
+    }();
+    // s12-s14 to the dwords at s[0:3], s[4:7] and s[8:11].
+    static const std::vector<u32> arguments_writer = [] {
+      std::vector<u32> code;
+      for (u32 i = 0; i < 3; i++) {
+        code.push_back(EncodeVop1(0x01u, 1, 12u + i)); // v_mov_b32 v1, s(12 + i)
+        code.push_back(EncodeMubuf0(0x1cu, 0, false, false));
+        code.push_back(EncodeMubuf1(1, i, 0));
+      }
+      AppendEnd(&code);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+      return code;
+    }();
+    // out[group * 4 + thread] = group * 4 + thread + 1, over 4-thread groups (s4: group id).
+    static const std::vector<u32> consumer = [] {
+      std::vector<u32> code;
+      AppendVop3(&code, 0x346u, 1, 4, InlineU32(2), Vgpr(0));
+      code.push_back(EncodeVop2(0x25u, 2, InlineU32(1), 1));
+      code.push_back(EncodeVop2(0x1au, 1, InlineU32(2), 1));
+      code.push_back(EncodeMubuf0(0x1cu));
+      code.push_back(EncodeMubuf1(2, 0, 1));
+      AppendEnd(&code);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+      return code;
+    }();
+    static const std::vector<u32> writer = [] {
+      std::vector<u32> code;
+      code.push_back(EncodeVop1(0x01u, 1, 4)); // v_mov_b32 v1, s4
+      code.push_back(EncodeMubuf0(0x1cu, 0, false, false)); // buffer_store_dword v1, off, s[0:3]
+      code.push_back(EncodeMubuf1(1, 0, 0));
+      AppendEnd(&code);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+      return code;
+    }();
+    const auto write = [](std::vector<u32> &commands, uint64_t address, u32 word) {
+      const auto out = EpochDwordBuffer(address, sizeof(u32));
+      commands.insert(commands.end(),
+                      {KYTY_PM4(7, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+                       out.fields[0], out.fields[1], out.fields[2], out.fields[3], word,
+                       KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u, 0x41u});
+    };
+    const auto read = [](uint64_t address) {
+      u32 word = 0;
+      (void)LibKernel::Memory::TryReadBacking(address, &word, sizeof(word));
+      return word;
+    };
+    const auto link = [&](u32 index) {
+      std::vector<u32> commands;
+      // Each link reads the one before: the guest orders them (CS_PARTIAL_FLUSH).
+      commands.insert(commands.end(), {KYTY_PM4(2, Pm4::IT_EVENT_WRITE, 0), 0x07u | (4u << 8u)});
+      AppendEpochCopy(commands, chain + index * 4ull, sizeof(u32), chain + (index + 1) * 4ull);
+      return commands;
+    };
+    EnsureRuntimeContext();
+    const bool readable = Libs::Graphics::Buffer::HostReadableSupported(m_runtime_context);
+
+    vk::Event gate{};
+    const vk::EventCreateInfo gate_info{};
+    RequireVk(name, "event", m_device.createEvent(&gate_info, nullptr, &gate), "createEvent");
+    std::mutex gate_mutex;
+    bool gate_set = false;
+    const auto release = [&] {
+      std::lock_guard lock(gate_mutex);
+      if (!gate_set) {
+        gate_set = true;
+        (void)m_device.setEvent(gate);
+      }
+    };
+    if (variant != Case::Busy) {
+      release();
+    }
+    std::promise<void> released;
+    // The GPU wait is bounded: the gate opens after the timeout whatever the test does.
+    std::thread watchdog([&release, done = released.get_future()] {
+      if (done.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+        release();
+      }
+    });
+
+    RunEpochFixture(
+        name, base, size,
+        [&] {
+          std::memcpy(reinterpret_cast<void *>(chain), &chain_start, sizeof(u32));
+          std::memset(reinterpret_cast<void *>(output), 0xa5, 0x100);
+        },
+        [&](RenderContext &context, CommandProcessor &processor) {
+          auto &cache = context.GetBufferCache();
+          auto &scheduler = context.GetCommandScheduler();
+          const auto feeds_before = scheduler.FeedSubmitCount();
+          const auto feeds = [&] { return scheduler.FeedSubmitCount() - feeds_before; };
+          const auto require_feeds = [&](const char *check, uint64_t expected) {
+            Require(name, check, feeds() == expected,
+                    std::to_string(feeds()) + " feed submits, expected " +
+                        std::to_string(expected));
+          };
+          switch (variant) {
+          case Case::Chain: {
+            CommandSchedulerTestAccess::SetFeedMinWork(scheduler, 2);
+            // Every submitted command buffer complete, none of this stream recorded.
+            FinishWithCompletions(scheduler);
+            for (u32 index = 0; index < 3; index++) {
+              RunEpochSlice(name, processor, increment, 8, link(index));
+            }
+            // The third dispatch found two recorded and the GPU idle.
+            require_feeds("feed at the threshold", 1);
+            scheduler.Wait(scheduler.CurrentTick() - 1);
+            // One recorded since the feed: below the threshold.
+            RunEpochSlice(name, processor, increment, 8, link(3));
+            require_feeds("count restarts after a submit", 1);
+            RunEpochSlice(name, processor, increment, 8, link(4));
+            require_feeds("second feed", 2);
+            // The priority thread watches the fed command buffer: the known GPU tick reaches it
+            // without a query here.
+            const auto fed = scheduler.CurrentTick() - 1;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (scheduler.GetMasterSemaphore().KnownGpuTick() < fed &&
+                   std::chrono::steady_clock::now() < deadline) {
+              std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            Require(name, "completion seen", scheduler.GetMasterSemaphore().KnownGpuTick() >= fed,
+                    "the known GPU tick did not reach the fed command buffer");
+            CommandSchedulerTestAccess::SetFeedMinWork(scheduler, 16);
+            std::vector<u32> commands;
+            for (u32 index = 5; index < chain_links; index++) {
+              const auto next = link(index);
+              commands.insert(commands.end(), next.begin(), next.end());
+            }
+            // One PM4 slice: the GPU is idle when it reaches 16 dispatches, so it feeds at least
+            // once, and at most once per 16.
+            const auto feeds_before_run = feeds();
+            RunEpochSlice(name, processor, increment, 8, commands);
+            Require(name, "feeds per threshold",
+                    feeds() > feeds_before_run &&
+                        feeds() <= feeds_before_run + (chain_links - 5) / 16,
+                    std::to_string(feeds() - feeds_before_run) + " feed submits over " +
+                        std::to_string(chain_links - 5) + " dispatches in one slice");
+            FinishWithCompletions(scheduler);
+            cache.ReadMemory(chain, (chain_links + 1) * sizeof(u32));
+            for (u32 index = 0; index <= chain_links; index++) {
+              const auto word = read(chain + index * 4ull);
+              Require(name, "chain", word == chain_start + index,
+                      "link " + std::to_string(index) + " read " + Hex(word) + ", expected " +
+                          Hex(chain_start + index));
+            }
+            break;
+          }
+          case Case::Indirect: {
+            CommandSchedulerTestAccess::SetFeedMinWork(scheduler, 1);
+            auto &shaders = processor.GetShCtx();
+            const auto set_buffer = [&](u32 sgpr, uint64_t address, u32 bytes) {
+              const auto descriptor = EpochDwordBuffer(address, bytes);
+              for (u32 i = 0; i < 4; i++) {
+                shaders.SetCsUserSgpr(sgpr + i, descriptor.fields[i], HW::UserSgprType::Unknown);
+              }
+            };
+            FinishWithCompletions(scheduler);
+            shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(arguments_writer.data()),
+                                 .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                                 .wave_size = 64, .user_sgpr = 15});
+            constexpr std::array<u32, 3> dimensions{indirect_threads, 1u, 1u};
+            for (u32 i = 0; i < 3; i++) {
+              set_buffer(i * 4u, arguments + i * 4u, 4);
+              shaders.SetCsUserSgpr(12u + i, dimensions[i], HW::UserSgprType::Unknown);
+            }
+            processor.DispatchDirect(1, 1, 1, 0x41u);
+            require_feeds("no feed before the threshold", 0);
+            shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(consumer.data()),
+                                 .num_thread_x = 4, .num_thread_y = 1, .num_thread_z = 1,
+                                 .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true});
+            set_buffer(0, output, 16u * sizeof(u32));
+            const std::array<u32, 3> packet{static_cast<u32>(arguments),
+                                           static_cast<u32>(arguments >> 32u), 0x61u};
+            Require(name, "indirect packet",
+                    CpOpDispatchIndirect(processor, 0xc0021600u, packet.data(), 0, 0) == 3,
+                    "the indirect packet was not consumed");
+            require_feeds("feed before the indirect dispatch", 1);
+            FinishWithCompletions(scheduler);
+            cache.ReadMemory(output, 16u * sizeof(u32));
+            for (u32 i = 0; i < 16; i++) {
+              const auto expected = i < indirect_threads ? i + 1u : sentinel;
+              const auto word = read(output + i * 4ull);
+              Require(name, "indirect threads", word == expected,
+                      "word " + std::to_string(i) + " read " + Hex(word) + ", expected " +
+                          Hex(expected));
+            }
+            break;
+          }
+          case Case::Busy: {
+            CommandSchedulerTestAccess::SetFeedMinWork(scheduler, 1);
+            FinishWithCompletions(scheduler);
+            auto &command = scheduler.Current();
+            command.EndRendering();
+            command.Handle().waitEvents(1, &gate, vk::PipelineStageFlagBits::eHost,
+                                        vk::PipelineStageFlagBits::eAllCommands, 0, nullptr, 0,
+                                        nullptr, 0, nullptr);
+            std::vector<u32> commands;
+            write(commands, output, 100);
+            RunEpochSlice(name, processor, writer, 5, commands);
+            scheduler.Flush();
+            const auto held = scheduler.CurrentTick() - 1;
+            for (u32 i = 1; i < 4; i++) {
+              commands.clear();
+              write(commands, output + i * 4ull, 100 + i);
+              RunEpochSlice(name, processor, writer, 5, commands);
+            }
+            Require(name, "held", !scheduler.IsFree(held),
+                    "the held command buffer completed before the gate opened");
+            require_feeds("no feed while the GPU is busy", 0);
+            release();
+            scheduler.Wait(held);
+            commands.clear();
+            write(commands, output + 16, 104);
+            RunEpochSlice(name, processor, writer, 5, commands);
+            require_feeds("feed once the GPU is idle", 1);
+            FinishWithCompletions(scheduler);
+            cache.ReadMemory(output, 5 * sizeof(u32));
+            for (u32 i = 0; i < 5; i++) {
+              const auto word = read(output + i * 4ull);
+              Require(name, "values", word == 100 + i,
+                      "word " + std::to_string(i) + " read " + Hex(word));
+            }
+            break;
+          }
+          case Case::Readback: {
+            // One cached buffer over the pages, created and submitted before the writes.
+            std::vector<u32> read_all;
+            AppendEpochCopy(read_all, base, 0x40000, base + 0x80000);
+            RunEpochSlice(name, processor, EpochCopyShader(), 8, read_all);
+            CommandSchedulerTestAccess::SetFeedMinWork(scheduler, 1);
+            FinishWithCompletions(scheduler);
+            constexpr u32 value = 0xfeed0001u;
+            std::vector<u32> commands;
+            write(commands, first, value);
+            RunEpochSlice(name, processor, writer, 5, commands);
+            commands.clear();
+            write(commands, chain, value + 1);
+            RunEpochSlice(name, processor, writer, 5, commands);
+            require_feeds("feed between the writes", 1);
+            // The feed handed the first write to its submitted command buffer's tick; the
+            // second is the open one's.
+            const auto write_tick = BufferCacheTestAccess::WriteTick(cache, first, sizeof(u32));
+            Require(name, "write submitted",
+                    !BufferCacheTestAccess::IsOpenWrite(cache, first, sizeof(u32)) &&
+                        BufferCacheTestAccess::IsOpenWrite(cache, chain, sizeof(u32)) &&
+                        (write_tick == 0 || scheduler.IsSubmitted(write_tick)),
+                    "the write before the feed point stayed with the open command buffer (tick " +
+                        std::to_string(write_tick) + ")");
+            scheduler.Wait(scheduler.CurrentTick() - 1);
+            const auto tick = scheduler.CurrentTick();
+            const auto direct_before = BufferCacheTestAccess::DirectReadbacks(cache);
+            cache.ReadMemory(first, sizeof(u32));
+            const auto direct = BufferCacheTestAccess::DirectReadbacks(cache) - direct_before;
+            Require(name, "value", read(first) == value,
+                    "the read returned " + Hex(read(first)) + ", expected " + Hex(value));
+            Require(name, "path",
+                    direct == (readable ? 1u : 0u) && (scheduler.CurrentTick() == tick) == readable,
+                    std::string(readable ? "expected a direct read" : "expected the download") +
+                        ": direct reads " + std::to_string(direct));
+            break;
+          }
+          }
+        });
+    release();
+    released.set_value();
+    watchdog.join();
+    m_device.destroyEvent(gate, nullptr);
+    if (variant == Case::Readback && !readable) {
+      std::printf("[gpu]     %-32s no host-readable device memory: download only\n", name);
+    }
+  }
+
+  void CheckIndirectDrawGpuArgs() {
+    constexpr const char *name = "IndirectDrawGpuArgs";
+    constexpr uintptr_t base = 0x0000000211000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t target = base + 0x10000;
+    constexpr uint64_t indices_address = base + 0x20000;
+    constexpr uint64_t gpu_args_base = base + 0x40000;
+    constexpr uint64_t cpu_args_base = base + 0x80000;
+    constexpr uint32_t Extent = 16;
+    constexpr uint32_t IndexCount = 30;
+    using Args = std::array<u32, 5>;
+    using Cells = std::set<std::pair<u32, u32>>;
+
+    // c = (v >> 2) + (v & 1), r = (instance & 7) + ((v >> 1) & 1); position (c, r) / 4 - 1.
+    static const auto vertex_code = [] {
+      std::vector<u32> code;
+      code.push_back(EncodeVop2(0x16u, 1, InlineU32(2), 5));   // v_lshrrev_b32 v1, 2, v5
+      code.push_back(EncodeVop2(0x1bu, 1, InlineU32(7), 1));   // v_and_b32 v1, 7, v1
+      code.push_back(EncodeVop2(0x1bu, 2, InlineU32(1), 5));   // v_and_b32 v2, 1, v5
+      code.push_back(EncodeVop2(0x25u, 1, Vgpr(2), 1));        // v_add_nc_u32 v1, v2, v1
+      code.push_back(EncodeVop2(0x16u, 3, InlineU32(1), 5));   // v_lshrrev_b32 v3, 1, v5
+      code.push_back(EncodeVop2(0x1bu, 3, InlineU32(1), 3));   // v_and_b32 v3, 1, v3
+      code.push_back(EncodeVop2(0x1bu, 4, InlineU32(7), 8));   // v_and_b32 v4, 7, v8
+      code.push_back(EncodeVop2(0x25u, 4, Vgpr(3), 4));        // v_add_nc_u32 v4, v3, v4
+      code.push_back(EncodeVop1(0x06u, 1, Vgpr(1)));           // v_cvt_f32_u32 v1, v1
+      code.push_back(EncodeVop1(0x06u, 4, Vgpr(4)));           // v_cvt_f32_u32 v4, v4
+      AppendVMovLiteral(&code, 6, 0x3e800000u);                // 0.25
+      code.push_back(EncodeVop2(0x08u, 1, Vgpr(1), 6));        // v_mul_f32 v1, v1, v6
+      code.push_back(EncodeVop2(0x08u, 4, Vgpr(4), 6));        // v_mul_f32 v4, v4, v6
+      code.push_back(EncodeVop2(0x03u, 1, 243u, 1));           // v_add_f32 v1, -1.0, v1
+      code.push_back(EncodeVop2(0x03u, 4, 243u, 4));           // v_add_f32 v4, -1.0, v4
+      AppendVMovU32(&code, 0, 0);
+      AppendVMovLiteral(&code, 7, 0x3f800000u);
+      code.push_back(EncodeExp0(0x0c, 0xf));
+      code.push_back(EncodeExp1(1, 4, 0, 7));
+      AppendEnd(&code);
+      return code;
+    }();
+    static const auto pixel_code = [] {
+      std::vector<u32> code;
+      AppendVMovLiteral(&code, 0, 0x3f800000u);
+      code.push_back(EncodeExp0(0x00, 0xf));
+      code.push_back(EncodeExp1(0, 0, 0, 0));
+      AppendEnd(&code);
+      return code;
+    }();
+    // The five dwords s4..s8 to s[0:3] at byte offsets 0 to 16: indirect draw arguments.
+    static const auto writer_code = [] {
+      std::vector<u32> code;
+      for (u32 i = 0; i < 5; i++) {
+        code.push_back(EncodeVop1(0x01u, 1, 4u + i));               // v_mov_b32 v1, s(4 + i)
+        code.push_back(EncodeMubuf0(0x1cu, i * 4u, false, false)); // buffer_store_dword v1, off
+        code.push_back(EncodeMubuf1(1, 0, 0));
+      }
+      AppendEnd(&code);
+      return code;
+    }();
+    static ShaderUserData vertex_user_data{};
+    const auto vertex_address = reinterpret_cast<uint64_t>(vertex_code.data());
+    const auto pixel_address = reinterpret_cast<uint64_t>(pixel_code.data());
+    ShaderMapUserData(vertex_address,
+        {.type = Prospero::ShaderBinaryType::kGs, .user_data = &vertex_user_data,
+         .code_size_bytes = static_cast<uint32_t>(vertex_code.size() * sizeof(u32))});
+    ShaderMapUserData(pixel_address,
+        {.type = Prospero::ShaderBinaryType::kPs,
+         .code_size_bytes = static_cast<uint32_t>(pixel_code.size() * sizeof(u32))});
+    ShaderMapUserData(reinterpret_cast<uint64_t>(writer_code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<uint32_t>(writer_code.size() * sizeof(u32))});
+
+    // The cells an indexed draw lights: triangle t of indices {4t, 4t + 1, 4t + 2}. The vertex
+    // shader is a native fetch, which takes the base vertex and first instance from patched user
+    // SGPRs: these draws patch none, so both paths draw without the offsets.
+    const auto indexed_cells = [](const Args &args, uint32_t bound) {
+      Cells cells;
+      const auto count = bound != 0 ? std::min(args[0], bound - std::min(args[2], bound)) : args[0];
+      for (u32 t = args[2] / 3; t < (args[2] + count) / 3; t++) {
+        for (u32 instance = 0; instance < args[1]; instance++) {
+          cells.insert({((4 * t) >> 2u) & 7u, instance & 7u});
+        }
+      }
+      return cells;
+    };
+
+    EnsureRuntimeContext();
+    // Without host-readable device memory the GPU path cannot keep instance counts, which every
+    // draw outside a stream keeps.
+    if (!Libs::Graphics::Buffer::HostReadableSupported(m_runtime_context)) {
+      std::printf("[gpu]     %-32s skipped (no host-readable device memory)\n", name);
+      return;
+    }
+    if (!m_draw_indirect_first_instance) {
+      std::printf("[gpu]     %-32s skipped (no drawIndirectFirstInstance)\n", name);
+      return;
+    }
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    // Triangle t is {4t, 4t + 1, 4t + 2}, also past the bound range of the clamp case.
+    for (u32 k = 0; k < IndexCount; k++) {
+      reinterpret_cast<uint16_t *>(indices_address)[k] = static_cast<uint16_t>(4 * (k / 3) + k % 3);
+      reinterpret_cast<uint8_t *>(indices_address + 0x1000)[k] = static_cast<uint8_t>(4 * (k / 3) + k % 3);
+    }
+    // The CPU path's arguments, written before the memory is tracked: slot i holds cpu_args[i].
+    uint32_t cpu_slot = 0;
+    const auto cpu_args = [&](const Args &args) {
+      const auto address = cpu_args_base + 0x1000ull * cpu_slot++;
+      std::memcpy(reinterpret_cast<void *>(address), args.data(), sizeof(args));
+      return address;
+    };
+    struct IndexedCase {
+      const char *label;
+      Args args;
+      uint32_t bound;
+    };
+    const std::array indexed_cases{
+        IndexedCase{"two triangles", {6, 1, 0, 0, 0}, IndexCount},
+        IndexedCase{"first index, base vertex, instances", {9, 3, 6, 4, 2}, IndexCount},
+        IndexedCase{"index count clamped to INDEX_BUFFER_SIZE", {30, 1, 0, 0, 0}, 12},
+        IndexedCase{"first index near INDEX_BUFFER_SIZE", {12, 1, 6, 0, 0}, 12},
+    };
+    std::array<uint64_t, indexed_cases.size()> indexed_cpu_args{};
+    for (size_t i = 0; i < indexed_cases.size(); i++) {
+      indexed_cpu_args[i] = cpu_args(indexed_cases[i].args);
+    }
+    const Args auto_args{6, 3, 8, 1, 0};
+    const auto auto_cpu_args = cpu_args(auto_args);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      GraphicsInitJmpTables();
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &buffers = context.GetBufferCache();
+      auto &cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      auto &draw_args = executor.IndirectDraws();
+      context.MapMemory(base, allocation_size);
+
+      auto &registers = processor.GetCtx();
+      auto &user_config = processor.GetUcfg();
+      auto &shaders = processor.GetShCtx();
+      registers.SetViewportTransformControl(0x300);
+      registers.SetViewportScaleOffset(0, Extent / 2, Extent / 2, Extent / 2, Extent / 2, 1, 0);
+      registers.SetViewportZMax(0, 1);
+      registers.SetScreenScissor(0, 0, Extent, Extent);
+      registers.SetWindowScissor(0, 0, Extent, Extent, false);
+      registers.SetGenericScissor(0, 0, Extent, Extent, false);
+      registers.SetViewportScissor(0, 0, 0, Extent, Extent, false);
+      registers.SetRenderTargetMask(0xf);
+      registers.SetShaderMask(0xf);
+      registers.SetPsInControl(0x8000);
+      registers.SetColorBase(0, {.addr = target});
+      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k32_32_32_32,
+                                 .channel_type = Prospero::ChannelType::kFloat,
+                                 .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = Extent - 1, .width = Extent - 1});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+      registers.SetTargetOutputMode(0, 4);
+      user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+      shaders.SetEsShaderBase(vertex_address);
+      shaders.SetPsShaderBase(pixel_address);
+      processor.SetIndexType(0);
+      processor.SetIndexBaseAddress(indices_address);
+      processor.SetIndexBufferSize(IndexCount);
+      processor.SetDrawIndirectArgsBaseAddress(base);
+
+      RenderColorInfo color{};
+      const auto clear = [&] {
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), color, 0);
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), color.image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+      };
+      const auto lit = [&] {
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), color, 0);
+        const auto pixels = ReadCachedTexel(name, context, color.image_id, {}, {Extent, Extent, 1});
+        Cells cells;
+        for (u32 y = 0; y < Extent; y++) {
+          for (u32 x = 0; x < Extent; x++) {
+            if (pixels[4 * (y * Extent + x)] != 0) {
+              cells.insert({x / 2, y / 2});
+            }
+          }
+        }
+        return cells;
+      };
+      const auto cells_text = [](const Cells &cells) {
+        std::string text;
+        for (const auto &[column, row] : cells) {
+          text += "(" + std::to_string(column) + "," + std::to_string(row) + ")";
+        }
+        return text.empty() ? std::string("none") : text;
+      };
+      // GPU work writes the arguments, and a partial flush orders the draw after it.
+      const auto write_args = [&](uint64_t address, const Args &args) {
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(address);
+        descriptor.fields[2] = sizeof(Args);
+        descriptor.fields[3] = DstSel(4, 5, 6, 7) |
+            (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(writer_code.data()),
+                             .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 9});
+        for (u32 i = 0; i < 4; i++) {
+          shaders.SetCsUserSgpr(i, descriptor.fields[i], HW::UserSgprType::Unknown);
+        }
+        for (u32 i = 0; i < args.size(); i++) {
+          shaders.SetCsUserSgpr(4 + i, args[i], HW::UserSgprType::Unknown);
+        }
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+        processor.RequestGuestBarrier(CommandProcessor::GuestSync::PartialFlush);
+        Require(name, "GPU-written arguments",
+                buffers.IsRegionGpuModified(address, sizeof(Args)),
+                "the writer dispatch did not leave the arguments GPU-modified");
+      };
+      uint32_t gpu_slot = 0;
+      const auto gpu_args = [&](const Args &args) {
+        const auto address = gpu_args_base + 0x1000ull * gpu_slot++;
+        write_args(address, args);
+        return address;
+      };
+      const auto draw = [&](uint64_t address, bool indexed) {
+        processor.DrawIndirect(static_cast<uint32_t>(address - base),
+                               {Pm4::SH_NOP, Pm4::SH_NOP, Pm4::SH_NOP}, indexed ? 0u : 2u,
+                               indexed);
+      };
+      // The arguments were not read back: the draw took them on the GPU.
+      const auto require_gpu = [&](const char *check, uint64_t address, bool gpu) {
+        Require(name, check, buffers.HasGpuDirtyBytes(address, sizeof(Args)) == gpu,
+                gpu ? "the CPU read GPU-written arguments back"
+                    : "the draw took arguments it must read on the CPU");
+      };
+
+      // Warm-up: the CPU path builds the pipeline and leaves the target GPU-owned.
+      // The pipeline builds in the background and draws are dropped until it exists, so repeat the
+      // draw until it lights cells.
+      const auto warm_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+      for (;;) {
+        clear();
+        draw(indexed_cpu_args[0], true);
+        if (!lit().empty() || std::chrono::steady_clock::now() > warm_deadline) {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      Require(name, "warm-up", !lit().empty(), "the warm-up draw never lit a cell");
+
+      {
+        constexpr const char *check = "DrawIndexedIndirectGpuArgs";
+        for (size_t i = 0; i < indexed_cases.size(); i++) {
+          const auto &test = indexed_cases[i];
+          processor.SetIndexBufferSize(test.bound);
+          clear();
+          draw(indexed_cpu_args[i], true);
+          const auto cpu = lit();
+          clear();
+          const auto conversions = draw_args.ConversionCount();
+          const auto address = gpu_args(test.args);
+          draw(address, true);
+          require_gpu(check, address, true);
+          const auto gpu = lit();
+          const auto expected = indexed_cells(test.args, test.bound);
+          Require(name, check,
+                  gpu == expected && cpu == expected &&
+                      draw_args.ConversionCount() == conversions + 1,
+                  std::string(test.label) + ": GPU path lit " + cells_text(gpu) +
+                      ", CPU path " + cells_text(cpu) + ", expected " + cells_text(expected) +
+                      " with one conversion");
+        }
+        processor.SetIndexBufferSize(IndexCount);
+        std::printf("[gpu]     %-32s ok\n", check);
+      }
+
+      {
+        constexpr const char *check = "DrawIndirectGpuArgs";
+        clear();
+        draw(auto_cpu_args, false);
+        const auto cpu = lit();
+        clear();
+        const auto address = gpu_args(auto_args);
+        draw(address, false);
+        require_gpu(check, address, true);
+        const auto gpu = lit();
+        // Six vertices, three instances, without the first vertex and first instance (native
+        // fetch, no patched SGPRs): two cells per instance.
+        const Cells expected{{0, 0}, {0, 1}, {0, 2}, {1, 0}, {1, 1}, {1, 2}};
+        Require(name, check, gpu == expected && cpu == expected,
+                "GPU path lit " + cells_text(gpu) + ", CPU path " + cells_text(cpu) +
+                    ", expected " + cells_text(expected));
+        std::printf("[gpu]     %-32s ok\n", check);
+      }
+
+      {
+        constexpr const char *check = "DrawIndirectZeroCount";
+        for (const auto &[args, indexed] : {std::pair{Args{0, 1, 0, 0, 0}, true},
+                                            std::pair{Args{3, 0, 0, 0, 0}, true},
+                                            std::pair{Args{0, 1, 0, 0, 0}, false}}) {
+          clear();
+          const auto address = gpu_args(args);
+          draw(address, indexed);
+          require_gpu(check, address, true);
+          const auto gpu = lit();
+          Require(name, check, gpu.empty() && cache.IsGpuOwned(color.image_id),
+                  "a zero-count draw lit " + cells_text(gpu) +
+                      " or left the target not GPU-owned");
+        }
+        std::printf("[gpu]     %-32s ok\n", check);
+      }
+
+      {
+        // A target with a guest write pending takes the CPU path, so a draw of nothing leaves it
+        // guest-owned.
+        constexpr const char *check = "DrawIndirectGuestOwnedTarget";
+        clear();
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), color, 0);
+        const auto image_id = color.image_id;
+        (void)context.InvalidateMemory(target, Extent * Extent * 16);
+        Require(name, check, !cache.IsGpuOwned(image_id),
+                "a guest write did not make the target guest-owned");
+        const auto address = gpu_args({0, 1, 0, 0, 0});
+        draw(address, true);
+        require_gpu(check, address, false);
+        Require(name, check, !cache.IsGpuOwned(image_id),
+                "a draw of nothing committed a guest-owned target as GPU-written");
+        // A draw that writes the target makes it GPU-owned again.
+        draw(indexed_cpu_args[0], true);
+        std::printf("[gpu]     %-32s ok\n", check);
+      }
+
+      {
+        // The NUM_INSTANCES state an indirect draw leaves: a direct draw after it without a
+        // NUM_INSTANCES packet takes the GPU-written count; with one, nothing is read.
+        constexpr const char *check = "DrawIndirectLazyInstances";
+        const Args args{3, 3, 15, 0, 0};
+        clear();
+        auto reads = draw_args.InstanceReadCount();
+        const auto address = gpu_args(args);
+        draw(address, true);
+        processor.DrawIndexAuto({.vertex_count = 3});
+        require_gpu(check, address, true);
+        const auto lazy = lit();
+        const Cells lazy_expected{{5, 0}, {5, 1}, {5, 2}, {0, 0}, {0, 1}, {0, 2}};
+        Require(name, check, lazy == lazy_expected && draw_args.InstanceReadCount() == reads + 1,
+                "lit " + cells_text(lazy) + ", expected " + cells_text(lazy_expected) +
+                    " after one instance-count read");
+        clear();
+        reads = draw_args.InstanceReadCount();
+        draw(gpu_args(args), true);
+        processor.SetNumInstances(2);
+        processor.DrawIndexAuto({.vertex_count = 3});
+        const auto set = lit();
+        const Cells set_expected{{5, 0}, {5, 1}, {5, 2}, {0, 0}, {0, 1}};
+        Require(name, check, set == set_expected && draw_args.InstanceReadCount() == reads,
+                "with NUM_INSTANCES, lit " + cells_text(set) + ", expected " +
+                    cells_text(set_expected) + " and no instance-count read");
+        std::printf("[gpu]     %-32s ok\n", check);
+      }
+
+      {
+        // In a stream, a NUM_INSTANCES packet before the next draw leaves the non-indexed draw's
+        // instance count unread; a direct draw next makes it keep the count. (The native fetch
+        // has its offsets dropped, so the draw is converted either way.) Six vertices light
+        // column 1 as well as the direct draw's column 0.
+        constexpr const char *check = "DrawIndirectInstanceScan";
+        const Args args{6, 2, 0, 0, 0};
+        for (const bool num_instances : {true, false}) {
+          clear();
+          const auto address = gpu_args(args);
+          const auto conversions = draw_args.ConversionCount();
+          const auto reads = draw_args.InstanceReadCount();
+          std::vector<u32> stream{KYTY_PM4(5, Pm4::IT_DRAW_INDIRECT, 0),
+                                  static_cast<u32>(address - base), Pm4::SH_NOP, Pm4::SH_NOP, 2};
+          if (num_instances) {
+            stream.insert(stream.end(), {KYTY_PM4(2, Pm4::IT_NUM_INSTANCES, 0), 3});
+          }
+          stream.insert(stream.end(), {KYTY_PM4(3, Pm4::IT_DRAW_INDEX_AUTO, 0), 3, 2});
+          Pm4Execution execution;
+          Require(name, check,
+                  processor.Process(execution, stream) == Pm4ProcessResult::Complete,
+                  "the draw stream did not complete");
+          require_gpu(check, address, true);
+          const auto cells = lit();
+          const Cells expected = num_instances
+              ? Cells{{1, 0}, {1, 1}, {0, 0}, {0, 1}, {0, 2}}
+              : Cells{{1, 0}, {1, 1}, {0, 0}, {0, 1}};
+          const uint64_t kept = num_instances ? 0 : 1;
+          Require(name, check,
+                  cells == expected && draw_args.ConversionCount() == conversions + 1 &&
+                      draw_args.InstanceReadCount() == reads + kept,
+                  std::string(num_instances ? "with" : "without") + " NUM_INSTANCES: lit " +
+                      cells_text(cells) + ", expected " + cells_text(expected) + ", " +
+                      std::to_string(draw_args.ConversionCount() - conversions) +
+                      " conversions and " + std::to_string(draw_args.InstanceReadCount() - reads) +
+                      " reads, expected 1 and " + std::to_string(kept));
+        }
+        std::printf("[gpu]     %-32s ok\n", check);
+      }
+
+      {
+        // DRAW_INDEX_INDIRECT_MULTI: each entry takes its arguments on the GPU, and only the last
+        // one keeps its instance count for the direct draw after it.
+        constexpr const char *check = "DrawIndirectMultiGpuArgs";
+        const Args first{3, 1, 0, 0, 0};
+        const Args last{3, 3, 3, 0, 0};
+        clear();
+        const auto conversions = draw_args.ConversionCount();
+        const auto reads = draw_args.InstanceReadCount();
+        const auto first_address = gpu_args(first);
+        const auto last_address = gpu_args(last);
+        Require(name, check, last_address == first_address + 0x1000,
+                "the argument entries are not one stride apart");
+        processor.DrawIndirectMulti(static_cast<uint32_t>(first_address - base), 2, nullptr,
+                                    0x1000, {Pm4::SH_NOP, Pm4::SH_NOP, Pm4::SH_NOP}, 0, true);
+        processor.DrawIndexAuto({.vertex_count = 3});
+        require_gpu(check, first_address, true);
+        require_gpu(check, last_address, true);
+        const auto cells = lit();
+        auto expected = indexed_cells(first, IndexCount);
+        expected.merge(indexed_cells(last, IndexCount));
+        expected.insert({{0, 0}, {0, 1}, {0, 2}});
+        Require(name, check,
+                cells == expected && draw_args.ConversionCount() == conversions + 2 &&
+                    draw_args.InstanceReadCount() == reads + 1,
+                "lit " + cells_text(cells) + ", expected " + cells_text(expected) + ", " +
+                    std::to_string(draw_args.ConversionCount() - conversions) +
+                    " conversions and " + std::to_string(draw_args.InstanceReadCount() - reads) +
+                    " reads, expected 2 and 1");
+        std::printf("[gpu]     %-32s ok\n", check);
+      }
+
+      {
+        // A dispatch after the draws overwrites their arguments without a guest synchronisation:
+        // the command processor read them before, so the draws take the old ones. A conversion
+        // is ordered before the dispatch by its own barrier. (A draw reading guest memory itself,
+        // ordered by a read barrier instead, needs an embedded fetch: this shader's offsets are
+        // dropped by a conversion.)
+        constexpr const char *check = "DrawIndirectArgsOverwritten";
+        const Args args{6, 2, 0, 0, 0};
+        const Args overwrite{3, 1, 0, 0, 0};
+        clear();
+        const auto address = gpu_args(args);
+        auto conversions = draw_args.ConversionCount();
+        auto barriers = scheduler.IndirectArgsReadBarrierCount();
+        const std::vector<u32> stream{KYTY_PM4(5, Pm4::IT_DRAW_INDIRECT, 0),
+                                      static_cast<u32>(address - base), Pm4::SH_NOP, Pm4::SH_NOP, 2,
+                                      KYTY_PM4(2, Pm4::IT_NUM_INSTANCES, 0), 1};
+        Pm4Execution execution;
+        Require(name, check, processor.Process(execution, stream) == Pm4ProcessResult::Complete,
+                "the draw stream did not complete");
+        write_args(address, overwrite);
+        require_gpu(check, address, true);
+        auto cells = lit();
+        Cells expected{{0, 0}, {0, 1}, {1, 0}, {1, 1}};
+        Require(name, check,
+                cells == expected && draw_args.ConversionCount() == conversions + 1 &&
+                    scheduler.IndirectArgsReadBarrierCount() == barriers,
+                "non-indexed: lit " + cells_text(cells) + ", expected " + cells_text(expected) +
+                    ", " + std::to_string(draw_args.ConversionCount() - conversions) +
+                    " conversions and " +
+                    std::to_string(scheduler.IndirectArgsReadBarrierCount() - barriers) +
+                    " read barriers, expected 1 and 0");
+        const Args indexed{3, 1, 6, 0, 0};
+        clear();
+        const auto indexed_address = gpu_args(indexed);
+        conversions = draw_args.ConversionCount();
+        barriers = scheduler.IndirectArgsReadBarrierCount();
+        draw(indexed_address, true);
+        write_args(indexed_address, {3, 1, 12, 0, 0});
+        require_gpu(check, indexed_address, true);
+        cells = lit();
+        expected = indexed_cells(indexed, IndexCount);
+        Require(name, check,
+                cells == expected && draw_args.ConversionCount() == conversions + 1 &&
+                    scheduler.IndirectArgsReadBarrierCount() == barriers,
+                "conversion: lit " + cells_text(cells) + ", expected " + cells_text(expected) +
+                    ", " + std::to_string(draw_args.ConversionCount() - conversions) +
+                    " conversions and " +
+                    std::to_string(scheduler.IndirectArgsReadBarrierCount() - barriers) +
+                    " read barriers, expected 1 and 0");
+        std::printf("[gpu]     %-32s ok\n", check);
+      }
+
+      {
+        // Without drawIndirectFirstInstance a draw's arguments could not carry a first instance:
+        // the CPU reads them.
+        constexpr const char *check = "DrawIndirectNoFirstInstance";
+        const auto &test = indexed_cases[1];
+        m_runtime_context.draw_indirect_first_instance_enabled = false;
+        clear();
+        const auto address = gpu_args(test.args);
+        draw(address, true);
+        m_runtime_context.draw_indirect_first_instance_enabled = m_draw_indirect_first_instance;
+        require_gpu(check, address, false);
+        const auto cells = lit();
+        const auto expected = indexed_cells(test.args, IndexCount);
+        Require(name, check, cells == expected,
+                "lit " + cells_text(cells) + ", expected " + cells_text(expected));
+        std::printf("[gpu]     %-32s ok\n", check);
+      }
+
+      {
+        // Draws the GPU path does not take read their arguments on the CPU (of no primitives,
+        // so they draw nothing whatever the state).
+        constexpr const char *check = "DrawIndirectFallbacks";
+        const Args zero{0, 1, 0, 0, 0};
+        processor.SetIndexBufferSize(0);
+        auto address = gpu_args(zero);
+        draw(address, true);
+        require_gpu("INDEX_BUFFER_SIZE 0", address, false);
+        processor.SetIndexBufferSize(IndexCount);
+        processor.SetIndexType(2);
+        processor.SetIndexBaseAddress(indices_address + 0x1000);
+        address = gpu_args(zero);
+        draw(address, true);
+        require_gpu("8-bit indices", address, false);
+        processor.SetIndexType(0);
+        processor.SetIndexBaseAddress(indices_address);
+        user_config.SetPrimitiveType(Prospero::PrimitiveType::kRectList);
+        address = gpu_args(zero);
+        draw(address, false);
+        require_gpu("rect list", address, false);
+        user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+        address = gpu_args(zero);
+        draw(address, false);
+        require_gpu("triangle list after the fallbacks", address, true);
+        std::printf("[gpu]     %-32s ok\n", check);
+      }
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // The draw-argument conversion: an indexed draw's index count clamped to the limit, every
+  // other dword copied bit for bit, and a non-indexed draw's copied whole.
+  void CheckDrawArgsConvertClamp() {
+    constexpr const char *name = "DrawArgsConvertClamp";
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &draw_args = context.GetRenderExecutor().IndirectDraws();
+    struct ConvertCase {
+      std::array<u32, 5> args;
+      uint32_t dwords;
+      uint32_t limit;
+      u32 expected_count;
+      bool drop_offsets = false;
+    };
+    constexpr std::array cases{
+        ConvertCase{{100, 0xdeadbeefu, 0x80000001u, 0xfffffffcu, 7}, 5, 64, 0},
+        ConvertCase{{100, 2, 0, 4, 5}, 5, 64, 64},
+        ConvertCase{{64, 2, 3, 4, 5}, 5, 64, 61},
+        ConvertCase{{60, 2, 3, 0x7fffffffu, 0xffffffffu}, 5, 64, 60},
+        ConvertCase{{20, 1, 60, 0, 0}, 5, 64, 4},
+        ConvertCase{{0xffffffffu, 9, 8, 7, 6}, 5, 0, 0xffffffffu},
+        ConvertCase{{100, 3, 4, 5, 0}, 4, 0, 100},
+        ConvertCase{{64, 2, 3, 4, 5}, 5, 64, 61, true},
+        ConvertCase{{100, 3, 4, 5, 0}, 4, 0, 100, true},
+    };
+    auto source = CreateHostBuffer(name, cases.size() * 32,
+                                   vk::BufferUsageFlagBits::eStorageBuffer, {});
+    auto probe = CreateHostBuffer(name, cases.size() * 32,
+                                  vk::BufferUsageFlagBits::eTransferDst, {});
+    std::vector<u32> words(cases.size() * 8, 0);
+    for (size_t i = 0; i < cases.size(); i++) {
+      std::copy(cases[i].args.begin(), cases[i].args.end(), words.begin() + i * 8);
+    }
+    WriteBuffer(name, source, words);
+    std::vector<IndirectDrawCommand> commands;
+    std::vector<DrawInstanceCapture> captures(cases.size());
+    for (size_t i = 0; i < cases.size(); i++) {
+      commands.push_back(draw_args.Convert(source.buffer, i * 32, cases[i].dwords, cases[i].limit,
+                                           cases[i].drop_offsets,
+                                           draw_args.CanCapture() ? &captures[i] : nullptr));
+    }
+    auto command = scheduler.Current().Handle();
+    vk::MemoryBarrier barrier{};
+    barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+    command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                            vk::PipelineStageFlagBits::eTransfer, {}, 1, &barrier, 0, nullptr, 0,
+                            nullptr);
+    for (size_t i = 0; i < cases.size(); i++) {
+      const vk::BufferCopy copy{commands[i].offset, i * 32, cases[i].dwords * sizeof(u32)};
+      command.copyBuffer(commands[i].buffer, probe.buffer, 1, &copy);
+    }
+    barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                            vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0, nullptr, 0,
+                            nullptr);
+    scheduler.Finish();
+    const auto converted = ReadBuffer(name, probe, cases.size() * 8);
+    for (size_t i = 0; i < cases.size(); i++) {
+      const auto &test = cases[i];
+      for (u32 dword = 0; dword < test.dwords; dword++) {
+        // Dropped offsets: base vertex and first instance, or first vertex and first instance.
+        const bool dropped = test.drop_offsets && dword >= test.dwords - 2;
+        const auto expected = dword == 0 ? test.expected_count : dropped ? 0u : test.args[dword];
+        Require(name, "converted arguments", converted[i * 8 + dword] == expected,
+                "case " + std::to_string(i) + " dword " + std::to_string(dword) + " is " +
+                    Hex(converted[i * 8 + dword]) + ", expected " + Hex(expected));
+      }
+      if (draw_args.CanCapture()) {
+        Require(name, "kept instance count",
+                draw_args.ReadInstances(captures[i]) == test.args[1],
+                "case " + std::to_string(i) + " kept the wrong instance count");
+      }
+    }
+    DestroyBuffer(&probe);
+    DestroyBuffer(&source);
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -21924,8 +23181,31 @@ public:
       for (const auto slot : {0u, 1u}) {
         registers.SetTargetOutputMode(slot, 0);
       }
-      RenderExecutorTestAccess::DrawAuto(
-          executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+      // The draw is split by CommandScheduler::FeedIdleGpu into two half-screen render passes in
+      // two command buffers, the first after a pending HTile clear: the second loads the first's
+      // depth instead of clearing it again (the left half would read 1).
+      const auto split_draw = [&](const char *check) {
+        const auto feeds = scheduler.FeedSubmitCount();
+        CommandSchedulerTestAccess::SetFeedMinWork(scheduler, 1);
+        scheduler.Wait(scheduler.CurrentTick() - 1);
+        registers.SetScreenScissor(0, 0, extent / 2, extent);
+        RenderExecutorTestAccess::DrawAuto(
+            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+        // Every submitted command buffer complete: the next draw feeds the GPU this one.
+        scheduler.Wait(scheduler.CurrentTick() - 1);
+        registers.SetScreenScissor(extent / 2, 0, extent, extent);
+        RenderExecutorTestAccess::DrawAuto(
+            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+        registers.SetScreenScissor(0, 0, extent, extent);
+        CommandSchedulerTestAccess::ResetFeedMinWork(scheduler);
+        Require(name, check, scheduler.FeedSubmitCount() == feeds + 1,
+                std::to_string(scheduler.FeedSubmitCount() - feeds) +
+                    " feed submits between the halves, expected 1");
+      };
+      Require(name, "pending HTile clear before a split draw",
+              cache.ClearMeta(stencil_target.htile_data_base_addr),
+              "the depth target lost its HTile metadata");
+      split_draw("feed between half-screen depth draws");
       const auto depth_only_pixels = ReadCachedTexel(
           name, context, depth.image_id, {}, {extent, extent, 1});
       Require(name, "disabled stale PS preserves fixed-function depth",
@@ -21971,6 +23251,16 @@ public:
           Require(name, "compact export to sparse MRT3", pixels[component] == expected,
                   "shader output routing used the write mask or clipped MRT3 with stale MRT0");
         }
+      }
+      TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+      split_draw("feed between half-screen colour draws");
+      const auto split_pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                               {}, {extent, extent, 1});
+      for (size_t component = 0; component < split_pixels.size(); component++) {
+        const auto expected = component % 4 == 3 ? 0x3f800000u : 0x3e800000u;
+        Require(name, "colour draws split by a feed", split_pixels[component] == expected,
+                "the render pass after the feed lost the first half's colour");
       }
 
       static const auto snorm_pixel = [] {
@@ -23851,6 +25141,7 @@ private:
   bool m_rasterization_supported = true;
   // VK_EXT_conditional_rendering, which production uses for fast clears it decides on the GPU.
   bool m_conditional_rendering = false;
+  bool m_draw_indirect_first_instance = false;
   bool m_compute_subgroup_size_control = false;
   u32 m_min_subgroup_size = 0;
   u32 m_max_subgroup_size = 0;
@@ -23892,6 +25183,7 @@ private:
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     m_runtime_context.conditional_rendering_enabled = m_conditional_rendering;
+    m_runtime_context.draw_indirect_first_instance_enabled = m_draw_indirect_first_instance;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -24213,6 +25505,8 @@ private:
     device_features.shaderFloat64 = available_features.shaderFloat64;
     device_features.fillModeNonSolid = m_rasterization_supported;
     device_features.tessellationShader = m_rasterization_supported;
+    m_draw_indirect_first_instance = available_features.drawIndirectFirstInstance == VK_TRUE;
+    device_features.drawIndirectFirstInstance = m_draw_indirect_first_instance;
     device_features.depthBounds = m_rasterization_supported;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{
@@ -53292,6 +54586,801 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4CeCompletion");
 }
 
+// Guest-ordered barriers (CommandScheduler::RequestGuestBarrier): each guest synchronisation
+// orders a producer before its consumer, unsynchronised dispatches record no barrier, and
+// emulator-internal work (CP fills, readbacks) orders itself.
+namespace GuestOrder {
+
+// Publishes GPU writes to [address, address + size) and copies them out.
+std::vector<uint32_t> ReadGuestWords(RenderContext &renderer, uint64_t address,
+                                     uint64_t size) {
+  constexpr uint64_t page = 0x1000;
+  for (uint64_t offset = 0; offset < size; offset += page) {
+    Require("QueueLabels", "readback", renderer.HandleFault(PageFaultAccess::Read,
+                                                               address + offset),
+            "GPU-written guest page was not published");
+  }
+  std::vector<uint32_t> words(size / sizeof(uint32_t));
+  std::memcpy(words.data(), reinterpret_cast<const void *>(address), size);
+  return words;
+}
+
+// Maps a fixed direct-memory range for GPU data and registers it with the renderer.
+void MapQueueLabelMemory(RenderContext &renderer, uint64_t base, uint64_t size) {
+  int64_t direct_offset = -1;
+  Require("QueueLabels", "direct allocation",
+          Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+              0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0,
+              &direct_offset) == 0,
+          "direct-memory allocation failed");
+  void *memory = reinterpret_cast<void *>(base);
+  Require("QueueLabels", "direct mapping",
+          Libs::LibKernel::Memory::KernelMapDirectMemory(&memory, size, 0x3, 0x10,
+                                                         direct_offset, size) == 0 &&
+              memory == reinterpret_cast<void *>(base),
+          "fixed direct-memory mapping failed");
+  renderer.MapMemory(base, size);
+}
+
+// A guest compute kernel with 64 threads per group: out[i] = i + s4 for the group's threads,
+// where s[0:3] is the output V# and s5 the group id.
+class FillKernel {
+public:
+  FillKernel() {
+    std::vector<u32> code;
+    AppendVop3(&code, 0x346u, 1, 5, InlineU32(6), Vgpr(0));
+    code.push_back(EncodeVop2(0x25u, 2, 4, 1));
+    code.push_back(EncodeVop2(0x1au, 1, InlineU32(2), 1));
+    code.push_back(EncodeMubuf0(0x1cu));
+    code.push_back(EncodeMubuf1(2, 0, 1));
+    AppendEnd(&code);
+    std::copy(code.begin(), code.end(), m_code.begin());
+    ShaderMapUserData(Address(), {.type = Prospero::ShaderBinaryType::kCs,
+                                  .code_size_bytes =
+                                      static_cast<uint32_t>(code.size() * sizeof(u32))});
+  }
+  [[nodiscard]] uint64_t Address() const {
+    return reinterpret_cast<uint64_t>(m_code.data());
+  }
+
+private:
+  // Programs are addressed in 256-byte units.
+  alignas(256) std::array<u32, 64> m_code{};
+};
+
+void AppendWriteData(std::vector<uint32_t> &stream, const void *destination,
+                     uint32_t value) {
+  const auto address = reinterpret_cast<uint64_t>(destination);
+  stream.insert(stream.end(), {KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0,
+                               static_cast<uint32_t>(address),
+                               static_cast<uint32_t>(address >> 32u), value});
+}
+
+void AppendWaitEqual(std::vector<uint32_t> &stream, const void *label, uint32_t value) {
+  const auto address = reinterpret_cast<uint64_t>(label);
+  stream.insert(stream.end(), {KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0), 0x10u | 3u,
+                               static_cast<uint32_t>(address),
+                               static_cast<uint32_t>(address >> 32u), value, UINT32_MAX,
+                               0});
+}
+
+// A guest kernel with 64 threads per group that loops before its load and store, so a reader not
+// ordered after it finds the old bytes: out[i] = in[i] + s8 + s9 after s9 (at least one) loop
+// iterations. s[0:3] is the input V#, s[4:7] the output V#, s10 the group id.
+class ChainKernel {
+public:
+  ChainKernel() {
+    std::vector<u32> code;
+    AppendVop3(&code, 0x346u, 1, 10, InlineU32(6), Vgpr(0)); // v_lshl_add_u32 v1, s10, 6, v0
+    code.push_back(EncodeVop2(0x1au, 1, InlineU32(2), 1));    // v_lshlrev_b32 v1, 2, v1
+    code.push_back(EncodeVop1(0x01u, 3, InlineU32(0)));       // v_mov_b32 v3, 0
+    code.push_back(EncodeSMovB32(11, InlineU32(0)));          // s_mov_b32 s11, 0
+    const auto loop = static_cast<int32_t>(code.size());
+    code.push_back(EncodeVop2(0x25u, 3, InlineU32(1), 3));    // v_add_nc_u32 v3, 1, v3
+    code.push_back(EncodeSop2(0x00u, 11, 11, InlineU32(1)));  // s_add_u32 s11, s11, 1
+    code.push_back(EncodeSopc(0x0au, 11, 9));                 // s_cmp_lt_u32 s11, s9
+    const auto next = static_cast<int32_t>(code.size()) + 1;
+    code.push_back(EncodeSopp(0x05u, static_cast<u32>(loop - next) & 0xffffu)); // s_cbranch_scc1
+    code.push_back(EncodeMubuf0(0x0cu));                      // buffer_load_dword v2, v1, s[0:3]
+    code.push_back(EncodeMubuf1(2, 0, 1));
+    code.push_back(EncodeSopp(0x0cu, 0));                     // s_waitcnt 0
+    code.push_back(EncodeVop2(0x25u, 2, 8, 2));               // v_add_nc_u32 v2, s8, v2
+    code.push_back(EncodeVop2(0x25u, 2, Vgpr(3), 2));         // v_add_nc_u32 v2, v3, v2
+    code.push_back(EncodeMubuf0(0x1cu));                      // buffer_store_dword v2, v1, s[4:7]
+    code.push_back(EncodeMubuf1(2, 1, 1));
+    AppendEnd(&code);
+    EXIT_IF(code.size() > m_code.size());
+    std::copy(code.begin(), code.end(), m_code.begin());
+    ShaderMapUserData(Address(), {.type = Prospero::ShaderBinaryType::kCs,
+                                  .code_size_bytes =
+                                      static_cast<uint32_t>(code.size() * sizeof(u32))});
+  }
+  [[nodiscard]] uint64_t Address() const {
+    return reinterpret_cast<uint64_t>(m_code.data());
+  }
+
+private:
+  alignas(256) std::array<u32, 64> m_code{};
+};
+
+constexpr uint32_t ChainThreads = 64;
+constexpr uint32_t ChainBytes = ChainThreads * sizeof(uint32_t);
+
+void AppendSetSh(std::vector<uint32_t> &stream, uint32_t reg,
+                 std::initializer_list<uint32_t> values) {
+  stream.push_back(KYTY_PM4(static_cast<uint32_t>(values.size()) + 2u, Pm4::IT_SET_SH_REG, 0));
+  stream.push_back(reg);
+  stream.insert(stream.end(), values.begin(), values.end());
+}
+
+// A raw (OOB_SELECT 3) dword V#: offsets below `bytes` are in range.
+ShaderBufferResource RawDwordBuffer(uint64_t address, uint32_t bytes) {
+  ShaderBufferResource value{};
+  value.UpdateAddress48(address);
+  value.fields[2] = bytes;
+  value.fields[3] = DstSel(4, 5, 6, 7) |
+                    (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u) | (3u << 28u);
+  return value;
+}
+
+void AppendProgram(std::vector<uint32_t> &stream, uint64_t program, uint32_t user_sgprs,
+                   uint32_t threads_x) {
+  AppendSetSh(stream, Pm4::COMPUTE_PGM_LO, {static_cast<uint32_t>(program >> 8u),
+                                            static_cast<uint32_t>(program >> 40u)});
+  AppendSetSh(stream, Pm4::COMPUTE_PGM_RSRC1, {0});
+  AppendSetSh(stream, Pm4::COMPUTE_PGM_RSRC2,
+              {(user_sgprs << Pm4::COMPUTE_PGM_RSRC2_USER_SGPR_SHIFT) |
+               (1u << Pm4::COMPUTE_PGM_RSRC2_TGID_X_EN_SHIFT)});
+  AppendSetSh(stream, Pm4::COMPUTE_NUM_THREAD_X, {threads_x, 1, 1});
+}
+
+void AppendChainDispatch(std::vector<uint32_t> &stream, const ChainKernel &kernel,
+                         uint64_t output, uint64_t input, uint32_t constant, uint32_t loops) {
+  AppendProgram(stream, kernel.Address(), 10, ChainThreads);
+  const auto out = RawDwordBuffer(output, ChainBytes);
+  const auto in = RawDwordBuffer(input, ChainBytes);
+  AppendSetSh(stream, Pm4::COMPUTE_USER_DATA_0,
+              {in.fields[0], in.fields[1], in.fields[2], in.fields[3], out.fields[0],
+               out.fields[1], out.fields[2], out.fields[3], constant, std::max(loops, 1u)});
+  stream.insert(stream.end(), {KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, 0), 1, 1, 1, 0x41u});
+}
+
+
+// The registers of a FillKernel dispatch over 64-thread groups writing up to `words` dwords at
+// output; the dispatch packet follows.
+void AppendFillSetup(std::vector<uint32_t> &stream, const FillKernel &kernel, uint64_t output,
+                     uint32_t words, uint32_t constant) {
+  AppendProgram(stream, kernel.Address(), 5, 64);
+  ShaderBufferResource descriptor{};
+  descriptor.UpdateAddress48(output);
+  descriptor.fields[2] = words * sizeof(uint32_t);
+  descriptor.fields[3] =
+      DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+  AppendSetSh(stream, Pm4::COMPUTE_USER_DATA_0,
+              {descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
+               descriptor.fields[3], constant});
+}
+
+
+void AppendAcquireMem(std::vector<uint32_t> &stream) {
+  stream.insert(stream.end(),
+                {KYTY_PM4(7, Pm4::IT_ACQUIRE_MEM, 0), 0x00400000u, 1u, 0u, 0u, 0u, 10u});
+}
+
+// The eight-dword form AgcDcbAcquireMem emits (Pm4AcquireMemPackets' captured byte range).
+void AppendNativeAcquireMem(std::vector<uint32_t> &stream) {
+  stream.insert(stream.end(), {KYTY_PM4(8, Pm4::IT_ACQUIRE_MEM, 0), 0x80000000u, 1u, 0u,
+                               0x20360003u, 0u, 25u, 0x9000u});
+}
+
+void AppendPartialFlush(std::vector<uint32_t> &stream) {
+  // EVENT_WRITE CS_PARTIAL_FLUSH.
+  stream.insert(stream.end(), {KYTY_PM4(2, Pm4::IT_EVENT_WRITE, 0), 0x07u | (4u << 8u)});
+}
+
+// Long enough (about a millisecond) that an unordered consumer starts well before the producer
+// stores.
+constexpr uint32_t ProducerLoops = 400000;
+
+void RequireChainWords(RenderContext &renderer, const char *name, uint64_t address,
+                       uint32_t expected, const char *stale_meaning) {
+  const auto words = ReadGuestWords(renderer, address, ChainBytes);
+  for (uint32_t i = 0; i < ChainThreads; i++) {
+    Require("GuestOrderedBarriers", name, words[i] == expected,
+            std::string(stale_meaning) + ": word " + std::to_string(i) + " is " +
+                Hex(words[i]) + ", expected " + Hex(expected));
+  }
+}
+
+
+// Producer, synchronisation, consumer: the consumer must read the producer's output. Each round
+// uses fresh memory and its own constants, so a stale read cannot match.
+void CheckGuestSyncOrders(RenderContext &renderer, GuestGpu &gpu, uint64_t base,
+                          const char *name,
+                          const std::function<void(std::vector<uint32_t> &, uint32_t)> &sync,
+                          bool split_submission = false) {
+  static const ChainKernel kernel;
+  constexpr uint32_t Rounds = 4;
+  for (uint32_t round = 0; round < Rounds; round++) {
+    const uint64_t zero = base + round * 0x4000ull;
+    const uint64_t produced = zero + 0x1000;
+    const uint64_t consumed = zero + 0x2000;
+    const uint32_t producer_constant = 0x10000u * (round + 1);
+    const uint32_t consumer_constant = 0x20u + round;
+    std::vector<uint32_t> producer;
+    std::vector<uint32_t> consumer;
+    AppendChainDispatch(producer, kernel, produced, zero, producer_constant, ProducerLoops);
+    sync(producer, round);
+    AppendChainDispatch(consumer, kernel, consumed, produced, consumer_constant, 1);
+    if (split_submission) {
+      // Each submission start requests the barrier before its first dispatch; the driver orders
+      // the two queue submits on its own, so the count checks the request itself.
+      auto &scheduler = renderer.GetCommandScheduler();
+      const auto barriers = scheduler.GlobalBarrierCount();
+      gpu.Submit(producer, {});
+      gpu.Submit(consumer, {});
+      gpu.WaitForIdle();
+      Require("GuestOrderedBarriers", name, scheduler.GlobalBarrierCount() - barriers >= 2,
+              "two submissions recorded " +
+                  std::to_string(scheduler.GlobalBarrierCount() - barriers) +
+                  " global barriers, expected at least 2");
+    } else {
+      producer.insert(producer.end(), consumer.begin(), consumer.end());
+      gpu.Submit(producer, {});
+    }
+    gpu.WaitForIdle();
+    RequireChainWords(renderer, name, consumed,
+                      producer_constant + ProducerLoops + consumer_constant + 1,
+                      "the consumer ran before the synchronisation ordered it");
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// A guest compute program at a 256-byte aligned address (PGM_LO/HI hold it in 256-byte units).
+class GuestKernel {
+public:
+  explicit GuestKernel(const std::vector<u32> &code) {
+    EXIT_IF(code.size() > m_code.size());
+    std::copy(code.begin(), code.end(), m_code.begin());
+    ShaderMapUserData(Address(), {.type = Prospero::ShaderBinaryType::kCs,
+                                  .code_size_bytes =
+                                      static_cast<uint32_t>(code.size() * sizeof(u32))});
+  }
+  [[nodiscard]] uint64_t Address() const {
+    return reinterpret_cast<uint64_t>(m_code.data());
+  }
+
+private:
+  alignas(256) std::array<u32, 64> m_code{};
+};
+
+// The dwords s4, s5 and s6 to s[0:3] at byte offsets 0, 4 and 8: indirect arguments.
+GuestKernel MakeArgumentsKernel() {
+  std::vector<u32> code;
+  for (u32 i = 0; i < 3; i++) {
+    code.push_back(EncodeVop1(0x01u, 1, 4u + i));             // v_mov_b32 v1, s(4 + i)
+    code.push_back(EncodeMubuf0(0x1cu, i * 4u, false, false)); // buffer_store_dword v1, off
+    code.push_back(EncodeMubuf1(1, 0, 0));
+  }
+  AppendEnd(&code);
+  return GuestKernel(code);
+}
+
+void AppendArgumentsDispatch(std::vector<uint32_t> &stream, const GuestKernel &kernel,
+                             uint64_t args, const std::array<uint32_t, 3> &values) {
+  AppendProgram(stream, kernel.Address(), 7, 1);
+  const auto out = RawDwordBuffer(args, 3 * sizeof(uint32_t));
+  AppendSetSh(stream, Pm4::COMPUTE_USER_DATA_0,
+              {out.fields[0], out.fields[1], out.fields[2], out.fields[3], values[0], values[1],
+               values[2]});
+  stream.insert(stream.end(), {KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, 0), 1, 1, 1, 0x41u});
+}
+
+// USE_THREAD_DIMENSIONS dispatches: thread counts in the packet, or at `args`.
+void AppendThreadDirect(std::vector<uint32_t> &stream, uint32_t threads) {
+  stream.insert(stream.end(), {KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, 0), threads, 1, 1, 0x61u});
+}
+
+void AppendThreadIndirect(std::vector<uint32_t> &stream, uint64_t args) {
+  stream.insert(stream.end(), {KYTY_PM4(4, Pm4::IT_DISPATCH_INDIRECT, 0),
+                               static_cast<uint32_t>(args), static_cast<uint32_t>(args >> 32u),
+                               0x61u});
+}
+
+// A FillKernel thread-dimension dispatch's output: word i is i + constant below `threads`, and
+// untouched (zero) from there to `words`.
+void RequireThreadFill(RenderContext &renderer, const char *name, uint64_t output,
+                       uint32_t threads, uint32_t constant, uint32_t words) {
+  const auto values = ReadGuestWords(renderer, output, words * sizeof(uint32_t));
+  for (uint32_t i = 0; i < words; i++) {
+    const uint32_t expected = i < threads ? i + constant : 0;
+    Require("GuestOrderedBarriers", name, values[i] == expected,
+            "word " + std::to_string(i) + " is " + Hex(values[i]) + ", expected " +
+                Hex(expected) + " (" + std::to_string(threads) + " threads)");
+  }
+}
+
+void CheckThreadDimensionBatches(RenderContext &renderer, GuestGpu &gpu, uint64_t base) {
+  auto &scheduler = renderer.GetCommandScheduler();
+  auto &executor = renderer.GetRenderExecutor();
+  static const FillKernel fill;
+  static const ChainKernel chain;
+  static const GuestKernel arguments = MakeArgumentsKernel();
+  constexpr uint32_t Words = 256; // four groups
+  constexpr uint32_t OutputStride = Words * sizeof(uint32_t);
+  const auto stats = [&] { return RenderExecutorTestAccess::ThreadBatchStats(executor); };
+
+  // Direct: 64 dispatches with no synchronisation; only the first follows a barrier once the
+  // buffers exist (second run), and each masks the lanes past its count.
+  {
+    constexpr const char *name = "ThreadDimDirectNoBarrier";
+    constexpr uint32_t Dispatches = 64;
+    const uint64_t output = base;
+    for (uint32_t run = 0; run < 2; run++) {
+      std::vector<uint32_t> stream;
+      for (uint32_t i = 0; i < Dispatches; i++) {
+        AppendFillSetup(stream, fill, output + i * OutputStride, Words, 0x1000u * (run + 1) + i);
+        AppendThreadDirect(stream, 1 + (i * 37u) % (Words - 1));
+      }
+      const auto after = scheduler.OrderedDispatchCount();
+      const auto barriers = scheduler.GlobalBarrierCount();
+      gpu.Submit(stream, {});
+      gpu.WaitForIdle();
+      if (run == 1) {
+        Require("GuestOrderedBarriers", name,
+                scheduler.OrderedDispatchCount() - after == 1 &&
+                    scheduler.GlobalBarrierCount() - barriers == 1,
+                std::to_string(scheduler.OrderedDispatchCount() - after) +
+                    " dispatches after a global barrier and " +
+                    std::to_string(scheduler.GlobalBarrierCount() - barriers) +
+                    " global barriers, expected 1 and 1");
+      }
+      for (uint32_t i = 0; i < Dispatches; i++) {
+        RequireThreadFill(renderer, name, output + i * OutputStride, 1 + (i * 37u) % (Words - 1),
+                          0x1000u * (run + 1) + i, Words);
+      }
+    }
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // Indirect: a dispatch writes the thread counts of 16 indirect dispatches, an acquire orders
+  // them; one batch converts all 16 behind the acquire's barrier, and the second run's counts
+  // differ from the first's, so a stale conversion cannot pass.
+  {
+    constexpr const char *name = "ThreadDimIndirectBatched";
+    constexpr uint32_t Dispatches = 16;
+    const uint64_t input = base + 0x40000;
+    const uint64_t args = input + 0x1000;
+    const uint64_t output = input + 0x2000;
+    const auto threads = [](uint32_t run, uint32_t i) { return 1 + (i * 29u) % 200 + run * 40u; };
+    const uint32_t bias = 7 + ProducerLoops;
+    for (uint32_t run = 0; run < 2; run++) {
+      // CPU writes go to pages the GPU has not used (no write tracking here).
+      const uint64_t source = input + 0x8000 + run * 0x4000ull;
+      auto *in = reinterpret_cast<uint32_t *>(source);
+      for (uint32_t i = 0; i < ChainThreads; i++) {
+        const uint32_t dimension = i % 3 == 0 && i / 3 < Dispatches ? threads(run, i / 3) : 1;
+        in[i] = dimension - bias;
+      }
+      std::vector<uint32_t> stream;
+      AppendChainDispatch(stream, chain, args, source, 7, ProducerLoops);
+      AppendAcquireMem(stream);
+      for (uint32_t i = 0; i < Dispatches; i++) {
+        AppendFillSetup(stream, fill, output + i * OutputStride, Words, 0x2000u * (run + 1) + i);
+        AppendThreadIndirect(stream, args + i * 12ull);
+      }
+      const auto before = stats();
+      const auto after = scheduler.OrderedDispatchCount();
+      gpu.Submit(stream, {});
+      gpu.WaitForIdle();
+      const auto now = stats();
+      // Once the buffers exist (the first run creates them, which may join the arguments').
+      if (run == 1) {
+        Require("GuestOrderedBarriers", name,
+                now.batches - before.batches == 1 && now.batched - before.batched == Dispatches,
+                std::to_string(now.batches - before.batches) + " batches converted " +
+                    std::to_string(now.batched - before.batched) +
+                    " dispatches, expected 1 and " + std::to_string(Dispatches));
+        // The producer and the first indirect dispatch, behind the acquire's barrier.
+        Require("GuestOrderedBarriers", name, scheduler.OrderedDispatchCount() - after == 2,
+                std::to_string(scheduler.OrderedDispatchCount() - after) +
+                    " dispatches after a global barrier, expected 2");
+      }
+      for (uint32_t i = 0; i < Dispatches; i++) {
+        RequireThreadFill(renderer, name, output + i * OutputStride, threads(run, i),
+                          0x2000u * (run + 1) + i, Words);
+      }
+    }
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // A command-processor write of the second dispatch's counts between the two ends the batch:
+  // the second dispatch starts its own, which reads the written counts.
+  {
+    constexpr const char *name = "ThreadDimIndirectCpWriteSplits";
+    const uint64_t args = base + 0x60000;
+    const uint64_t output = args + 0x1000;
+    constexpr std::array<uint32_t, 3> first{70, 1, 1};
+    constexpr std::array<uint32_t, 3> old_second{30, 1, 1};
+    constexpr std::array<uint32_t, 3> new_second{150, 1, 1};
+    std::memcpy(reinterpret_cast<void *>(args), first.data(), sizeof(first));
+    std::memcpy(reinterpret_cast<void *>(args + 12), old_second.data(), sizeof(old_second));
+    std::vector<uint32_t> stream;
+    AppendAcquireMem(stream);
+    AppendFillSetup(stream, fill, output, Words, 0x3000u);
+    AppendThreadIndirect(stream, args);
+    const auto second = args + 12;
+    stream.insert(stream.end(), {KYTY_PM4(7, Pm4::IT_WRITE_DATA, 0), 0,
+                                 static_cast<uint32_t>(second),
+                                 static_cast<uint32_t>(second >> 32u), new_second[0],
+                                 new_second[1], new_second[2]});
+    AppendFillSetup(stream, fill, output + OutputStride, Words, 0x3100u);
+    AppendThreadIndirect(stream, second);
+    const auto before = stats();
+    gpu.Submit(stream, {});
+    gpu.WaitForIdle();
+    const auto now = stats();
+    RequireThreadFill(renderer, name, output, first[0], 0x3000u, Words);
+    RequireThreadFill(renderer, name, output + OutputStride, new_second[0], 0x3100u, Words);
+    Require("GuestOrderedBarriers", name,
+            now.batches - before.batches == 2 && now.batched - before.batched == 2 &&
+                now.fallbacks == before.fallbacks,
+            std::to_string(now.batches - before.batches) + " batches and " +
+                std::to_string(now.batched - before.batched) +
+                " batched dispatches, expected 2 and 2 with no fallback: the batch crossed the "
+                "write");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // A dispatch in the window writes the second dispatch's counts through a written binding: the
+  // batch read them before, so the second converts alone, after the write.
+  {
+    constexpr const char *name = "ThreadDimIndirectWrittenFallback";
+    const uint64_t args = base + 0x70000;
+    const uint64_t output = args + 0x1000;
+    constexpr std::array<uint32_t, 3> first{90, 1, 1};
+    constexpr std::array<uint32_t, 3> old_second{20, 1, 1};
+    constexpr std::array<uint32_t, 3> new_second{220, 1, 1};
+    std::memcpy(reinterpret_cast<void *>(args), first.data(), sizeof(first));
+    std::memcpy(reinterpret_cast<void *>(args + 12), old_second.data(), sizeof(old_second));
+    std::vector<uint32_t> stream;
+    AppendAcquireMem(stream);
+    AppendFillSetup(stream, fill, output, Words, 0x4000u);
+    AppendThreadIndirect(stream, args);
+    AppendArgumentsDispatch(stream, arguments, args + 12, new_second);
+    AppendFillSetup(stream, fill, output + OutputStride, Words, 0x4100u);
+    AppendThreadIndirect(stream, args + 12);
+    const auto before = stats();
+    gpu.Submit(stream, {});
+    gpu.WaitForIdle();
+    const auto now = stats();
+    RequireThreadFill(renderer, name, output, first[0], 0x4000u, Words);
+    RequireThreadFill(renderer, name, output + OutputStride, new_second[0], 0x4100u, Words);
+    Require("GuestOrderedBarriers", name,
+            now.batched - before.batched == 1 && now.fallbacks[3] - before.fallbacks[3] == 1,
+            std::to_string(now.batched - before.batched) + " batched and " +
+                std::to_string(now.fallbacks[3] - before.fallbacks[3]) +
+                " written fallbacks, expected 1 and 1");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // As above, with the native eight-dword ACQUIRE_MEM between the writer and the second
+  // dispatch: the acquire ends the window, so the second converts in a batch of its own, after
+  // the write, instead of falling back.
+  {
+    constexpr const char *name = "ThreadDimIndirectAcquireSplits";
+    const uint64_t args = base + 0x80000;
+    const uint64_t output = args + 0x1000;
+    {
+      // The scan itself stops at the acquire: the batch does not convert the dispatch after it.
+      std::vector<uint32_t> window;
+      AppendThreadIndirect(window, args);
+      const auto acquire = static_cast<uint32_t>(window.size());
+      AppendNativeAcquireMem(window);
+      AppendThreadIndirect(window, args + 12);
+      GraphicsInitJmpTables();
+      CommandProcessor processor(renderer, 0);
+      Pm4ThreadDispatchScan scan(renderer, 0);
+      std::vector<ThreadDispatchRequest> requests;
+      const auto end = scan.Scan(processor, window, 0, requests);
+      Require("GuestOrderedBarriers", name, end == acquire && requests.size() == 1,
+              "the thread-dimension scan stopped at " + std::to_string(end) + " with " +
+                  std::to_string(requests.size()) + " dispatches, expected the acquire at " +
+                  std::to_string(acquire) + " with 1");
+    }
+    constexpr std::array<uint32_t, 3> first{60, 1, 1};
+    constexpr std::array<uint32_t, 3> old_second{25, 1, 1};
+    constexpr std::array<uint32_t, 3> new_second{180, 1, 1};
+    std::memcpy(reinterpret_cast<void *>(args), first.data(), sizeof(first));
+    std::memcpy(reinterpret_cast<void *>(args + 12), old_second.data(), sizeof(old_second));
+    std::vector<uint32_t> stream;
+    AppendAcquireMem(stream);
+    AppendFillSetup(stream, fill, output, Words, 0x5000u);
+    AppendThreadIndirect(stream, args);
+    AppendArgumentsDispatch(stream, arguments, args + 12, new_second);
+    AppendNativeAcquireMem(stream);
+    AppendFillSetup(stream, fill, output + OutputStride, Words, 0x5100u);
+    AppendThreadIndirect(stream, args + 12);
+    const auto before = stats();
+    gpu.Submit(stream, {});
+    gpu.WaitForIdle();
+    const auto now = stats();
+    RequireThreadFill(renderer, name, output, first[0], 0x5000u, Words);
+    RequireThreadFill(renderer, name, output + OutputStride, new_second[0], 0x5100u, Words);
+    Require("GuestOrderedBarriers", name,
+            now.batches - before.batches == 2 && now.batched - before.batched == 2 &&
+                now.fallbacks == before.fallbacks,
+            std::to_string(now.batches - before.batches) + " batches and " +
+                std::to_string(now.batched - before.batched) +
+                " batched dispatches, expected 2 and 2 with no fallback: the batch crossed the "
+                "acquire");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // A conversion ring of 8 slots (segments of 2): 32 indirect dispatches of one window, of which
+  // a batch takes the 6 the ring holds (8 less a segment) and the rest convert alone, each
+  // reuse of a segment waiting for the dispatches that read it instead of overwriting them.
+  {
+    constexpr const char *name = "RingReuseWaitsForTick";
+    constexpr uint32_t Dispatches = 32;
+    const uint64_t indirect_output = base + 0xa0000;
+    const uint64_t args = base + 0xc0000;
+    const auto indirect_threads = [](uint32_t i) { return 1 + (i * 41u + 17u) % (Words - 1); };
+    gpu.SendCommandSync([&] {
+      scheduler.Finish();
+      RenderExecutorTestAccess::ReplaceIndirectThreads(executor, 8);
+    });
+    for (uint32_t i = 0; i < Dispatches; i++) {
+      const std::array<uint32_t, 3> counts{indirect_threads(i), 1, 1};
+      std::memcpy(reinterpret_cast<void *>(args + i * 12ull), counts.data(), sizeof(counts));
+    }
+    std::vector<uint32_t> stream;
+    AppendAcquireMem(stream);
+    for (uint32_t i = 0; i < Dispatches; i++) {
+      AppendFillSetup(stream, fill, indirect_output + i * OutputStride, Words, 0x6000u + i);
+      AppendThreadIndirect(stream, args + i * 12ull);
+    }
+    const auto before = stats();
+    gpu.Submit(stream, {});
+    gpu.WaitForIdle();
+    const auto now = stats();
+    uint64_t waits = 0;
+    gpu.SendCommandSync([&] {
+      waits = RenderExecutorTestAccess::ThreadRingWaits(executor);
+      scheduler.Finish();
+      RenderExecutorTestAccess::ReplaceIndirectThreads(executor,
+                                                       IndirectThreadDispatch::DefaultSlots);
+    });
+    for (uint32_t i = 0; i < Dispatches; i++) {
+      RequireThreadFill(renderer, name, indirect_output + i * OutputStride, indirect_threads(i),
+                        0x6000u + i, Words);
+    }
+    Require("GuestOrderedBarriers", name, now.batched - before.batched == 6 && waits > 0,
+            std::to_string(now.batched - before.batched) + " batched dispatches and " +
+                std::to_string(waits) + " conversion ring waits, expected 6 and at least 1");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+}
+
+void CheckGuestOrderedBarriers(VulkanHarness &vulkan) {
+  auto &renderer = vulkan.RuntimeRenderer();
+  constexpr uint64_t base = 0x0000000208000000ull;
+  constexpr uint64_t size = 0x400000;
+  MapQueueLabelMemory(renderer, base, size);
+  renderer.InitializeGpu(nullptr);
+  auto &gpu = renderer.GetGpu();
+  auto &scheduler = renderer.GetCommandScheduler();
+  const auto region = [&](uint32_t index) { return base + index * 0x20000ull; };
+  alignas(64) std::array<uint64_t, 8> labels{};
+
+  CheckGuestSyncOrders(renderer, gpu, region(0), "PartialFlushOrders",
+                       [](std::vector<uint32_t> &stream, uint32_t) { AppendPartialFlush(stream); });
+  CheckGuestSyncOrders(renderer, gpu, region(1), "CacheEventOrders",
+                       [](std::vector<uint32_t> &stream, uint32_t) {
+                         // EVENT_WRITE CB_DATA_WRITEBACK_INVALIDATE (0x31).
+                         stream.insert(stream.end(),
+                                       {KYTY_PM4(2, Pm4::IT_EVENT_WRITE, 0), 0x31u});
+                       });
+  const auto release_mem = [](std::vector<uint32_t> &stream, void *label, uint32_t value) {
+    // The bottom-of-pipe form without cache actions, which records no barrier of its own.
+    const auto address = reinterpret_cast<uint64_t>(label);
+    stream.insert(stream.end(),
+                  {KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM), 0x28u | (5u << 8u), 1u << 29u,
+                   static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u), value,
+                   0u, 0u});
+  };
+  CheckGuestSyncOrders(renderer, gpu, region(2), "ReleaseMemOrders",
+                       [&](std::vector<uint32_t> &stream, uint32_t round) {
+                         release_mem(stream, &labels[0], round + 1);
+                       });
+  CheckGuestSyncOrders(renderer, gpu, region(3), "ReleaseMemLabelOrders",
+                       [&](std::vector<uint32_t> &stream, uint32_t round) {
+                         release_mem(stream, &labels[1], round + 1);
+                         AppendWaitEqual(stream, &labels[1], round + 1);
+                       });
+  CheckGuestSyncOrders(renderer, gpu, region(4), "EndOfPipeOrders",
+                       [&](std::vector<uint32_t> &stream, uint32_t round) {
+                         // EVENT_WRITE_EOP, bottom of pipe, 64-bit data, no cache action.
+                         const auto address = reinterpret_cast<uint64_t>(&labels[2]);
+                         stream.insert(stream.end(),
+                                       {KYTY_PM4(6, Pm4::IT_EVENT_WRITE_EOP, 0), 0x28u,
+                                        static_cast<uint32_t>(address),
+                                        static_cast<uint32_t>((address >> 32u) & 0xffffu) |
+                                            (2u << 29u),
+                                        round + 1, 0u});
+                       });
+  // Both ACQUIRE_MEM forms, in alternate rounds.
+  CheckGuestSyncOrders(renderer, gpu, region(5), "AcquireMemOrders",
+                       [](std::vector<uint32_t> &stream, uint32_t round) {
+                         if (round % 2u == 0u) {
+                           AppendNativeAcquireMem(stream);
+                         } else {
+                           AppendAcquireMem(stream);
+                         }
+                       });
+  CheckGuestSyncOrders(renderer, gpu, region(6), "WaitRegMemOrders",
+                       [&](std::vector<uint32_t> &stream, uint32_t) {
+                         // A label the CPU set already: the wait passes on arrival.
+                         labels[3] = 1;
+                         AppendWaitEqual(stream, &labels[3], 1);
+                       });
+  CheckGuestSyncOrders(
+      renderer, gpu, region(7), "SubmissionOrders", [](std::vector<uint32_t> &, uint32_t) {},
+      true);
+
+  static const ChainKernel kernel;
+  // Back-to-back dispatches with no synchronisation record no barrier between them; only the
+  // submission start orders the first.
+  {
+    constexpr uint32_t Dispatches = 64;
+    const uint64_t zero = region(8);
+    std::vector<uint32_t> stream;
+    for (uint32_t i = 0; i < Dispatches; i++) {
+      AppendChainDispatch(stream, kernel, zero + 0x1000 + i * ChainBytes, zero, i, 64);
+    }
+    const auto ordered = scheduler.OrderedDispatchCount();
+    const auto barriers = scheduler.GlobalBarrierCount();
+    gpu.Submit(stream, {});
+    gpu.WaitForIdle();
+    Require("GuestOrderedBarriers", "UnsyncedDispatchesNoBarrier",
+            scheduler.OrderedDispatchCount() - ordered == 1 &&
+                scheduler.GlobalBarrierCount() - barriers == 1,
+            "unsynchronised dispatches recorded " +
+                std::to_string(scheduler.OrderedDispatchCount() - ordered) +
+                " ordered dispatches and " +
+                std::to_string(scheduler.GlobalBarrierCount() - barriers) +
+                " global barriers, expected 1 and 1");
+    for (uint32_t i = 0; i < Dispatches; i++) {
+      RequireChainWords(renderer, "UnsyncedDispatchesNoBarrier", zero + 0x1000 + i * ChainBytes,
+                        i + 64, "an unsynchronised dispatch lost its output");
+    }
+    std::printf("[host]    %-32s ok\n", "UnsyncedDispatchesNoBarrier");
+  }
+
+  // A CP fill of memory the first dispatch reads and the second reads again, with no guest
+  // synchronisation: the upload must wait for the first and be seen by the second.
+  {
+    const uint64_t source = region(9);
+    const uint64_t first = source + 0x1000;
+    const uint64_t second = source + 0x2000;
+    constexpr uint32_t Fill = 0x5a5a0000u;
+    std::vector<uint32_t> stream;
+    AppendChainDispatch(stream, kernel, first, source, 7, ProducerLoops);
+    stream.insert(stream.end(),
+                  {KYTY_PM4(7, Pm4::IT_DMA_DATA, 0), 2u << 29u, Fill, 0u,
+                   static_cast<uint32_t>(source), static_cast<uint32_t>(source >> 32u),
+                   ChainBytes});
+    AppendChainDispatch(stream, kernel, second, source, 9, 1);
+    gpu.Submit(stream, {});
+    gpu.WaitForIdle();
+    RequireChainWords(renderer, "CpFillBetweenDispatches", first, 7 + ProducerLoops,
+                      "the upload overwrote memory an earlier dispatch still had to read");
+    RequireChainWords(renderer, "CpFillBetweenDispatches", second, Fill + 9 + 1,
+                      "the dispatch after the upload read the old bytes");
+    std::printf("[host]    %-32s ok\n", "CpFillBetweenDispatches");
+  }
+
+  // A CP fill of memory a dispatch writes: the fill lands after the dispatch's store.
+  {
+    const uint64_t zero = region(10);
+    const uint64_t produced = zero + 0x1000;
+    const uint64_t consumed = zero + 0x2000;
+    constexpr uint32_t Fill = 0x3c3c0000u;
+    std::vector<uint32_t> stream;
+    AppendChainDispatch(stream, kernel, produced, zero, 5, ProducerLoops);
+    stream.insert(stream.end(),
+                  {KYTY_PM4(7, Pm4::IT_DMA_DATA, 0), 2u << 29u, Fill, 0u,
+                   static_cast<uint32_t>(produced), static_cast<uint32_t>(produced >> 32u),
+                   ChainBytes});
+    AppendChainDispatch(stream, kernel, consumed, produced, 3, 1);
+    gpu.Submit(stream, {});
+    gpu.WaitForIdle();
+    RequireChainWords(renderer, "GpuFillAfterDispatch", consumed, Fill + 3 + 1,
+                      "the fill did not follow the dispatch that wrote the memory before it");
+    std::printf("[host]    %-32s ok\n", "GpuFillAfterDispatch");
+  }
+
+  // A readback of an unsynchronised dispatch's output waits for it.
+  {
+    const uint64_t zero = region(11);
+    std::vector<uint32_t> stream;
+    AppendChainDispatch(stream, kernel, zero + 0x1000, zero, 11, ProducerLoops);
+    gpu.Submit(stream, {});
+    gpu.WaitForIdle();
+    RequireChainWords(renderer, "ReadbackAfterUnsyncedDispatch", zero + 0x1000,
+                      11 + ProducerLoops, "the readback did not wait for the dispatch");
+    std::printf("[host]    %-32s ok\n", "ReadbackAfterUnsyncedDispatch");
+  }
+
+  // A dispatch computes the group count of an indirect dispatch after a partial flush.
+  {
+    static const FillKernel fill;
+    constexpr uint32_t Groups = 5;
+    constexpr uint32_t MaxGroups = 16;
+    constexpr uint32_t Constant = 13;
+    const uint64_t source = region(13);
+    const uint64_t args = source + 0x1000;
+    const uint64_t output = source + 0x2000;
+    const uint32_t bias = Constant + ProducerLoops;
+    std::vector<uint32_t> stream;
+    AppendWriteData(stream, reinterpret_cast<const void *>(source), Groups - bias);
+    AppendWriteData(stream, reinterpret_cast<const void *>(source + 4), 1u - bias);
+    AppendWriteData(stream, reinterpret_cast<const void *>(source + 8), 1u - bias);
+    AppendChainDispatch(stream, kernel, args, source, Constant, ProducerLoops);
+    AppendPartialFlush(stream);
+    AppendFillSetup(stream, fill, output, MaxGroups * 64, 1000);
+    stream.insert(stream.end(), {KYTY_PM4(4, Pm4::IT_DISPATCH_INDIRECT, 0),
+                                 static_cast<uint32_t>(args),
+                                 static_cast<uint32_t>(args >> 32u), 0x41u});
+    gpu.Submit(stream, {});
+    gpu.WaitForIdle();
+    const auto words = ReadGuestWords(renderer, output, MaxGroups * 64 * sizeof(uint32_t));
+    for (uint32_t i = 0; i < MaxGroups * 64; i++) {
+      const uint32_t expected = i < Groups * 64 ? i + 1000 : 0;
+      Require("GuestOrderedBarriers", "IndirectArgsAfterSync", words[i] == expected,
+              "word " + std::to_string(i) + " is " + Hex(words[i]) + ", expected " +
+                  Hex(expected) + ": the indirect dispatch read its arguments early");
+    }
+    std::printf("[host]    %-32s ok\n", "IndirectArgsAfterSync");
+  }
+
+  // A draw after a synchronisation that follows unordered dispatches takes the global barrier
+  // first (its preparation and vertex fetch read what they wrote); with no dispatch since the
+  // last barrier it takes none.
+  {
+    constexpr const char *name = "DrawAfterSyncOrdersDispatches";
+    // DRAW_INDEX_AUTO of no vertices: the draw returns once its barrier is decided.
+    const std::array<uint32_t, 3> draw{KYTY_PM4(3, Pm4::IT_DRAW_INDEX_AUTO, 0), 0u, 0u};
+    for (const bool dispatch : {true, false}) {
+      const uint64_t zero = region(14);
+      std::vector<uint32_t> stream;
+      if (dispatch) {
+        AppendChainDispatch(stream, kernel, zero + 0x1000, zero, 1, 64);
+      }
+      AppendAcquireMem(stream);
+      stream.insert(stream.end(), draw.begin(), draw.end());
+      const auto barriers = scheduler.GlobalBarrierCount();
+      gpu.Submit(stream, {});
+      gpu.WaitForIdle();
+      // With the dispatch: the submission's barrier before it and the acquire's before the draw.
+      const uint64_t expected = dispatch ? 2 : 0;
+      Require("GuestOrderedBarriers", name,
+              scheduler.GlobalBarrierCount() - barriers == expected,
+              std::to_string(scheduler.GlobalBarrierCount() - barriers) +
+                  " global barriers, expected " + std::to_string(expected) +
+                  (dispatch ? " with a dispatch" : " without one"));
+    }
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  CheckThreadDimensionBatches(renderer, gpu, region(16));
+
+  renderer.UnmapMemory(base, size);
+  renderer.ShutdownGpu();
+}
+
+} // namespace GuestOrder
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -54285,9 +56374,30 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--guest-ordered-barriers-only") == 0) {
+    VulkanHarness vulkan;
+    GuestOrder::CheckGuestOrderedBarriers(vulkan);
+    vulkan.CheckThreadDimIndirectMismatchFallback();
+    vulkan.CheckMidStreamReadbackAfterUnsynced();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--feed-idle-gpu-only") == 0) {
+    VulkanHarness vulkan;
+    using Case = VulkanHarness::FeedIdleCase;
+    for (const auto variant : {Case::Chain, Case::Indirect, Case::Busy, Case::Readback}) {
+      vulkan.CheckFeedIdleGpu(variant);
+    }
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-flat-copy-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuFlatCopyDependency();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--indirect-draw-args-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDrawArgsConvertClamp();
+    vulkan.CheckIndirectDrawGpuArgs();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--pm4-lookahead-only") == 0) {

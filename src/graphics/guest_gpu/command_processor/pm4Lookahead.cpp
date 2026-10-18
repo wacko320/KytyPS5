@@ -4,10 +4,13 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 
 namespace Libs::Graphics {
 
@@ -129,6 +132,42 @@ void Pm4Lookahead::OnDraw(const CommandProcessor& processor, std::span<const uin
 	cache.BeginPrefetchedDraw(draw);
 }
 
+// An indirect register load reads its (offset, value) pairs from guest memory when it executes.
+// The shadow applies them as they are now, from the backing store (no page protection, so no
+// readback): like the other register writes, they only predict the draw's inputs.
+bool Pm4Lookahead::ApplyIndirectRegisters(const uint32_t* packet) {
+	const auto header = packet[0] & ~1u;
+	const auto opcode = (header >> 8u) & 0xffu;
+	if ((opcode != Pm4::IT_SET_CONTEXT_REG_INDIRECT && opcode != Pm4::IT_SET_SH_REG_INDIRECT &&
+	     opcode != Pm4::IT_SET_UCONFIG_REG_INDIRECT) ||
+	    KYTY_PM4_LEN(header) != 5u) {
+		return false;
+	}
+	const uint64_t address = (static_cast<uint64_t>(packet[1]) & 0xfffffffcu) |
+	                         (static_cast<uint64_t>(packet[2]) << 32u);
+	const uint32_t count   = packet[4] & 0x3fffu;
+	if (count != 0) {
+		const auto bytes = uint64_t {count} * 2u * sizeof(uint32_t);
+		LibKernel::Memory::GuestBackingView view {};
+		if (address == 0 || !m_renderer.IsMapped(address, bytes) ||
+		    !LibKernel::Memory::GetGuestBackingView(address, bytes, &view)) {
+			return false;
+		}
+		m_indirect_pairs.resize(count * 2u);
+		std::memcpy(m_indirect_pairs.data(), view.pointer, bytes);
+		if (!IndirectRegistersKnown(opcode, m_indirect_pairs)) {
+			return false;
+		}
+	}
+	// The packet with its address pointing at the copy.
+	const auto                    local = reinterpret_cast<uint64_t>(m_indirect_pairs.data());
+	const std::array<uint32_t, 5> copy {
+	    packet[0], (packet[1] & 3u) | static_cast<uint32_t>(local & 0xfffffffcu),
+	    static_cast<uint32_t>(local >> 32u), packet[3], packet[4]};
+	g_cp_op_func[opcode](*m_shadow, header, copy.data() + 1, 5u, 5u);
+	return true;
+}
+
 // Mirrors CommandProcessor::ProcessPm4's framing for the packets it decodes.
 void Pm4Lookahead::Scan() {
 	auto&      cache  = m_renderer.GetPipelineCache();
@@ -205,12 +244,110 @@ void Pm4Lookahead::Scan() {
 				m_window.push_back({m_scan, cache.PrefetchDispatch(shadow.GetShCtx(), groups)});
 				break;
 			}
-			case PacketKind::Barrier: m_blocked = true; continue;
+			case PacketKind::Barrier:
+				if (ApplyIndirectRegisters(packet)) {
+					break;
+				}
+				m_blocked = true;
+				continue;
 		}
 		m_scan += length;
 		budget -= std::min(budget, length);
 	}
 	cache.FlushPrefetch();
+}
+
+Pm4ThreadDispatchScan::Pm4ThreadDispatchScan(RenderContext& renderer, int interrupt_event_id)
+    : m_shadow(std::make_unique<CommandProcessor>(renderer, interrupt_event_id)) {}
+
+Pm4ThreadDispatchScan::~Pm4ThreadDispatchScan() = default;
+
+// Mirrors CommandProcessor::ProcessPm4's framing, as Pm4Lookahead::Scan does.
+uint32_t Pm4ThreadDispatchScan::Scan(const CommandProcessor& processor,
+                                     std::span<const uint32_t> commands, uint32_t offset,
+                                     std::vector<ThreadDispatchRequest>& dispatches) {
+	auto& shadow = *m_shadow;
+	shadow.CopyRegisterState(processor);
+	dispatches.clear();
+	const auto total  = static_cast<uint32_t>(commands.size());
+	uint32_t   scan   = offset;
+	uint32_t   budget = MaxScanWords;
+	while (scan < total && budget != 0 && dispatches.size() < MaxDispatches) {
+		const auto* packet    = commands.data() + scan;
+		const auto  remaining = total - scan;
+		const auto  header    = packet[0];
+		if (header == 0x80000000u || Pm4::PacketSizeDw(header) == 1u) {
+			scan++;
+			budget--;
+			continue;
+		}
+		if (remaining < 2) {
+			break;
+		}
+		uint32_t length = 0;
+		if ((header >> 30u) == 0u) {
+			length = ((header >> 16u) & 0x3fffu) + 2u;
+		} else if ((header >> 30u) == 3u) {
+			length = Pm4::PacketSizeDw(header);
+		}
+		if (length == 0 || length > remaining) {
+			break;
+		}
+		if ((header >> 30u) == 0u || ((header & 1u) != 0 && shadow.ShouldSkipPredicatedPackets())) {
+			scan += length;
+			budget -= std::min(budget, length);
+			continue;
+		}
+		const auto opcode = (header >> 8u) & 0xffu;
+		bool       stop   = false;
+		switch (Pm4Lookahead::Classify(packet)) {
+			case Pm4Lookahead::PacketKind::Register: {
+				const auto handler = g_cp_op_func[opcode];
+				const auto used =
+				    handler(shadow, header & ~1u, packet + 1, remaining, total) + 1u;
+				if (used > remaining) {
+					stop = true;
+					break;
+				}
+				length = used;
+				break;
+			}
+			case Pm4Lookahead::PacketKind::Transparent:
+				// Markers, PFP_SYNC_ME and DE counters pass; the rest (acquires, releases, events,
+				// memory writes) synchronise or write memory.
+				stop = opcode != Pm4::IT_PFP_SYNC_ME && opcode != Pm4::IT_INCREMENT_DE_COUNTER &&
+				       !(opcode == Pm4::IT_NOP && KYTY_PM4_R(header) != Pm4::R_RELEASE_MEM);
+				break;
+			case Pm4Lookahead::PacketKind::Dispatch: {
+				if (opcode != Pm4::IT_DISPATCH_INDIRECT) {
+					break;
+				}
+				const bool long_form = (header & ~1u) == 0xc0021600u;
+				const auto mode      = long_form ? packet[3] : packet[2];
+				if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) == 0) {
+					break;
+				}
+				const auto base = shadow.GetDispatchIndirectArgsBaseAddress();
+				const auto args = long_form ? packet[1] | (static_cast<uint64_t>(packet[2]) << 32u)
+				                            : (base == 0 ? 0 : base + packet[1]);
+				if (args == 0 || (args & 3u) != 0) {
+					stop = true;
+					break;
+				}
+				const auto& cs = shadow.GetShCtx().GetCs().cs_regs;
+				dispatches.push_back({args, {cs.num_thread_x, cs.num_thread_y, cs.num_thread_z}});
+				break;
+			}
+			case Pm4Lookahead::PacketKind::Draw:
+			case Pm4Lookahead::PacketKind::Barrier: stop = true; break;
+		}
+		if (stop) {
+			break;
+		}
+		scan += length;
+		budget -= std::min(budget, length);
+	}
+	return scan;
 }
 
 } // namespace Libs::Graphics

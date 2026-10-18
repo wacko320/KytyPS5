@@ -1975,6 +1975,12 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	return image.FindView(desc.view_info);
 }
 
+bool TextureCache::IsGpuOwned(ImageId id) {
+	std::scoped_lock lock {m_lock};
+	const auto*      image = m_slot_images.try_get(id);
+	return image != nullptr && image->SafeToDownload();
+}
+
 void TextureCache::MarkGpuWritten(ImageId id) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];

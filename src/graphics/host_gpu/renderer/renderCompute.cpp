@@ -212,48 +212,92 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	return true;
 }
 
-static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
-                             PreparedBindings& bindings, uint64_t indirect_args = 0) {
+void RenderExecutor::BindSharedMemory(ShaderComputeInputInfo& input, PreparedBindings& bindings,
+                                      uint64_t indirect_args) {
 	if (input.stage.program->bindings.descriptor_counts[
 	        static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::SharedMemory)] == 0) {
 		return;
 	}
-	auto& cache = context.GetBufferCache();
+	// When the dispatch's size is unknown on the CPU, at least this much is bound.
+	constexpr uint64_t UnsizedBytes = 32ull << 20u;
+	auto&      cache = m_context.GetBufferCache();
+	const auto range_limit =
+	    m_context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
+	bool sized = true;
 	if (indirect_args != 0) {
-		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
-		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
-		            sizeof(input.workgroup_counts));
-		if (input.dispatch_thread_dimensions) {
-			// Thread counts, rounded up to whole workgroups as the GPU conversion does.
-			for (uint32_t axis = 0; axis < 3u; ++axis) {
-				const auto size    = std::max(input.threads_num[axis], 1u);
-				const auto threads = input.workgroup_counts[axis];
-				input.workgroup_counts[axis] = threads / size + (threads % size != 0u);
-			}
+		// Arguments the GPU wrote would be read back (a drain), and thread dimensions are
+		// converted on the GPU: neither is read here.
+		if (input.dispatch_thread_dimensions ||
+		    cache.IsRegionGpuModified(indirect_args, sizeof(vk::DispatchIndirectCommand))) {
+			sized = false;
+			Common::FrameProfiler::Add(Common::FrameProfiler::Counter::ComputeLdsIndirectUnsized);
+		} else {
+			cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
+			std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
+			            sizeof(input.workgroup_counts));
 		}
 	}
-	// LDS has no contents to preserve between dispatches. The existing shader hazard
-	// barriers also order other users of this GPU-only utility buffer.
-	auto& storage = cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
-	const auto limit = std::min<uint64_t>(storage.Size(),
-	    context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
-	uint64_t size = sizeof(uint32_t);
-	if (std::ranges::find(input.workgroup_counts, 0u) == std::end(input.workgroup_counts)) {
+	uint64_t size = sized ? sizeof(uint32_t) : std::min<uint64_t>(UnsizedBytes, range_limit);
+	if (sized && std::ranges::find(input.workgroup_counts, 0u) == std::end(input.workgroup_counts)) {
 		size = uint64_t {input.lds_size_dwords} * sizeof(uint32_t);
-		EXIT_IF(size == 0 || size > limit);
+		EXIT_IF(size == 0 || size > range_limit);
 		for (const auto count: input.workgroup_counts) {
-			EXIT_IF(size > limit / count);
+			EXIT_IF(size > range_limit / count);
 			size *= count;
 		}
 	}
-	bindings.shared_memory = {storage.Handle(), 0, size};
+	// LDS has no contents to preserve: a larger buffer replaces the old one, which work recorded
+	// before may still use.
+	if (m_lds_storage == nullptr || m_lds_storage->Size() < size) {
+		const auto capacity = std::max<uint64_t>(
+		    {size, m_lds_storage != nullptr ? m_lds_storage->Size() * 2u : 0u, 1ull << 20u});
+		if (m_lds_storage != nullptr) {
+			m_context.GetCommandScheduler().DeferOperation(
+			    [old = std::move(m_lds_storage)]() mutable { old.reset(); });
+		}
+		m_lds_storage = std::make_unique<Buffer>(
+		    m_context.GetGraphics(), m_context.GetCommandScheduler(), MemoryUsage::DeviceLocal, 0,
+		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
+		    capacity);
+		m_lds_unordered = false;
+	}
+	if (!sized) {
+		size = std::min<uint64_t>(m_lds_storage->Size(), range_limit);
+	}
+	bindings.shared_memory = {m_lds_storage->Handle(), 0, size};
+}
+
+void RenderExecutor::OrderSharedMemory(vk::CommandBuffer command, const PreparedBindings& bindings) {
+	if (bindings.shared_memory.buffer == nullptr || !m_lds_unordered ||
+	    m_context.GetCommandScheduler().GlobalBarrierCount() != m_lds_global_barriers) {
+		return;
+	}
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	                        vk::PipelineStageFlagBits::eComputeShader, {}, 1, &barrier, 0, nullptr,
+	                        0, nullptr);
+	m_lds_unordered = false;
+	m_lds_barriers++;
+	Common::FrameProfiler::Add(Common::FrameProfiler::Counter::ComputeLdsBarriers);
+}
+
+void RenderExecutor::NoteSharedMemoryDispatch(const PreparedBindings& bindings) {
+	if (bindings.shared_memory.buffer == nullptr) {
+		return;
+	}
+	m_lds_unordered       = true;
+	m_lds_global_barriers = m_context.GetCommandScheduler().GlobalBarrierCount();
 }
 
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
-                                    uint32_t thread_group_z, uint32_t mode, bool async_compute) {
+                                    uint32_t thread_group_z, uint32_t mode, bool async_compute,
+                                    ThreadDispatchBatch* batch) {
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().FeedIdleGpu();
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -327,6 +371,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
+	// A clear that replaces the dispatch is ordered by the guest's synchronisation before it too.
+	m_context.GetCommandScheduler().BeforeGuestDispatch();
 	if (resources.specialization_reads.empty()) {
 		// Cached metadata addresses can be reused as ordinary buffers; preserve their guest writes.
 		UpdateComputeMetaClears(input_info, buffer);
@@ -376,7 +422,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.RequestFaultProcessing();
 	}
 	RebindImages(bindings);
-	BindSharedMemory(m_context, input_info, bindings);
+	BindSharedMemory(input_info, bindings);
+	// Acquiring the batch's arguments can merge cache buffers; finalize shader bindings afterward.
+	if (batch != nullptr && !batch->requests.empty()) {
+		RecordThreadBatch(*batch);
+	}
 	RebindBuffers(bindings);
 
 	auto              vk_buffer        = buffer.Handle();
@@ -384,21 +434,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	               std::span {&descriptor_stage, 1u});
 	CommitBindlessHeap(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	                   std::span {&descriptor_stage, 1u});
-	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
-	    HasShaderBufferWrites(input_info.stage);
-	has_storage_writes =
-	    std::any_of(program.info.images.begin(), program.info.images.end(),
-	                [](const auto& image) {
-		                return image.written &&
-		                       image.resource_class ==
-		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
-	                }) ||
-	    has_storage_writes;
-	if (has_storage_writes) {
-		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
-		// while allowing the queue to execute asynchronously.
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-	}
 	if (Config::GraphicsDebugDumpEnabled()) {
 		const auto sampled_images = std::count_if(
 		    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
@@ -464,15 +499,22 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.has_address_writes) {
 		m_context.GetBufferCache().NoteUntrackedWrites();
 	}
+	// No barrier of its own: the guest's synchronisation orders dispatches (CommandScheduler::
+	// RequestGuestBarrier), as the hardware overlaps the dispatches between its syncs.
+	auto& scheduler = m_context.GetCommandScheduler();
+	scheduler.BeforeGuestDispatch();
+	if (HasShaderBufferWrites(input_info.stage)) {
+		scheduler.OrderIndirectArgsReads(vk::PipelineStageFlagBits::eComputeShader);
+	}
+	OrderSharedMemory(vk_buffer, bindings);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+	scheduler.CountGuestDispatch();
+	NoteSharedMemoryDispatch(bindings);
 	if (use_thread_dimensions) {
 		Common::FrameProfiler::Add(Common::FrameProfiler::Counter::ComputeThreadDimensionDispatches);
 	}
-
-	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	if (bindings.uses_bindless) {
 		m_context.GetBindlessHeap().Finish();
 	}
@@ -480,6 +522,114 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ResetBindings();
 }
 
+
+void RenderExecutor::RecordThreadBatch(ThreadDispatchBatch& batch) {
+	using Common::FrameProfiler::Counter;
+	auto& cache     = m_context.GetBufferCache();
+	auto& scheduler = m_context.GetCommandScheduler();
+	// At a window's head the batch follows the guest barrier the dispatch takes; later in a
+	// window it follows the compute writes recorded before it, as the conversion of a single
+	// dispatch does. That one is defensive: arguments a dispatch of the same window wrote are a
+	// guest race on the hardware.
+	if (scheduler.GuestBarrierPending()) {
+		scheduler.GlobalBarrier(CommandScheduler::GlobalBarrierSite::ThreadBatch);
+	}
+	const bool order_before = scheduler.UnorderedComputeReads();
+	// Acquiring a range can create or join cache buffers, which may move the ones translated
+	// before: translate all, then take the final buffers.
+	m_thread_batch.clear();
+	m_thread_ranges.clear();
+	// Requests past what one batch's slots may hold are left to convert alone (a mismatch).
+	const auto capacity = IndirectThreads().BatchCapacity();
+	for (const auto& request: batch.requests) {
+		if (m_thread_batch.size() == capacity) {
+			break;
+		}
+		// A prediction: arguments the dispatch will not read may be anywhere.
+		if (m_context.IsMapped(request.args_addr, sizeof(vk::DispatchIndirectCommand))) {
+			(void)cache.TranslateRead(request.args_addr, sizeof(vk::DispatchIndirectCommand));
+			m_thread_batch.push_back({request, {}});
+			m_thread_ranges.emplace_back(request.args_addr, sizeof(vk::DispatchIndirectCommand));
+		}
+	}
+	if (m_thread_batch.empty()) {
+		return;
+	}
+	m_thread_sources.clear();
+	for (const auto& entry: m_thread_batch) {
+		const auto [args_buffer, args_offset] = cache.TranslateRead(
+		    entry.request.args_addr, sizeof(vk::DispatchIndirectCommand));
+		EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
+		m_thread_sources.push_back({args_buffer->Handle(), args_offset, entry.request.group_size});
+	}
+	// From here on, a possible change to the arguments' bytes is noted against the batch.
+	cache.WatchUnchanged(m_thread_ranges);
+	m_thread_converted.resize(m_thread_sources.size());
+	IndirectThreads().ConvertBatch(m_thread_sources, order_before, m_thread_converted);
+	scheduler.NoteComputeReadBarrier();
+	for (size_t i = 0; i < m_thread_batch.size(); i++) {
+		m_thread_batch[i].converted = m_thread_converted[i];
+	}
+	m_thread_batch_next = 0;
+	batch.serial        = ++m_thread_batch_serial;
+	m_thread_stats.batches++;
+	Common::FrameProfiler::Add(Counter::ComputeIndirectThreadBatches);
+	Common::FrameProfiler::Add(Counter::ComputeIndirectThreadBatchEntries, m_thread_batch.size());
+}
+
+const IndirectThreadDispatchArguments* RenderExecutor::FindBatchedThreads(
+    const ThreadDispatchBatch* batch, uint64_t args_addr, const std::array<uint32_t, 3>& group_size,
+    uint64_t change_serial) {
+	using Common::FrameProfiler::Counter;
+	const auto fallback = [this](Counter reason, size_t stat) {
+		m_thread_stats.fallbacks[stat]++;
+		Common::FrameProfiler::Add(Counter::ComputeIndirectThreadFallback);
+		Common::FrameProfiler::Add(reason);
+		return nullptr;
+	};
+	if (batch == nullptr || batch->serial == 0 || batch->serial != m_thread_batch_serial) {
+		return fallback(Counter::ComputeIndirectThreadFallbackNotReached, 0);
+	}
+	// Dispatches take the entries in order; a dispatch the scan did not predict leaves them.
+	const auto matches = [&](const BatchedThreads& entry) {
+		return entry.request.args_addr == args_addr && entry.request.group_size == group_size;
+	};
+	auto index = m_thread_batch_next;
+	while (index < m_thread_batch.size() && !matches(m_thread_batch[index])) {
+		index++;
+	}
+	if (index == m_thread_batch.size()) {
+		return fallback(Counter::ComputeIndirectThreadFallbackMismatch, 1);
+	}
+	m_thread_batch_next = index + 1;
+	// The conversion read the bytes when the batch was recorded. An upload or join since, or a
+	// GPU write recorded before this dispatch began, may have changed them; this dispatch's own
+	// written bindings run after the conversion, as on the hardware its packet reads them first.
+	const auto changes = m_context.GetBufferCache().UnchangedRangeChanges(index);
+	if (changes.other_write) {
+		return fallback(Counter::ComputeIndirectThreadFallbackUpload, 2);
+	}
+	if (changes.first_gpu_write != 0 && changes.first_gpu_write <= change_serial) {
+		return fallback(Counter::ComputeIndirectThreadFallbackWritten, 3);
+	}
+	m_thread_stats.batched++;
+	Common::FrameProfiler::Add(Counter::ComputeIndirectThreadBatched);
+	return &m_thread_batch[index].converted;
+}
+
+IndirectDrawArgs& RenderExecutor::IndirectDraws() {
+	if (m_indirect_draws == nullptr) {
+		m_indirect_draws = std::make_unique<IndirectDrawArgs>(m_context.GetGraphics(),
+		                                                      m_context.GetCommandScheduler());
+	}
+	return *m_indirect_draws;
+}
+
+uint32_t RenderExecutor::ReadCapturedInstances(const DrawInstanceCapture& capture) {
+	Common::LockGuard lock(m_context.GetMutex());
+	Common::FrameProfiler::Add(Common::FrameProfiler::Counter::DrawIndirectLazyInstanceReads);
+	return IndirectDraws().ReadInstances(capture);
+}
 
 IndirectThreadDispatch& RenderExecutor::IndirectThreads() {
 	if (m_indirect_threads == nullptr) {
@@ -490,11 +640,14 @@ IndirectThreadDispatch& RenderExecutor::IndirectThreads() {
 }
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
-                                      uint64_t args_addr, uint32_t mode, bool async_compute) {
+                                      uint64_t args_addr, uint32_t mode, bool async_compute,
+                                      ThreadDispatchBatch* batch) {
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0);
 	const bool use_thread_dimensions =
 	    (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().FeedIdleGpu();
+	const auto change_serial = m_context.GetBufferCache().ChangeSerial();
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
@@ -532,8 +685,15 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	} else if (program.info.loop_watchdog) {
 		m_context.RequestFaultProcessing();
 	}
-	BindSharedMemory(m_context, input_info, bindings, args_addr);
+	BindSharedMemory(input_info, bindings, args_addr);
 	RebindImages(bindings);
+	// Thread-dimension arguments are converted on the GPU: earlier dispatches of this submission
+	// may still be computing them. Record the conversion before binding this pipeline, in the
+	// batch of this guest synchronisation window when one covers it. The batch acquires ranges
+	// (which can join cache buffers) and may submit: before this dispatch's arguments are taken.
+	if (batch != nullptr && !batch->requests.empty()) {
+		RecordThreadBatch(*batch);
+	}
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
@@ -542,11 +702,17 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	// may still be computing them. Record the conversion before binding this pipeline.
 	auto indirect_buffer = args_buffer->Handle();
 	auto indirect_offset = static_cast<uint64_t>(args_offset);
+	vk::DeviceAddress threads_address = 0;
 	if (use_thread_dimensions) {
-		const auto converted = IndirectThreads().Convert(
-		    buffer.Handle(), indirect_buffer, indirect_offset,
-		    {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
-		     cs_regs.cs_regs.num_thread_z});
+		const std::array<uint32_t, 3> group_size {cs_regs.cs_regs.num_thread_x,
+		                                          cs_regs.cs_regs.num_thread_y,
+		                                          cs_regs.cs_regs.num_thread_z};
+		const auto* batched = FindBatchedThreads(batch, args_addr, group_size, change_serial);
+		const auto  converted =
+		    batched != nullptr
+		        ? *batched
+		        : IndirectThreads().Convert({indirect_buffer, indirect_offset, group_size});
+		threads_address = converted.threads_address;
 		indirect_buffer = converted.buffer;
 		indirect_offset = converted.offset;
 		if (const auto dword = program.bindings.dispatch_thread_dword;
@@ -561,30 +727,28 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	CommitBindlessHeap(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	                   std::span {&descriptor_stage, 1u});
 	const auto vk_buffer = buffer.Handle();
-	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
-	    HasShaderBufferWrites(input_info.stage) ||
-	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
-		    return image.written && image.resource_class ==
-		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
-	    });
-	if (has_storage_writes) {
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-	}
-	vk::MemoryBarrier barrier {};
-	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
-	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
-	                              vk::PipelineStageFlagBits::eComputeShader |
-	                              vk::PipelineStageFlagBits::eTransfer,
-	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
-	                          1, &barrier, 0, nullptr, 0, nullptr);
 	// Before the dispatch is recorded: a readback in between must not take it for unwritten.
 	if (program.has_address_writes) {
 		m_context.GetBufferCache().NoteUntrackedWrites();
 	}
+	// No barrier of its own, for the arguments either: GPU work that produced them is ordered
+	// by the guest's synchronisation before this packet (the barrier includes indirect reads),
+	// uploads and joins by their own barriers, and conversions by theirs.
+	auto& scheduler = m_context.GetCommandScheduler();
+	scheduler.BeforeGuestDispatch();
+	if (HasShaderBufferWrites(input_info.stage)) {
+		scheduler.OrderIndirectArgsReads(vk::PipelineStageFlagBits::eComputeShader);
+	}
+	OrderSharedMemory(vk_buffer, bindings);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+	scheduler.CountGuestDispatch();
+	NoteSharedMemoryDispatch(bindings);
+	if (use_thread_dimensions) {
+		// A batched slot was taken at the batch's tick; this dispatch may be in a later one.
+		IndirectThreads().NoteRead(threads_address);
+	}
 	if (Common::FrameProfiler::Active()) {
 		using Common::FrameProfiler::Counter;
 		Common::FrameProfiler::Add(Counter::ComputeIndirectDispatches);
@@ -596,7 +760,6 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			Common::FrameProfiler::Add(Counter::ComputeIndirectArgsGpuWritten);
 		}
 	}
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	if (bindings.uses_bindless) {
 		m_context.GetBindlessHeap().Finish();
 	}

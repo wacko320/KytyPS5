@@ -39,6 +39,9 @@ struct GraphicContext {
 	bool                               host_query_reset_enabled              = false;
 	// VK_EXT_conditional_rendering: fast clears the GPU decides on (TextureCache).
 	bool                               conditional_rendering_enabled         = false;
+	// drawIndirectFirstInstance: indirect draws whose arguments the GPU reads (IndirectDrawArgs)
+	// may carry a first instance.
+	bool                               draw_indirect_first_instance_enabled  = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
