@@ -895,6 +895,11 @@ uint64_t WriteMappedBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	           : 0;
 }
 
+bool GetGuestBackingView(uint64_t vaddr, uint64_t size, GuestBackingView* out) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->BackingView(vaddr, size, out);
+}
+
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);

@@ -741,7 +741,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		const auto size =
 		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
 		range.acquired_end = range.base_address + size;
-		range.binding      = cache.ObtainBuffer(range.base_address, size, false);
+		range.binding      = cache.TranslateRead(range.base_address, size);
 	}
 
 	// Rebuild slot bindings, offsetting non-empty slots into their acquired merged range.
@@ -958,7 +958,7 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 		prepared.buffer = stream.Handle();
 	} else {
 		auto [buffer_ptr, offset] =
-		    buffer.GetContext().GetBufferCache().ObtainBuffer(source.address, source.size, false);
+		    buffer.GetContext().GetBufferCache().TranslateRead(source.address, source.size);
 		prepared.buffer = buffer_ptr->Handle();
 		prepared.offset = offset;
 	}
@@ -1138,8 +1138,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 
 	if (mesh_active && draw.IsIndexed()) {
-		// Register the original guest indices for shader reads; PrepareGraphicsBindings
-		// synchronizes registered BDA ranges before any draw commands are committed.
+		// Register the original guest indices for shader reads; a new buffer takes the guest
+		// bytes when it is created, an existing one has them from the epoch's acquire.
 		(void)m_context.GetBufferCache().FindBuffer(
 		    index_source.address, static_cast<uint64_t>(draw.index_count) *
 		                              index_source.guest_element_size);

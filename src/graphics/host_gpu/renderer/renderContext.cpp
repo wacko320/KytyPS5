@@ -108,6 +108,25 @@ void RenderContext::PrepareGpuThreadWrite(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+uint8_t* RenderContext::BeginWriteThrough(uint64_t vaddr, uint64_t size) {
+	if (!IsMapped(vaddr, size) || m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		return nullptr;
+	}
+	auto* through = m_buffer_cache.WriteThroughView(vaddr, size);
+	if (through == nullptr) {
+		return nullptr;
+	}
+	// As PrepareGpuThreadWrite: an image over a watched page re-reads guest memory.
+	constexpr uint64_t PageSize = 4096;
+	for (auto page = vaddr & ~(PageSize - 1); page < vaddr + size; page += PageSize) {
+		if (m_page_manager.IsWriteWatched(page)) {
+			m_texture_cache.InvalidateMemory(vaddr, size);
+			break;
+		}
+	}
+	return through;
+}
+
 bool RenderContext::TryWriteGpuOrdered(uint64_t vaddr, const void* data, uint64_t size) {
 	return IsMapped(vaddr, size) && !m_texture_cache.IsRegionGpuModified(vaddr, size) &&
 	       m_buffer_cache.TryWriteGpuOrdered(vaddr, data, size);
@@ -133,6 +152,8 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	// A buffer that outlived an unmap of this range missed the CPU writes since (uploads skip
+	// unmapped pages, and pages left CPU-dirty do not fault): the next acquire uploads them.
 	m_buffer_cache.QueueBdaSync(vaddr, size);
 }
 
@@ -190,9 +211,17 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
+	// Buffers already hold every CPU write the GPU may see: the epoch's acquire uploaded them
+	// (CoherenceEpoch), and new buffers upload when created. Shader stores through BDA are not
+	// tracked, though: a page the CPU wrote since the acquire would be uploaded whole over them
+	// at the next one. Synchronize what was queued since the acquire before them.
 	m_buffer_cache.EnsureBdaZeroEntry();
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_buffer_cache.SynchronizeBda(m_mapped_ranges);
+	{
+		const Common::FrameProfiler::ScopedUploadSource source(
+		    Common::FrameProfiler::UploadSource::Bda);
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		m_buffer_cache.SynchronizeBda(m_mapped_ranges);
+	}
 	m_fault_process_pending = true;
 }
 

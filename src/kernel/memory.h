@@ -137,6 +137,13 @@ bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_
 // the range meanwhile, and those bytes have nowhere to go. Returns the bytes written.
 uint64_t               WriteMappedBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// The backing store's view of a guest range held by one mapping: its read-write alias, through
+// which the host may store without touching the guest view's protection.
+struct GuestBackingView {
+	uint8_t* pointer = nullptr;
+	uint64_t offset  = 0;
+};
+[[nodiscard]] bool     GetGuestBackingView(uint64_t vaddr, uint64_t size, GuestBackingView* out);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);

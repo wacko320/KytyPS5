@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/frameProfiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
@@ -20,6 +21,7 @@
 #include <memory>
 #include <span>
 #include <shared_mutex>
+#include <utility>
 #include <vector>
 
 namespace Libs::VideoOut {
@@ -64,6 +66,27 @@ public:
 	// Before the GPU thread stores to guest memory directly: invalidates the range if a write
 	// would fault, so it does not take a fault per page.
 	void PrepareGpuThreadWrite(uint64_t vaddr, uint64_t size);
+	// GPU thread: the guest backing's view of the range when a store to it can bypass page
+	// protection (BufferCache::WriteThroughView), images over it taking it as a CPU write. A
+	// store through the guest view would fault on a watched page, then the upload after it would
+	// watch the page again: once per store, for labels written over and over.
+	[[nodiscard]] uint8_t* BeginWriteThrough(uint64_t vaddr, uint64_t size);
+	// GPU thread: a command-processor store to guest memory, made by writer(dst), where dst is
+	// where the range's bytes are to be stored. Every such store goes through here: the buffers
+	// over the range take it in command order, so GPU work recorded after it reads it without a
+	// per-binding upload (CoherenceEpoch).
+	template <typename Writer>
+	void GpuThreadGuestWrite(uint64_t vaddr, uint64_t size, Writer&& writer) {
+		Common::FrameProfiler::Rec(Common::FrameProfiler::Event::GpuGuestWrite, vaddr, size);
+		if (auto* through = BeginWriteThrough(vaddr, size); through != nullptr) {
+			std::forward<Writer>(writer)(static_cast<void*>(through));
+			m_buffer_cache.WriteThrough(vaddr, through, size);
+			return;
+		}
+		PrepareGpuThreadWrite(vaddr, size);
+		std::forward<Writer>(writer)(reinterpret_cast<void*>(vaddr));
+		m_buffer_cache.Epoch().SyncRangeNow(vaddr, size);
+	}
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	// Calls func(begin, end) for each mapped sub-range of [vaddr, vaddr + size).
 	template <typename Func>

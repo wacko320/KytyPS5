@@ -128,12 +128,15 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
+	auto&      cache = context.GetBufferCache();
+	const bool texel = resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled());
 	const bool metadata_read = resource.read && Config::SupportZmaskEnabled() &&
 	                           (address & 0x7fffu) == 0 &&
 	                           context.GetTextureCache().IsMeta(address);
-	auto [buffer, offset]    = context.GetBufferCache().ObtainBuffer(
-	    address, size, resource.written || metadata_read,
-	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+	// A read-only binding is a translation within the epoch (CoherenceEpoch).
+	auto [buffer, offset] = resource.written || metadata_read
+	                            ? cache.ObtainBuffer(address, size, true, texel, id)
+	                            : cache.TranslateRead(address, size, texel, id);
 	if (metadata_read) buffer->Fill(offset, size, 0xf); // HTILE ZMask::kUncompressed.
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;

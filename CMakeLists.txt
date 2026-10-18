@@ -622,6 +622,9 @@ target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
+# Source checks read the tree (GpuThreadGuestWritesRouted).
+target_compile_definitions(shader_recompiler_compute_tests PRIVATE
+	KYTY_TEST_SOURCE_DIR="${KYTY_SOURCE_DIR}")
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
 set(gpu_test_ms_depth_source
@@ -730,6 +733,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
 	add_test(NAME buffer_writeback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --writeback-only)
+	add_test(NAME epoch_coherence
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --epoch-coherence-only)
 	add_test(NAME stream_buffer_ring
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
 	add_test(NAME gpu_command_lane

@@ -80,6 +80,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cctype>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
@@ -89,12 +90,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <regex>
 #include <semaphore>
 #include <set>
 #include <span>
@@ -102,6 +106,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <thread>
 #include <vector>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -4631,12 +4636,14 @@ public:
       const auto stream_tick = scheduler.CurrentTick();
       const auto [streamed, streamed_offset] =
           cache.ObtainBuffer(stream_address, sizeof(stream_values), false);
-      Require(name, "cross-page read-only stream upload",
-              streamed == &cache.GetUtilityBuffer(MemoryUsage::Stream) &&
-                  scheduler.CurrentTick() == stream_tick &&
-                  std::memcmp(streamed->Mapped().data() + streamed_offset,
-                              stream_values.data(), sizeof(stream_values)) == 0,
-              "GPU-readable guest bytes were not streamed without submission");
+      // Read bindings are cached ranges (no stream-ring snapshot): the new buffer takes the
+      // guest bytes in the command stream.
+      Require(name, "cross-page read-only upload",
+              streamed != &cache.GetUtilityBuffer(MemoryUsage::Stream) &&
+                  streamed->IsInBounds(stream_address, sizeof(stream_values)) &&
+                  scheduler.CurrentTick() == stream_tick,
+              "GPU-readable guest bytes were not uploaded to a cached buffer without "
+              "submission");
       Require(name, "stream source protection restore",
               Libs::LibKernel::Memory::KernelMprotect(
                   reinterpret_cast<void *>(stream_pages), 0x8000, 0x3) == 0,
@@ -11339,6 +11346,340 @@ public:
     scheduler.WaitPriorityOperations(tick);
   }
 
+  static u32 ReadEpochDword(const char *name, RenderContext &context, uint64_t address) {
+    context.GetBufferCache().ReadMemory(address, sizeof(u32));
+    u32 word = 0;
+    Require(name, "readback", LibKernel::Memory::TryReadBacking(address, &word, sizeof(word)),
+            "a dword could not be read back");
+    return word;
+  }
+
+  // Command-processor writes (WRITE_DATA, a DMA_DATA fill, a RELEASE_MEM label, GET_LOD_STATS)
+  // into buffers a dispatch already read in this command buffer: dispatches after them read the
+  // new values without a new epoch, and the ones before keep the old. The small ones write
+  // through, leaving page protection alone (nothing pending afterwards); a large fill goes
+  // through guest memory and an upload.
+  void CheckEpochGpuThreadWrites() {
+    constexpr const char *name = "EpochGpuThreadWrites";
+    constexpr uintptr_t base = 0x0000000209000000ull;
+    constexpr uint64_t size = 0x100000;
+    constexpr std::array<uint64_t, 4> sources{base + 0x100, base + 0x1100, base + 0x2100,
+                                              base + 0x3100};
+    constexpr std::array<u32, 4> old_values{0x0e1d0001u, 0x0e1d0002u, 0x0e1d0003u,
+                                            0x0e1d0004u};
+    // GET_LOD_STATS zeroes its buffer and sets the first dword to 1.
+    constexpr std::array<u32, 4> new_values{0x7a3c0001u, 0x7a3c0002u, 0x7a3c0003u, 1u};
+    constexpr uint64_t fill_base = base + 0x10000;
+    constexpr u32 fill_size = 0x20000;
+    constexpr uint64_t fill_probe = fill_base + 0x8100;
+    constexpr u32 fill_old = 0x5eed0000u;
+    constexpr u32 fill_new = 0x5eed1111u;
+    const auto output = [](uint32_t index) { return base + 0x40000 + index * 0x10u; };
+    const auto &copy = EpochCopyShader();
+
+    std::vector<u32> commands;
+    for (uint32_t i = 0; i < sources.size(); i++) {
+      AppendEpochCopy(commands, sources[i], sizeof(u32), output(i));
+    }
+    // The same reads first, in a slice of their own: the buffers they create are queued for BDA
+    // synchronization when registered (MemoryTracker::QueueBdaSync), and the next slice's
+    // acquire takes that, so only what the writes queue is pending after it.
+    const std::vector<u32> warm_commands = commands;
+    commands.insert(commands.end(),
+                    {KYTY_PM4(5, Pm4::IT_WRITE_DATA, Pm4::R_ZERO), 0u,
+                     static_cast<u32>(sources[0]), static_cast<u32>(sources[0] >> 32u),
+                     new_values[0]});
+    commands.insert(commands.end(),
+                    {KYTY_PM4(7, Pm4::IT_DMA_DATA, 0), 2u << 29u, new_values[1], 0u,
+                     static_cast<u32>(sources[1]), static_cast<u32>(sources[1] >> 32u),
+                     static_cast<u32>(sizeof(u32))});
+    constexpr u32 release_action = 0x28u | (5u << 8u) | ((1u << 9u) << 12u);
+    commands.insert(commands.end(),
+                    {KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM), release_action, 1u << 29u,
+                     static_cast<u32>(sources[2]), static_cast<u32>(sources[2] >> 32u),
+                     new_values[2], 0u, 0x123u});
+    commands.insert(commands.end(),
+                    {KYTY_PM4(5, Pm4::IT_GET_LOD_STATS, 0), 64u, static_cast<u32>(sources[3]),
+                     static_cast<u32>(sources[3] >> 32u), 0u});
+    for (uint32_t i = 0; i < sources.size(); i++) {
+      AppendEpochCopy(commands, sources[i], sizeof(u32), output(4 + i));
+    }
+
+    std::vector<u32> fill_commands;
+    AppendEpochCopy(fill_commands, fill_probe, sizeof(u32), output(8));
+    fill_commands.insert(fill_commands.end(),
+                         {KYTY_PM4(7, Pm4::IT_DMA_DATA, 0), 2u << 29u, fill_new, 0u,
+                          static_cast<u32>(fill_base), static_cast<u32>(fill_base >> 32u),
+                          fill_size});
+    AppendEpochCopy(fill_commands, fill_probe, sizeof(u32), output(9));
+
+    RunEpochFixture(
+        name, base, size,
+        [&] {
+          for (uint32_t i = 0; i < sources.size(); i++) {
+            *reinterpret_cast<u32 *>(sources[i]) = old_values[i];
+          }
+          *reinterpret_cast<u32 *>(fill_probe) = fill_old;
+        },
+        [&](RenderContext &context, CommandProcessor &processor) {
+          RunEpochSlice(name, processor, copy, 8, warm_commands);
+          RunEpochSlice(name, processor, copy, 8, commands);
+          Require(name, "write-through", !context.GetBufferCache().Epoch().HasPending(),
+                  "a command-processor write into a cached page invalidated it");
+          RunEpochSlice(name, processor, copy, 8, fill_commands);
+          constexpr std::array<const char *, 4> writers{"WRITE_DATA", "DMA_DATA fill",
+                                                        "RELEASE_MEM label", "GET_LOD_STATS"};
+          for (uint32_t i = 0; i < sources.size(); i++) {
+            const auto before = ReadEpochDword(name, context, output(i));
+            const auto after = ReadEpochDword(name, context, output(4 + i));
+            Require(name, writers[i], before == old_values[i] && after == new_values[i],
+                    std::string("dispatches around the write read ") + Hex(before) + " and " +
+                        Hex(after) + ", expected " + Hex(old_values[i]) + " and " +
+                        Hex(new_values[i]));
+          }
+          const auto before = ReadEpochDword(name, context, output(8));
+          const auto after = ReadEpochDword(name, context, output(9));
+          Require(name, "large DMA_DATA fill", before == fill_old && after == fill_new,
+                  std::string("dispatches around the fill read ") + Hex(before) + " and " +
+                      Hex(after));
+        });
+  }
+
+  // A CPU write the command buffer orders with a WAIT_REG_MEM, or a rewind, that passes on
+  // arrival: it lands after the slice began, and a dispatch after the wait reads it.
+  void CheckEpochWaitAcquire() {
+    constexpr const char *name = "EpochWaitAcquire";
+    constexpr uintptr_t base = 0x0000000209200000ull;
+    constexpr uint64_t size = 0x100000;
+    constexpr uint64_t flag = base + 0x8000;
+    constexpr u32 old_value = 0x51a7e000u;
+    constexpr u32 new_value = 0x0f4e5600u;
+    const auto &copy = EpochCopyShader();
+    const auto source = [](uint32_t variant) { return base + 0x10000u * (variant + 1u) + 0x100u; };
+    const auto output = [](uint32_t index) { return base + 0x80000 + index * 0x10u; };
+
+    RunEpochFixture(
+        name, base, size,
+        [&] {
+          *reinterpret_cast<u32 *>(flag) = 1;
+          for (uint32_t variant = 0; variant < 2; variant++) {
+            *reinterpret_cast<u32 *>(source(variant)) = old_value + variant;
+          }
+        },
+        [&](RenderContext &context, CommandProcessor &processor) {
+          for (uint32_t variant = 0; variant < 2; variant++) {
+            const auto src = source(variant);
+            std::vector<u32> first;
+            AppendEpochCopy(first, src, sizeof(u32), output(variant * 2u));
+            RunEpochSlice(name, processor, copy, 8, first);
+            // The GPU thread runs queued host commands between packets: this guest write
+            // fault lands after the next slice's own acquire, before its first packet.
+            std::thread([&] {
+              context.GetGpu().SendCommand([&context, src, variant] {
+                (void)context.InvalidateMemory(src, sizeof(u32));
+                *reinterpret_cast<volatile u32 *>(src) = new_value + variant;
+              });
+            }).join();
+            std::vector<u32> second;
+            if (variant == 0) {
+              second.insert(second.end(),
+                            {KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0), 0x10u | 3u,
+                             static_cast<u32>(flag), static_cast<u32>(flag >> 32u), 1u,
+                             UINT32_MAX, 0u});
+            } else {
+              second.insert(second.end(), {KYTY_PM4(2, Pm4::IT_REWIND, 0), 0x80000000u});
+            }
+            AppendEpochCopy(second, src, sizeof(u32), output(variant * 2u + 1u));
+            RunEpochSlice(name, processor, copy, 8, second);
+            const auto before = ReadEpochDword(name, context, output(variant * 2u));
+            const auto after = ReadEpochDword(name, context, output(variant * 2u + 1u));
+            Require(name, variant == 0 ? "WAIT_REG_MEM" : "rewind",
+                    before == old_value + variant && after == new_value + variant,
+                    std::string("dispatches around the wait read ") + Hex(before) + " and " +
+                        Hex(after));
+          }
+        });
+  }
+
+  // A read binding that joins a cached buffer with uncached pages in the middle of an epoch.
+  // The joined buffer keeps the GPU's writes to the old one and takes the CPU's bytes for the
+  // rest, also for parts of it no binding has asked for yet: later reads only translate.
+  void CheckEpochJoinTranslation() {
+    constexpr const char *name = "EpochJoinTranslation";
+    constexpr uintptr_t base = 0x0000000209400000ull;
+    constexpr uint64_t size = 0x100000;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    constexpr uint64_t gpu_written = base + 0x100;
+    constexpr uint64_t joined_bound = base + page + 0x40;
+    constexpr uint64_t joined_unbound = base + page + 0x2000;
+    constexpr u32 stale = 0xa0a0a0a0u;
+    constexpr u32 gpu_value = 0x6b0d1e55u;
+    constexpr u32 bound_value = 0x3c0ffee1u;
+    constexpr u32 unbound_value = 0x3c0ffee2u;
+    const auto output = [](uint32_t index) { return base + 0x80000 + index * 0x10u; };
+    const auto &copy = EpochCopyShader();
+    static const std::vector<u32> writer = [] {
+      std::vector<u32> code;
+      code.push_back(EncodeVop1(0x01u, 1, 4)); // v_mov_b32 v1, s4
+      code.push_back(EncodeMubuf0(0x1cu, 0, false, false)); // buffer_store_dword v1, off, s[0:3]
+      code.push_back(EncodeMubuf1(1, 0, 0));
+      AppendEnd(&code);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+      return code;
+    }();
+
+    RunEpochFixture(
+        name, base, size,
+        [&] {
+          *reinterpret_cast<u32 *>(gpu_written) = stale;
+          *reinterpret_cast<u32 *>(joined_bound) = bound_value;
+          *reinterpret_cast<u32 *>(joined_unbound) = unbound_value;
+        },
+        [&](RenderContext &context, CommandProcessor &processor) {
+          auto &cache = context.GetBufferCache();
+          const auto target = EpochDwordBuffer(gpu_written, sizeof(u32));
+          RunEpochSlice(name, processor, writer, 5,
+                        {KYTY_PM4(7, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+                         target.fields[0], target.fields[1], target.fields[2], target.fields[3],
+                         gpu_value, KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u,
+                         1u, 0x41u});
+          const auto first_owner = BufferCacheTestAccess::PageOwner(cache, base);
+          Require(name, "fixture",
+                  first_owner && !BufferCacheTestAccess::PageOwner(cache, base + page) &&
+                      cache.HasGpuDirtyBytes(gpu_written, sizeof(u32)),
+                  "the GPU write did not leave one cached, GPU-written page");
+
+          std::vector<u32> commands;
+          AppendEpochCopy(commands, gpu_written,
+                          static_cast<uint32_t>(base + page + 0x100 - gpu_written), output(0));
+          AppendEpochCopy(commands, joined_unbound, sizeof(u32), output(1));
+          AppendEpochCopy(commands, joined_bound, sizeof(u32), output(2));
+          RunEpochSlice(name, processor, copy, 8, commands);
+          const auto joined = BufferCacheTestAccess::PageOwner(cache, base);
+          Require(name, "join",
+                  joined && joined != first_owner &&
+                      joined == BufferCacheTestAccess::PageOwner(cache, base + page),
+                  "the straddling read did not join the cached buffer with the next page");
+          const std::array<u32, 3> expected{gpu_value, unbound_value, bound_value};
+          constexpr std::array<const char *, 3> what{"GPU-written dword", "unbound CPU dword",
+                                                     "bound CPU dword"};
+          for (uint32_t i = 0; i < expected.size(); i++) {
+            const auto actual = ReadEpochDword(name, context, output(i));
+            Require(name, what[i], actual == expected[i],
+                    "expected " + Hex(expected[i]) + ", got " + Hex(actual));
+          }
+        });
+  }
+
+  // A buffer outlives an unmap of its range; once the range is mapped again, the CPU writes to
+  // it (not write-watched, so no fault reports them) reach the buffer at the next epoch.
+  void CheckEpochRemap() {
+    constexpr const char *name = "EpochRemap";
+    constexpr uintptr_t base = 0x0000000209600000ull;
+    constexpr uint64_t size = 0x100000;
+    constexpr uint64_t remapped = 0x10000;
+    constexpr uint64_t source = base + 0x100;
+    constexpr u32 old_value = 0x00c0ffeeu;
+    constexpr u32 new_value = 0x0dec0de0u;
+    const auto output = [](uint32_t index) { return base + 0x80000 + index * 0x10u; };
+    const auto &copy = EpochCopyShader();
+
+    RunEpochFixture(
+        name, base, size, [&] { *reinterpret_cast<u32 *>(source) = old_value; },
+        [&](RenderContext &context, CommandProcessor &processor) {
+          std::vector<u32> read_old;
+          AppendEpochCopy(read_old, source, sizeof(u32), output(0));
+          RunEpochSlice(name, processor, copy, 8, read_old);
+          const auto owner = BufferCacheTestAccess::PageOwner(context.GetBufferCache(), source);
+          context.UnmapMemory(base, remapped);
+          // A slice while the range is unmapped: its acquire skips the range.
+          RunEpochSlice(name, processor, copy, 8, {0x80000000u});
+          context.MapMemory(base, remapped);
+          *reinterpret_cast<volatile u32 *>(source) = new_value;
+          std::vector<u32> read_new;
+          AppendEpochCopy(read_new, source, sizeof(u32), output(1));
+          RunEpochSlice(name, processor, copy, 8, read_new);
+          Require(name, "buffer kept",
+                  owner && owner == BufferCacheTestAccess::PageOwner(context.GetBufferCache(),
+                                                                      source),
+                  "the cached buffer did not outlive the unmap");
+          const auto before = ReadEpochDword(name, context, output(0));
+          const auto after = ReadEpochDword(name, context, output(1));
+          Require(name, "remapped write", before == old_value && after == new_value,
+                  "reads before and after the remap returned " + Hex(before) + " and " +
+                      Hex(after));
+        });
+  }
+
+  // A CPU write after the acquire to a cached page, then a shader store through BDA (not
+  // tracked) to other bytes of that page: the next acquire must not upload the whole page over
+  // the shader's bytes. The BDA dispatch uploads the CPU's write before it runs.
+  void CheckEpochBdaStoresKept() {
+    constexpr const char *name = "EpochBdaStoresKept";
+    constexpr uintptr_t base = 0x0000000209800000ull;
+    constexpr uint64_t size = 0x100000;
+    constexpr uint64_t cpu_dword = base + 0x4100;
+    constexpr uint64_t gpu_dword = base + 0x4200;
+    constexpr u32 cpu_old = 0x0c0de001u;
+    constexpr u32 cpu_new = 0x0c0de002u;
+    constexpr u32 stale = 0x57a1e000u;
+    constexpr u32 gpu_value = 0x6b0d1e77u;
+    const auto output = [](uint32_t index) { return base + 0x80000 + index * 0x10u; };
+    const auto &copy = EpochCopyShader();
+    // global_store_dword of s2 to the address in s[0:1].
+    static const std::vector<u32> bda_store = [] {
+      std::vector<u32> code;
+      code.push_back(EncodeVop1(0x01u, 20, 0)); // v_mov_b32 v20, s0
+      code.push_back(EncodeVop1(0x01u, 21, 1)); // v_mov_b32 v21, s1
+      code.push_back(EncodeVop1(0x01u, 30, 2)); // v_mov_b32 v30, s2
+      code.push_back(EncodeFlat0(0x1cu, 2));
+      code.push_back(EncodeFlat1(0, 0x7d, 30, 20));
+      AppendEnd(&code);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+      return code;
+    }();
+
+    RunEpochFixture(
+        name, base, size,
+        [&] {
+          *reinterpret_cast<u32 *>(cpu_dword) = cpu_old;
+          *reinterpret_cast<u32 *>(gpu_dword) = stale;
+        },
+        [&](RenderContext &context, CommandProcessor &processor) {
+          std::vector<u32> read_first;
+          AppendEpochCopy(read_first, cpu_dword, sizeof(u32), output(0));
+          RunEpochSlice(name, processor, copy, 8, read_first);
+          // Lands after the next slice's acquire, before its first packet (EpochWaitAcquire).
+          std::thread([&] {
+            context.GetGpu().SendCommand([&context] {
+              (void)context.InvalidateMemory(cpu_dword, sizeof(u32));
+              *reinterpret_cast<volatile u32 *>(cpu_dword) = cpu_new;
+            });
+          }).join();
+          RunEpochSlice(name, processor, bda_store, 3,
+                        {KYTY_PM4(5, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+                         static_cast<u32>(gpu_dword), static_cast<u32>(gpu_dword >> 32u),
+                         gpu_value, KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u,
+                         1u, 0x41u});
+          std::vector<u32> read_after;
+          AppendEpochCopy(read_after, gpu_dword, sizeof(u32), output(1));
+          AppendEpochCopy(read_after, cpu_dword, sizeof(u32), output(2));
+          RunEpochSlice(name, processor, copy, 8, read_after);
+          const auto shader_bytes = ReadEpochDword(name, context, output(1));
+          const auto cpu_bytes = ReadEpochDword(name, context, output(2));
+          Require(name, "BDA store kept", shader_bytes == gpu_value,
+                  "the BDA store's dword read back as " + Hex(shader_bytes) + ", expected " +
+                      Hex(gpu_value));
+          Require(name, "CPU write", cpu_bytes == cpu_new,
+                  "the CPU's dword read back as " + Hex(cpu_bytes));
+        });
+  }
+
+
 
   // A dispatch writes a hot page (one whose write-backs the CPU uses), and the staging ring
   // wraps after the page is bound but before the dispatch is recorded (its second binding
@@ -12280,6 +12621,9 @@ public:
         Require(name, "descriptor table refresh", context.InvalidateMemory(table_address, sizeof(table)),
                 "the descriptor table escaped its mapped allocation");
         LibKernel::Memory::WriteBacking(table_address, table.data(), sizeof(table));
+        // The dispatch below is not in a command-buffer slice: begin the epoch a slice would,
+        // so the cached buffers take the CPU's table (CoherenceEpoch).
+        context.GetBufferCache().Epoch().Acquire();
         ShaderComputeInputInfo input{};
         input.workgroup_counts[0] = input.workgroup_counts[1] = 1;
         input.workgroup_counts[2] = test.groups;
@@ -50752,6 +51096,123 @@ void CheckPm4RewindResume(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// The command processor's stores to guest memory all go through
+// RenderContext::GpuThreadGuestWrite, which hands them to the cached buffers: a raw
+// store into a guest address anywhere else in graphicsRun.cpp or the packet handlers
+// would stay invisible to dispatches recorded after it in the same epoch. Both bulk
+// stores (memcpy and friends) and assignments through a pointer or index count.
+// Copies into the processor's own state (m_ members), into locals (&local) or into a
+// member of a local object (local.field) are not guest stores.
+void CheckGpuThreadGuestWritesRouted() {
+  constexpr const char *name = "GpuThreadGuestWritesRouted";
+  const std::string root = std::string(KYTY_TEST_SOURCE_DIR) + "/graphics/guest_gpu";
+  std::vector<std::string> paths{root + "/graphicsRun.cpp"};
+  for (const auto &entry :
+       std::filesystem::directory_iterator(root + "/command_processor")) {
+    if (entry.path().extension() == ".cpp") {
+      paths.push_back(entry.path().string());
+    }
+  }
+  Require(name, "sources", paths.size() >= 3,
+          "found no command-processor sources under " + root);
+  const std::regex assignment(
+      R"((?:[;{}]|\)|\belse)\s*(?:\*\s*\(?\s*([A-Za-z_]\w*)|([A-Za-z_]\w*)\s*\[[^\]\n]*\]|)"
+      R"(([A-Za-z_]\w*)\s*->\s*(\w+))\s*=[^=])");
+  const std::regex local_member(R"(^[A-Za-z_]\w*\.)");
+  size_t stores = 0;
+  size_t routed_total = 0;
+  for (const auto &path : paths) {
+    std::ifstream file(path);
+    Require(name, "source", file.good(), "cannot read " + path);
+    const auto file_name = std::filesystem::path(path).filename().string();
+    std::string source;
+    for (std::string line; std::getline(file, line);) {
+      if (const auto comment = line.find("//"); comment != std::string::npos) {
+        line.erase(comment);
+      }
+      source += line;
+      source += '\n';
+    }
+    const auto where = [&](size_t offset) {
+      return file_name + ":" +
+             std::to_string(1 + std::count(source.begin(), source.begin() + offset, '\n'));
+    };
+    // The argument span of every helper call.
+    std::vector<std::pair<size_t, size_t>> routed;
+    constexpr std::string_view helper = "GpuThreadGuestWrite(";
+    for (auto at = source.find(helper); at != std::string::npos;
+         at = source.find(helper, at + 1)) {
+      size_t depth = 0;
+      size_t end = at + helper.size() - 1;
+      for (; end < source.size(); end++) {
+        if (source[end] == '(') {
+          depth++;
+        } else if (source[end] == ')' && --depth == 0) {
+          break;
+        }
+      }
+      routed.emplace_back(at, end);
+    }
+    routed_total += routed.size();
+    const auto inside = [&](size_t at) {
+      return std::any_of(routed.begin(), routed.end(), [&](const auto &span) {
+        return at > span.first && at < span.second;
+      });
+    };
+    Require(name, "no bare preparation",
+            source.find("PrepareGpuThreadWrite") == std::string::npos,
+            file_name + " prepares a guest store without GpuThreadGuestWrite");
+    for (const std::string_view call : {"memcpy(", "memmove(", "memset(", "std::fill(",
+                                        "std::fill_n(", "std::copy(", "std::copy_n("}) {
+      for (auto at = source.find(call); at != std::string::npos;
+           at = source.find(call, at + 1)) {
+        if (at != 0 && (std::isalnum(static_cast<unsigned char>(source[at - 1])) != 0 ||
+                        source[at - 1] == '_')) {
+          continue;
+        }
+        // The destination: the first argument, or the iterator after the first two for
+        // std::copy.
+        auto argument = at + call.size();
+        if (call.starts_with("std::copy")) {
+          argument = source.find(',', source.find(',', argument) + 1) + 1;
+        }
+        while (std::isspace(static_cast<unsigned char>(source[argument])) != 0) {
+          argument++;
+        }
+        const auto destination = source.substr(argument, 32);
+        if (destination.starts_with("&") || destination.starts_with("m_") ||
+            std::regex_search(destination, local_member)) {
+          continue;
+        }
+        stores++;
+        Require(name, "routed store", inside(at),
+                where(at) + " stores to guest memory with " + std::string(call) +
+                    "...) outside GpuThreadGuestWrite");
+      }
+    }
+    for (auto it = std::sregex_iterator(source.begin(), source.end(), assignment);
+         it != std::sregex_iterator(); ++it) {
+      const auto &match = *it;
+      const auto target = match[1].matched   ? match[1].str()
+                          : match[2].matched ? match[2].str()
+                                             : match[3].str();
+      if (target.starts_with("m_") || target.starts_with("g_") || target == "this" ||
+          (match[4].matched && match[4].str().starts_with("m_"))) {
+        continue;
+      }
+      const auto at = static_cast<size_t>(match.position(0) + match.length(0));
+      stores++;
+      Require(name, "routed assignment", inside(at),
+              where(at) + " assigns through " + target + " outside GpuThreadGuestWrite");
+    }
+  }
+  Require(name, "helper use", routed_total >= 9,
+          "the command processor routes only " + std::to_string(routed_total) +
+              " stores through GpuThreadGuestWrite");
+  Require(name, "stores found", stores != 0, "the scan found no guest store at all");
+  std::printf("[host]    %-32s ok (%zu stores in %zu files)\n", name, stores, paths.size());
+}
+
 void CheckPm4CeCompletion(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
@@ -51402,6 +51863,17 @@ int main(int argc, char **argv) {
     vulkan.CheckReadbackInFlightSibling(VulkanHarness::InFlightSiblingCase::WrapGated);
     vulkan.CheckReadbackInFlightSibling(VulkanHarness::InFlightSiblingCase::Unsubmitted);
     vulkan.CheckGpuOrderedWriteData();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--epoch-coherence-only") == 0) {
+    CheckGpuThreadGuestWritesRouted();
+    VulkanHarness vulkan;
+    vulkan.CheckEpochGpuThreadWrites();
+    vulkan.CheckEpochWaitAcquire();
+    vulkan.CheckEpochJoinTranslation();
+    vulkan.CheckEpochRemap();
+    vulkan.CheckEpochBdaStoresKept();
+    vulkan.CheckPartialUnmapSync();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--readonly-bindings-bench") == 0) {
@@ -52087,6 +52559,12 @@ int main(int argc, char **argv) {
   vulkan.CheckReadbackInFlightSibling(VulkanHarness::InFlightSiblingCase::WrapGated);
   vulkan.CheckReadbackInFlightSibling(VulkanHarness::InFlightSiblingCase::Unsubmitted);
   vulkan.CheckGpuOrderedWriteData();
+  CheckGpuThreadGuestWritesRouted();
+  vulkan.CheckEpochGpuThreadWrites();
+  vulkan.CheckEpochWaitAcquire();
+  vulkan.CheckEpochJoinTranslation();
+  vulkan.CheckEpochRemap();
+  vulkan.CheckEpochBdaStoresKept();
   if (skipped_device_checks) {
     std::printf(
         "ShaderRecompilerComputeTests: device rasterization checks skipped, this "

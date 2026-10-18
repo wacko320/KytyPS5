@@ -7,6 +7,7 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/renderer/cache/coherenceEpoch.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
@@ -70,6 +71,13 @@ public:
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
+	// A range the GPU only reads, within an epoch (CoherenceEpoch): the buffer holding it already
+	// has every CPU write the GPU may see, so a cached range is only translated. A range no buffer
+	// holds whole is obtained (and uploaded) as ObtainBuffer does.
+	[[nodiscard]] std::pair<Buffer*, uint64_t> TranslateRead(uint64_t vaddr, uint64_t size,
+	                                                         bool     is_texel_buffer = false,
+	                                                         BufferId id              = {});
+	[[nodiscard]] CoherenceEpoch&              Epoch() noexcept { return m_epoch; }
 	// Called once the command that writes the ranges bound since the last call is recorded: they
 	// are copied back (hot pages only) at the end of the submit that holds the write, not of one
 	// a stream-buffer wrap made between the binding and the command.
@@ -104,6 +112,13 @@ public:
 	// before it instead of draining the GPU to merge it into guest memory. False (nothing
 	// recorded) unless every tracker page of the range is GPU-dirty.
 	bool TryWriteGpuOrdered(uint64_t vaddr, const void* data, uint64_t size);
+	// GPU thread: where a command-processor store to [vaddr, vaddr + size) may be made without
+	// touching page protection, or nullptr. The guest backing's own view of the range, for a
+	// small range no page of which the GPU owns or a download is still publishing into.
+	[[nodiscard]] uint8_t* WriteThroughView(uint64_t vaddr, uint64_t size);
+	// GPU thread: after a store through WriteThroughView, the buffers over the range take the
+	// same bytes in command order. Their pages keep their protection and CPU-dirty state.
+	void WriteThrough(uint64_t vaddr, const uint8_t* bytes, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBda(const RangeSet& mapped);
 	void               QueueBdaSync(uint64_t vaddr, uint64_t size) {
@@ -130,6 +145,7 @@ public:
 
 private:
 	friend struct BufferCacheTestAccess;
+	friend class CoherenceEpoch;
 
 	bool IsBufferInvalid(BufferId id) const {
 		const auto* buffer = m_slot_buffers.try_get(id);
@@ -167,6 +183,14 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// Uploads the CPU-dirty pages of the buffers over the ranges in one batch (CoherenceEpoch).
+	void UploadCpuPending(const RangeSet& pending);
+	// Notes the tracker pages over the range pending, holding the epoch's upload (HoldPending).
+	[[nodiscard]] CoherenceEpoch::Hold HoldCpuWritten(uint64_t vaddr, uint64_t size);
+	// Marks a range CPU-dirty, and so writable, under HoldCpuWritten.
+	void MarkCpuWritten(uint64_t vaddr, uint64_t size);
+	// Debug builds: reports a translated read of CPU-dirty bytes (a write no acquire covered).
+	void ValidateEpochRead(const Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
@@ -222,6 +246,7 @@ private:
 	// Written on the GPU thread under m_dirty_ranges_mutex; other threads read them under it.
 	mutable std::shared_mutex                         m_dirty_ranges_mutex;
 	RangeSet                                          m_gpu_modified_ranges;
+	CoherenceEpoch                                    m_epoch {*this};
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

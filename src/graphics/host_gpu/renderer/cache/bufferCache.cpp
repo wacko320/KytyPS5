@@ -593,7 +593,7 @@ bool BufferCache::TryResolveWrittenBack(uint64_t vaddr, bool is_write) {
 	m_memory_tracker.UnmarkRegionAsGpuModified(page << WritebackPageBits,
 	                                           (run + 1) * WritebackPageSize);
 	if (is_write) {
-		m_memory_tracker.MarkRegionAsCpuModified(vaddr, 1);
+		MarkCpuWritten(vaddr, 1);
 	}
 	// The GPU thread drops the pages' GPU-dirty ranges before it next records a write. Queued
 	// before the count is published: a writer that sees the new count sees the hand-back too.
@@ -664,8 +664,23 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
-	m_memory_tracker.InvalidateRegion(vaddr, size,
-	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+	// Pending before the pages turn writable, and held until they have: an acquire in between
+	// would otherwise miss a write made through them (noted after), or find them still clean
+	// and drop the range (noted before, unheld). A flush marks its pages in MarkCpuWritten.
+	m_memory_tracker.InvalidateRegion(
+	    vaddr, size, [this, vaddr, size] { ReadMemory(vaddr, size, true); },
+	    [this](uint64_t address, uint64_t bytes) { return HoldCpuWritten(address, bytes); });
+}
+
+CoherenceEpoch::Hold BufferCache::HoldCpuWritten(uint64_t vaddr, uint64_t size) {
+	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	return m_epoch.HoldPending(begin, end - begin);
+}
+
+void BufferCache::MarkCpuWritten(uint64_t vaddr, uint64_t size) {
+	const auto hold = HoldCpuWritten(vaddr, size);
+	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -770,7 +785,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			}
 		}
 		if (is_write) {
-			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			MarkCpuWritten(vaddr, size);
 		}
 	});
 }
@@ -815,7 +830,7 @@ void BufferCache::ReadMemoryFromGuestThread(uint64_t vaddr, uint64_t size, bool 
 				}
 				m_memory_tracker.UnmarkRegionAsGpuModified(fault_page, CACHING_PAGESIZE);
 				if (is_write) {
-					m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+					MarkCpuWritten(vaddr, size);
 				}
 				profile.outcome = FrameProfiler::Counter::DownloadFastRender;
 				done            = true;
@@ -859,7 +874,7 @@ void BufferCache::ReadMemoryFromGuestThread(uint64_t vaddr, uint64_t size, bool 
 				}
 			}
 			if (is_write && !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
-				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+				MarkCpuWritten(vaddr, size);
 			}
 			for (auto page = range_begin; page < range_end && !again; page += TRACKER_PAGE_SIZE) {
 				again = m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE) &&
@@ -981,6 +996,14 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
 	Register(id);
+	// Reads within an epoch only translate (TranslateRead), and pages never protected do not
+	// fault to mark themselves pending: the new range takes what the CPU wrote now, in one batch.
+	RangeSet created;
+	created.Add(overlap.begin, overlap.end - overlap.begin);
+	{
+		const FrameProfiler::ScopedUploadSource source(FrameProfiler::UploadSource::Create);
+		UploadCpuPending(created);
+	}
 	return id;
 }
 
@@ -1076,21 +1099,6 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
 
-	if (!is_written && size <= CACHING_PAGESIZE &&
-	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
-		const auto alignment = std::max<uint64_t>(
-		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
-		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
-		if (mapped != nullptr) {
-			if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
-				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
-			}
-			m_stream_buffer.Commit();
-			return {&m_stream_buffer, offset};
-		}
-	}
-
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
 		id = FindBuffer(vaddr, size);
 	}
@@ -1112,6 +1120,54 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
+}
+
+std::pair<Buffer*, uint64_t> BufferCache::TranslateRead(uint64_t vaddr, uint64_t size,
+                                                        bool is_texel_buffer, BufferId id) {
+	if (m_scheduler.Current().IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: buffer read request requires a recording command buffer\n");
+	}
+	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
+		const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+		if (owner != nullptr && *owner && m_slot_buffers[*owner].IsInBounds(vaddr, size)) {
+			id = *owner;
+			ValidateEpochRead(m_slot_buffers[id], vaddr, size);
+		} else {
+			// A range no buffer holds whole: the buffer created (or joined) for it takes the
+			// CPU's bytes as it is created.
+			id = FindBuffer(vaddr, size);
+		}
+	} else {
+		ValidateEpochRead(m_slot_buffers[id], vaddr, size);
+	}
+	auto& buffer = m_slot_buffers[id];
+	TouchBuffer(buffer);
+	// Image data over the range is a separate domain, synchronized per binding as before.
+	if (is_texel_buffer) {
+		(void)SynchronizeBufferFromImage(buffer, vaddr, size);
+	}
+	return {&buffer, buffer.Offset(vaddr)};
+}
+
+void BufferCache::ValidateEpochRead(const Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	(void)buffer;
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
+	// A CPU-dirty page under a translated read is a CPU write no acquire covered: a guest race,
+	// or a synchronization channel that is not an acquire point.
+	if (!m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		return;
+	}
+	static std::atomic<uint64_t> stale_reads {0};
+	const auto                   count = stale_reads.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (count <= 64 || (count & (count - 1)) == 0) {
+		LOGF("BufferCache: read of CPU-dirty bytes within an epoch (%" PRIu64 " so far), "
+		     "addr=0x%016" PRIx64 " size=0x%" PRIx64 " epoch=%" PRIu64 "\n",
+		     count, vaddr, size, m_epoch.EpochId());
+	}
+#else
+	(void)vaddr;
+	(void)size;
+#endif
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
@@ -1156,9 +1212,10 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
 	if (!IsRegionGpuModified(vaddr, size)) {
-		// Access the guest mapping so write faults invalidate cached buffers and images.
-		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
-		std::fill(destination, destination + size / sizeof(uint32_t), value);
+		m_scheduler.Context().GpuThreadGuestWrite(vaddr, size, [&](void* to) {
+			auto* destination = static_cast<uint32_t*>(to);
+			std::fill(destination, destination + size / sizeof(uint32_t), value);
+		});
 		return;
 	}
 
@@ -1183,8 +1240,9 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	}
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
-		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
-		            size);
+		m_scheduler.Context().GpuThreadGuestWrite(dst_vaddr, size, [&](void* to) {
+			std::memcpy(to, reinterpret_cast<const void*>(src_vaddr), size);
+		});
 		return;
 	}
 
@@ -1262,6 +1320,45 @@ bool BufferCache::TryWriteGpuOrdered(uint64_t vaddr, const void* data, uint64_t 
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
 	return true;
+}
+
+uint8_t* BufferCache::WriteThroughView(uint64_t vaddr, uint64_t size) {
+	// Larger stores (DMA fills and copies) upload their pages in one batch instead of streaming
+	// every byte through the staging ring.
+	constexpr uint64_t MaxWriteThroughSize = 64 * 1024;
+	if (size == 0 || size > MaxWriteThroughSize || !GuestRange {vaddr, size}.Valid()) {
+		return nullptr;
+	}
+	// A page the GPU owns holds stale guest bytes, and a download still on its way (a pending
+	// guest write) would publish over the store.
+	if (m_memory_tracker.IsRegionGpuModified(vaddr, size) || HasGpuDirtyBytes(vaddr, size) ||
+	    HasPendingGuestWrite(vaddr, size)) {
+		return nullptr;
+	}
+	Libs::LibKernel::Memory::GuestBackingView view {};
+	if (!Libs::LibKernel::Memory::GetGuestBackingView(vaddr, size, &view)) {
+		return nullptr;
+	}
+	return view.pointer;
+}
+
+void BufferCache::WriteThrough(uint64_t vaddr, const uint8_t* bytes, uint64_t size) {
+	FrameProfiler::Add(FrameProfiler::Counter::WriteThroughs);
+	// A clean page stays clean, as buffer and guest memory both take the bytes. A CPU-dirty one
+	// is pending already: the acquire that uploads it reads these bytes from guest memory too.
+	const auto end = vaddr + size;
+	auto       it  = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		auto&      buffer = m_slot_buffers[it->second];
+		const auto start  = std::max(buffer.CpuAddress(), vaddr);
+		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+		if (start < finish) {
+			WriteDataBuffer(buffer, start, bytes + (start - vaddr), finish - start);
+		}
+	}
 }
 
 bool BufferCache::IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const {
@@ -1420,6 +1517,131 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 			SynchronizeBuffersInRange(start, finish - start);
 		});
 	});
+}
+
+void BufferCache::UploadCpuPending(const RangeSet& pending) {
+	struct Upload {
+		Buffer* buffer;
+		size_t  first;
+		size_t  count;
+	};
+	std::vector<Upload>         uploads;
+	std::vector<vk::BufferCopy> copies;
+	uint64_t                    total_size = 0;
+	const auto                  collect    = [&](uint64_t vaddr, uint64_t end) {
+		auto it = m_buffers.upper_bound(vaddr);
+		if (it != m_buffers.begin()) {
+			--it;
+		}
+		for (; it != m_buffers.end() && it->first < end; ++it) {
+			auto&      buffer = m_slot_buffers[it->second];
+			const auto start  = std::max(buffer.CpuAddress(), vaddr);
+			const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+			if (start >= finish) {
+				continue;
+			}
+			const auto first = copies.size();
+			// The pages turn clean (and write-watched) during the walk; a CPU write after that
+			// faults and is pending again, whether or not the copy below took it.
+			m_memory_tracker.ForEachUploadRange(
+			    start, finish - start, false,
+			    [&](uint64_t address, uint64_t bytes) noexcept {
+				    copies.emplace_back(total_size, buffer.Offset(address), bytes);
+				    total_size += bytes;
+			    },
+			    []() noexcept {});
+			if (copies.size() == first) {
+				continue;
+			}
+			// Pending ranges come in address order, so a buffer's copies are consecutive.
+			if (uploads.empty() || uploads.back().buffer != &buffer) {
+				uploads.push_back({&buffer, first, 0});
+			}
+			uploads.back().count = copies.size() - uploads.back().first;
+		}
+	};
+	const uint64_t profile_t0     = FrameProfiler::Start();
+	const uint64_t protect_calls0 = FrameProfiler::t_protect_calls;
+	const uint64_t protect_ticks0 = FrameProfiler::t_protect_ticks;
+	pending.ForEach([&](uint64_t start, uint64_t end) { ForEachMappedPart(start, end, collect); });
+	if (profile_t0 != 0) {
+		using FrameProfiler::Counter;
+		using FrameProfiler::UploadCounter;
+		FrameProfiler::Add(UploadCounter(Counter::UploadCallsAcquire));
+		if (!copies.empty()) {
+			FrameProfiler::RecordEvent(FrameProfiler::Event::EpochUpload, total_size, copies.size());
+			FrameProfiler::Add(UploadCounter(Counter::UploadNonEmptyAcquire));
+			FrameProfiler::Add(UploadCounter(Counter::UploadBytesAcquire), total_size);
+			FrameProfiler::Add(UploadCounter(Counter::UploadCopiesAcquire), copies.size());
+			FrameProfiler::AddSince(Counter::UploadWalkTime, profile_t0);
+			// The walk re-protects the pages it cleans: its share of syscalls.
+			FrameProfiler::Add(Counter::UploadWalkProtectCalls,
+			                   FrameProfiler::t_protect_calls - protect_calls0);
+			FrameProfiler::Add(Counter::UploadWalkProtectTime,
+			                   FrameProfiler::t_protect_ticks - protect_ticks0);
+		}
+	}
+	if (copies.empty()) {
+		FrameProfiler::AddSince(FrameProfiler::Counter::UploadTime, profile_t0);
+		return;
+	}
+
+	// One staging reservation: a wrap waiting on this submit then happens before any copy is
+	// recorded, never between a copy and the data it reads.
+	const uint64_t copy_t0         = profile_t0 != 0 ? FrameProfiler::Ticks() : 0;
+	auto [staging, staging_offset] = m_staging_buffer.Map(total_size, 4);
+	std::unique_ptr<Buffer> temporary;
+	if (staging == nullptr) {
+		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
+		                                     vk::BufferUsageFlagBits::eTransferSrc, total_size);
+		staging        = temporary->Mapped().data();
+		staging_offset = 0;
+	}
+	for (const auto& upload: uploads) {
+		for (size_t i = upload.first; i < upload.first + upload.count; i++) {
+			auto& copy = copies[i];
+			std::memcpy(staging + copy.srcOffset,
+			            reinterpret_cast<const void*>(upload.buffer->CpuAddress() + copy.dstOffset),
+			            copy.size);
+			copy.srcOffset += staging_offset;
+		}
+	}
+	FrameProfiler::AddSince(FrameProfiler::Counter::UploadCopyTime, copy_t0);
+	vk::Buffer source;
+	if (temporary) {
+		FrameProfiler::Add(FrameProfiler::Counter::UploadTemporaryStaging);
+		temporary->Flush(0, total_size);
+		source = temporary->Handle();
+		m_scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+	} else {
+		m_staging_buffer.Commit();
+		source = m_staging_buffer.Handle();
+	}
+
+	auto& command = m_scheduler.Current();
+	if (command.IsInvalid()) {
+		EXIT("BufferCache: CPU-write upload requires a recording command buffer\n");
+	}
+	command.EndRendering();
+	const auto        native = command.Handle();
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+	                       vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+	                       nullptr);
+	for (const auto& upload: uploads) {
+		native.copyBuffer(source, upload.buffer->Handle(), static_cast<uint32_t>(upload.count),
+		                  copies.data() + upload.first);
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0, nullptr, 0,
+	                       nullptr);
+	FrameProfiler::AddSince(FrameProfiler::Counter::UploadTime, profile_t0);
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

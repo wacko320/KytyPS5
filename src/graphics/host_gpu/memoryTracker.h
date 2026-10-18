@@ -35,15 +35,57 @@ public:
 	// Queue after changing ownership; a concurrent drain must not consume an event
 	// before the dirty pages it describes become visible.
 	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
+	// Waits for the holds queued into the set it takes (HoldBdaSync). A thread must not take
+	// while it holds.
 	[[nodiscard]] RangeSet TakeBdaSync();
+	[[nodiscard]] bool     HasBdaSync() const noexcept {
+		return m_bda_sync_nonempty.load(std::memory_order_acquire);
+	}
+	// Keeps TakeBdaSync from returning the set it was queued into until the holder drops it.
+	class BdaSyncHold {
+	public:
+		BdaSyncHold() = default;
+		explicit BdaSyncHold(std::atomic<uint32_t>& in_flight): m_in_flight(&in_flight) {}
+		BdaSyncHold(BdaSyncHold&& other) noexcept
+		    : m_in_flight(std::exchange(other.m_in_flight, nullptr)) {}
+		BdaSyncHold& operator=(BdaSyncHold&&)      = delete;
+		BdaSyncHold(const BdaSyncHold&)            = delete;
+		BdaSyncHold& operator=(const BdaSyncHold&) = delete;
+		~BdaSyncHold() {
+			if (m_in_flight != nullptr) {
+				m_in_flight->fetch_sub(1, std::memory_order_release);
+			}
+		}
+
+	private:
+		std::atomic<uint32_t>* m_in_flight = nullptr;
+	};
+	// QueueBdaSync before the ownership change, returning a hold to drop once it is made: the
+	// take that gets the range then sees its pages changed whole, so a CPU write through pages
+	// turned writable cannot slip between the take and a queue made after the change. Holders
+	// do not wait for each other (faults on many threads); only a take waits, for the holds of
+	// the set it takes.
+	[[nodiscard]] BdaSyncHold HoldBdaSync(uint64_t vaddr, uint64_t size);
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
+		InvalidateRegion(vaddr, size, std::forward<Flush>(on_flush),
+		                 [](uint64_t, uint64_t) noexcept { return 0; });
+	}
+	// As above. on_cpu_dirty(vaddr, size) runs for each region part before its pages may turn
+	// CPU-dirty and writable, and what it returns is held until they have (a hold, so that an
+	// upload taking the note sees the change whole). It runs before the region lock is taken.
+	template <typename Flush, typename CpuDirty>
+	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush,
+	                      CpuDirty&& on_cpu_dirty) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
+		static_assert(std::is_invocable_v<CpuDirty&, uint64_t, uint64_t>);
 		CheckNotInUploadCallback();
 
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			const bool should_flush = [&] {
+				[[maybe_unused]] const auto hold =
+				    on_cpu_dirty(manager->GetCpuAddr() + offset, bytes);
 				// Perform both the GPU modification check and CPU state change with the lock in
 				// case the GPU thread is racing to mark the page modified. If a flush is needed,
 				// on_flush performs the CPU state change.
@@ -278,6 +320,13 @@ private:
 	std::mutex                                     m_region_mutex;
 	std::mutex                                     m_bda_sync_mutex;
 	RangeSet                                       m_bda_sync;
+	// Bumped under the mutex as a take swaps the set out. A hold counts itself under the mutex,
+	// in the slot of the generation its range was queued into, so the take that gets the range
+	// waits for it (and for older holds still in that slot, which only waits longer).
+	std::atomic<uint64_t>                m_bda_sync_generation {0};
+	std::array<std::atomic<uint32_t>, 2> m_bda_sync_in_flight {};
+	// Stored under the mutex, so a take with nothing queued is one load.
+	std::atomic<bool> m_bda_sync_nonempty {false};
 	PageManager&                                   m_page_manager;
 	TrackerEpochs                                  m_epochs;
 	// Uploads may come from any thread; the records belong to whichever holds this.

@@ -233,6 +233,27 @@ public:
 		return true;
 	}
 
+	// The backing store's own view of [vaddr, vaddr + size) when one mapping holds all of it:
+	// always read-write, whatever the guest view's protection.
+	bool BackingView(uint64_t vaddr, uint64_t size, GuestBackingView* out) {
+		EXIT_IF(out == nullptr);
+		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		std::lock_guard lock(m_mutex);
+		MapEntry        entry {};
+		if (!FindContainingUnlocked(vaddr, size, &entry)) {
+			return false;
+		}
+		const auto offset = entry.backing_offset + vaddr - entry.vaddr;
+		if (!RangeOk(offset, size)) {
+			return false;
+		}
+		out->pointer = m_backing_base + offset;
+		out->offset  = offset;
+		return true;
+	}
+
 	// Writes the parts of the range a mapping holds, skipping the rest; the bytes written.
 	uint64_t WriteMappedBacking(uint64_t vaddr, const void* data, uint64_t size) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
@@ -813,6 +834,10 @@ public:
 
 	uint64_t WriteMappedBacking(uint64_t vaddr, const void* data, uint64_t size) {
 		return m_backing->WriteMappedBacking(vaddr, data, size);
+	}
+
+	bool BackingView(uint64_t vaddr, uint64_t size, GuestBackingView* out) {
+		return m_backing->BackingView(vaddr, size, out);
 	}
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {

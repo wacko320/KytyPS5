@@ -274,7 +274,11 @@ void CommandProcessor::WaitDeDiff(uint32_t diff) {
 void CommandProcessor::WaitForRewind(bool valid) {
 	if (!valid) {
 		SuspendPm4();
+		return;
 	}
+	// The guest marked the commands after the rewind valid; what it wrote before that is ordered
+	// before them.
+	m_renderer.GetBufferCache().Epoch().Acquire();
 }
 
 void CommandProcessor::IncrementDe() {
@@ -290,7 +294,10 @@ void CommandProcessor::WriteConstRam(uint32_t offset, const uint32_t* src, uint3
 }
 
 void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_num) {
-	memcpy(dst, m_const_ram + offset / 4, static_cast<size_t>(dw_num) * 4);
+	const auto bytes = static_cast<size_t>(dw_num) * 4;
+	m_renderer.GpuThreadGuestWrite(reinterpret_cast<uint64_t>(dst), bytes, [&](void* to) {
+		memcpy(to, m_const_ram + offset / 4, bytes);
+	});
 }
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func) {
@@ -339,7 +346,11 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 			     static_cast<uint64_t>(ref));
 		}
 		SuspendPm4();
+		return;
 	}
+	// A CPU write before the one this wait observed is ordered before the commands after it, also
+	// when the wait passes on arrival (a resumed wait begins a new slice as well).
+	m_renderer.GetBufferCache().Epoch().Acquire();
 }
 
 template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, uint32_t, uint32_t,
@@ -370,14 +381,16 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	if (m_renderer.TryWriteGpuOrdered(reinterpret_cast<uint64_t>(dst), data, bytes)) {
 		return;
 	}
-	m_renderer.PrepareGpuThreadWrite(reinterpret_cast<uint64_t>(dst), bytes);
-	if (write_one_address) {
-		for (uint32_t i = 0; i < dw_num; i++) {
-			dst[0] = src[i];
+	m_renderer.GpuThreadGuestWrite(reinterpret_cast<uint64_t>(dst), bytes, [&](void* to) {
+		auto* words = static_cast<uint32_t*>(to);
+		if (write_one_address) {
+			for (uint32_t i = 0; i < dw_num; i++) {
+				words[0] = src[i];
+			}
+		} else {
+			memcpy(words, src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
 		}
-	} else {
-		memcpy(dst, src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
-	}
+	});
 }
 
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
@@ -387,14 +400,26 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		     num_bytes);
 	}
 	const auto value = Sync::ReadReferenceClock();
-	m_renderer.PrepareGpuThreadWrite(dst_address, num_bytes);
-	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	m_renderer.GpuThreadGuestWrite(dst_address, num_bytes,
+	                               [&](void* to) { std::memcpy(to, &value, num_bytes); });
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
 		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
 		     " size=%u\n",
 		     dst_address, value, num_bytes);
 	}
+}
+
+void CommandProcessor::WriteLodStats(void* dst, uint32_t num_bytes) {
+	// No statistics are gathered: the buffer reads as zero, with its first dword (the ready
+	// label) set. Hack?
+	m_renderer.GpuThreadGuestWrite(reinterpret_cast<uint64_t>(dst), num_bytes, [&](void* to) {
+		memset(to, 0, num_bytes);
+		if (num_bytes >= sizeof(uint32_t)) {
+			const uint32_t label = 1;
+			memcpy(to, &label, sizeof(label));
+		}
+	});
 }
 
 void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
@@ -674,6 +699,9 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 		Pm4Execution*     previous_execution;
 	} execution_scope(*this, execution);
 
+	// Every command-buffer slice begins an epoch: CPU writes made before it reach the buffers
+	// once here, so its read bindings only translate guest addresses (CoherenceEpoch).
+	m_renderer.GetBufferCache().Epoch().Acquire();
 	ProcessPm4(execution);
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
@@ -1126,7 +1154,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		auto  data = static_cast<uint32_t>(value);
 		EXIT_IF(dst == nullptr);
 		(void)command.Handle();
-		std::memcpy(dst, &data, sizeof(data));
+		m_renderer.GpuThreadGuestWrite(reinterpret_cast<uint64_t>(dst), sizeof(data),
+		                               [&](void* to) { std::memcpy(to, &data, sizeof(data)); });
 
 		if (with_interrupt) {
 			TriggerEopEventAtEndOfPipe(interrupt_context_id);
@@ -1139,8 +1168,12 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				if (eop_event_type == 0x2f && cache_action == 0x00 && event_index == 0x06) {
 					auto* dst = static_cast<uint32_t*>(dst_gpu_addr);
 					SynchronizeGpu();
-					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
-					              value >> 16u);
+					m_renderer.GpuThreadGuestWrite(
+					    reinterpret_cast<uint64_t>(dst), uint64_t {value >> 16u} * sizeof(uint32_t),
+					    [&](void* to) {
+						    Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(),
+						                  static_cast<uint32_t*>(to), value & 0xffffu, value >> 16u);
+					    });
 					if (with_interrupt) {
 						m_renderer.TriggerInterrupt(m_interrupt_event_id, interrupt_context_id);
 					}
@@ -1169,7 +1202,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					EXIT_IF(dst == nullptr);
 					(void)command.Handle();
-					std::memcpy(dst, &value, sizeof(value));
+					m_renderer.GpuThreadGuestWrite(
+					    reinterpret_cast<uint64_t>(dst), sizeof(value),
+					    [&](void* to) { std::memcpy(to, &value, sizeof(value)); });
 
 					if (with_interrupt) {
 						TriggerEopEventAtEndOfPipe(interrupt_context_id);
@@ -1360,11 +1395,15 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			// ready.
 			constexpr uint64_t ready_bit    = 1ull << 63u;
 			constexpr uint64_t counter_mask = ready_bit - 1u;
-			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);
+			constexpr uint32_t db_count     = 16u;
+			constexpr uint64_t results_size = uint64_t {db_count} * 2u * sizeof(uint64_t);
 			const auto         value        = ready_bit | m_synthetic_occlusion_counter;
-			for (uint32_t db = 0; db < 16u; db++) {
-				results[db * 2u] = value;
-			}
+			m_renderer.GpuThreadGuestWrite(event_address, results_size, [&](void* to) {
+				auto* results = static_cast<volatile uint64_t*>(to);
+				for (uint32_t db = 0; db < db_count; db++) {
+					results[db * 2u] = value;
+				}
+			});
 			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
 			break;
 		}
@@ -1398,7 +1437,8 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	}
 
 	EXIT_IF(dst_gpu_addr == nullptr);
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	m_renderer.GpuThreadGuestWrite(reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value),
+	                               [&](void* to) { std::memcpy(to, &value, sizeof(value)); });
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	(void)command.Handle();
@@ -1424,7 +1464,8 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 		EXIT("unknown event type\n");
 	}
 	EXIT_IF(dst_gpu_addr == nullptr);
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	m_renderer.GpuThreadGuestWrite(reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value),
+	                               [&](void* to) { std::memcpy(to, &value, sizeof(value)); });
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	(void)command.Handle();

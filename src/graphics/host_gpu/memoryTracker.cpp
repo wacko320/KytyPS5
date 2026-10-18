@@ -2,10 +2,21 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/frameProfiler.h"
+
+#include <thread>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
 
 namespace Libs::Graphics {
 
 static_assert(std::atomic<void*>::is_always_lock_free);
+
+namespace FrameProfiler = Common::FrameProfiler;
 
 MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
 	m_regions              = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
@@ -112,11 +123,67 @@ void MemoryTracker::QueueBdaSync(uint64_t vaddr, uint64_t size) {
 	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	std::lock_guard lock(m_bda_sync_mutex);
 	m_bda_sync.Add(begin, end - begin);
+	m_bda_sync_nonempty.store(true, std::memory_order_release);
+}
+
+MemoryTracker::BdaSyncHold MemoryTracker::HoldBdaSync(uint64_t vaddr, uint64_t size) {
+	const auto      begin      = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto      end        = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	const uint64_t  profile_t0 = FrameProfiler::Start();
+	std::lock_guard lock(m_bda_sync_mutex);
+	if (profile_t0 != 0) {
+		FrameProfiler::AddSince(FrameProfiler::CurrentRole() == FrameProfiler::Role::Gpu
+		                            ? FrameProfiler::Counter::PendingLockWaitGpuTime
+		                            : FrameProfiler::Counter::PendingLockWaitGuestTime,
+		                        profile_t0);
+		FrameProfiler::Add(FrameProfiler::Counter::PendingHolds);
+	}
+	// Counted under the mutex, in the slot of the take that gets this range.
+	auto& in_flight =
+	    m_bda_sync_in_flight[m_bda_sync_generation.load(std::memory_order_relaxed) & 1];
+	in_flight.fetch_add(1, std::memory_order_relaxed);
+	BdaSyncHold hold(in_flight);
+	m_bda_sync.Add(begin, end - begin);
+	m_bda_sync_nonempty.store(true, std::memory_order_release);
+	return hold;
 }
 
 RangeSet MemoryTracker::TakeBdaSync() {
-	std::lock_guard lock(m_bda_sync_mutex);
-	return std::exchange(m_bda_sync, RangeSet {});
+	if (!m_bda_sync_nonempty.load(std::memory_order_acquire)) {
+		return {};
+	}
+	RangeSet taken;
+	uint64_t generation = 0;
+	{
+		std::lock_guard lock(m_bda_sync_mutex);
+		taken = std::exchange(m_bda_sync, RangeSet {});
+		m_bda_sync_nonempty.store(false, std::memory_order_relaxed);
+		generation = m_bda_sync_generation.fetch_add(1, std::memory_order_relaxed);
+	}
+	// The holds queued into the taken set counted themselves in this generation's slot under
+	// the mutex; they are short (a page-state change), so spin.
+	const uint64_t wait_t0 = FrameProfiler::Start();
+	for (uint32_t spins = 0;
+	     m_bda_sync_in_flight[generation & 1].load(std::memory_order_acquire) != 0; spins++) {
+		if (spins < 64) {
+#if defined(__x86_64__) || defined(_M_X64)
+			_mm_pause();
+#elif defined(_M_ARM64)
+			__yield();
+#elif defined(__aarch64__)
+			asm volatile("yield");
+#endif
+		} else {
+			std::this_thread::yield();
+		}
+	}
+	if (wait_t0 != 0) {
+		const uint64_t ticks = FrameProfiler::Ticks() - wait_t0;
+		FrameProfiler::Add(FrameProfiler::Counter::EpochUploadWaitTime, ticks);
+		FrameProfiler::Add(FrameProfiler::Counter::EpochUploadWaits);
+		FrameProfiler::Max(FrameProfiler::Counter::EpochUploadLongestWait, ticks);
+	}
+	return taken;
 }
 
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {

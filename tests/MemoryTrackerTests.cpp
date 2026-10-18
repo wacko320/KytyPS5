@@ -610,6 +610,50 @@ void TestRangeInvalidation() {
   Release(memory);
 }
 
+// InvalidateRegion's on_cpu_dirty runs before a region's pages turn CPU-dirty and writable,
+// and what it returns lives until they have. BufferCache notes the pages pending under a
+// lock there, so an acquire either runs before a CPU write can reach them or finds them
+// both pending and dirty.
+void TestInvalidationHoldsAcrossCpuDirty() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  tracker.ForEachUploadRange(
+      address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  Check(!tracker.IsRegionCpuModified(address, page_size * 2) && !IsWritable(memory),
+        "invalidation hook setup did not leave the pages clean and protected");
+
+  struct Hold {
+    MemoryTracker *tracker;
+    uint8_t *memory;
+    uint64_t size;
+    int *released;
+    ~Hold() {
+      Check(tracker->IsRegionCpuModified(reinterpret_cast<uint64_t>(memory), size) &&
+                IsWritable(memory),
+            "invalidation released its hook before the pages turned CPU-dirty");
+      (*released)++;
+    }
+  };
+  int calls = 0;
+  int released = 0;
+  tracker.InvalidateRegion(
+      address + 16, 32, [] { Check(false, "clean invalidation requested a GPU flush"); },
+      [&](uint64_t vaddr, uint64_t size) {
+        calls++;
+        Check(vaddr <= address + 16 && vaddr + size >= address + 48,
+              "invalidation hook did not cover the range");
+        Check(!tracker.IsRegionCpuModified(address, page_size) && !IsWritable(memory),
+              "invalidation hook ran after the pages turned writable");
+        return Hold{&tracker, memory, page_size, &released};
+      });
+  Check(calls == 1 && released == 1, "invalidation hook did not run once per region part");
+  tracker.UntrackMemory(address, page_size * 2);
+  Release(memory);
+}
+
 void TestGpuReacquisitionAfterInvalidation() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1674,6 +1718,7 @@ int main(int argc, char **argv) {
   TestBdaSyncConcurrentDrain();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
+  TestInvalidationHoldsAcrossCpuDirty();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();
   TestExactDirtyIntervalsSharingTrackerPage();
