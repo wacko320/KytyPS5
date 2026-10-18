@@ -26,6 +26,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/renderTargetMemo.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -762,7 +763,8 @@ private:
 
 RenderExecutor::RenderExecutor(RenderContext& context)
     : m_context(context), m_texture_resolves(std::make_unique<TextureResolveCache>()),
-      m_samplers(std::make_unique<SamplerFrontTable>()) {}
+      m_samplers(std::make_unique<SamplerFrontTable>()),
+      m_target_memo(std::make_unique<RenderTargetMemo>()) {}
 
 RenderExecutor::~RenderExecutor() = default;
 

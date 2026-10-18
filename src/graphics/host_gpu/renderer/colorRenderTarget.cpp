@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 
 #include "common/assert.h"
+#include "common/frameProfiler.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -12,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/renderTargetMemo.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -71,6 +73,20 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 
 		return;
 	}
+	auto& texture_cache = m_context.GetTextureCache();
+	auto& memo          = m_target_memo->color[rt_slot];
+	if (memo.valid && memo.mask == mask && memo.slice_offset == render_target_slice_offset &&
+	    memo.exact_format == exact_format && memo.regs.Matches(rt) &&
+	    texture_cache.ReuseImage(memo.info.image_id, memo.info.desc, memo.metadata_base_layer,
+	                             memo.stamp)) {
+		Common::FrameProfiler::Add(Common::FrameProfiler::Counter::RenderTargetReuses);
+		r = memo.info;
+		BindRenderTarget(r.image_id);
+		return;
+	}
+	memo.valid = false;
+	m_target_memo->full_resolves++;
+	Common::FrameProfiler::Add(Common::FrameProfiler::Counter::RenderTargetResolves);
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
 	if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {
 		EXIT("unsupported render-target sample configuration: samples=%u fragments=%u\n",
@@ -253,11 +269,20 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.view_info.base_layer  = view.base_layer;
 	desc.view_info.layer_count = view.layer_count;
 	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
-	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
-	r.export_mapping           = target_format.export_mapping;
+	const auto metadata_base_layer = desc.view_info.base_layer;
+	TextureCache::ResolveStamp stamp;
+	r.image_id       = texture_cache.FindImage(r.desc, exact_format, &stamp);
+	r.export_mapping = target_format.export_mapping;
+	memo.regs.Set(rt);
+	memo.mask                = mask;
+	memo.slice_offset        = render_target_slice_offset;
+	memo.exact_format        = exact_format;
+	memo.info                = r;
+	memo.metadata_base_layer = metadata_base_layer;
+	memo.stamp               = stamp;
+	memo.valid               = true;
 	BindRenderTarget(r.image_id);
 }
 

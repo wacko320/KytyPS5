@@ -335,6 +335,8 @@ enum class Kind : uint8_t { Sum, Max };
 	X(ColorClearGuestOwned, Count, Sum, "fast clear: no GPU route as the image is guest-owned")   \
 	X(ColorClearBufferFills, Count, Sum, "fast clear: GPU checks cleared into the guest buffer")   \
 	X(SurfaceMetaQueries, Count, Sum, "surface metadata: HTile clear-state queries and updates")   \
+	X(RenderTargetResolves, Count, Sum, "render targets: resolved from their registers")         \
+	X(RenderTargetReuses, Count, Sum, "render targets: previous resolve reused (same registers)")  \
 	R(ColorMetadataReadbacks, Count, Sum, "readback: other readbacks of DCC/CMask metadata")        \
 	R(ColorMetadataReadbackTime, Ticks, Sum, "readback: other readbacks of DCC/CMask metadata, time")
 

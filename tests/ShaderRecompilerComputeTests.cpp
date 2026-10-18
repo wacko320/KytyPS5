@@ -37,6 +37,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/host_gpu/renderer/renderTargetMemo.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include <vulkan/vulkan_format_traits.hpp>
@@ -543,6 +544,10 @@ struct RenderExecutorTestAccess {
 
   static uint64_t FullTextureResolves(const RenderExecutor &executor) {
     return executor.m_full_texture_resolves;
+  }
+
+  static uint64_t FullTargetResolves(const RenderExecutor &executor) {
+    return executor.m_target_memo->full_resolves;
   }
 
   static void DrawIndex(RenderExecutor &executor, CommandBuffer &command,
@@ -17026,6 +17031,125 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
                                                                allocation_size) == 0,
             "texture allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Unchanged colour and depth target registers reuse the previous resolve while the texture
+  // cache's resolve stamp holds; a register change or a deleted image takes a full resolve.
+  void CheckRenderTargetResolveMemo() {
+    constexpr const char *name = "RenderTargetResolveMemo";
+    constexpr uintptr_t base = 0x0000000204f00000ull;
+    constexpr uint64_t allocation_size = 0x40000;
+    constexpr uint64_t depth_address = base + 0x20000;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, 0x10000, 0, &direct_offset) == 0,
+            "target allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "target mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      registers.SetColorBase(0, {.addr = base});
+      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k16_16_16_16,
+                                 .channel_type = Prospero::ChannelType::kFloat,
+                                 .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = 0, .width = 0, .num_mip_levels = 0});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                    .dimension = 1,
+                                    .metadata_pipe_aligned = true});
+      registers.SetRenderTargetMask(0x0f);
+      HW::DepthRenderTarget depth_target{};
+      depth_target.z_info.format = Prospero::DepthFormat::kZ32F;
+      depth_target.z_read_base_addr = depth_address;
+      depth_target.z_write_base_addr = depth_address;
+      depth_target.size.valid = true;
+      registers.SetDepthRenderTarget(depth_target);
+      HW::DepthControl depth_control{};
+      depth_control.z_enable = true;
+      depth_control.z_write_enable = true;
+      registers.SetDepthControl(depth_control);
+      registers.SetRenderControl({});
+      scheduler.Begin(registers, user_config, shaders);
+      auto &cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      context.MapMemory(base, allocation_size);
+      const auto resolve_color = [&] {
+        RenderColorInfo color{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
+                                                           color, 0);
+        return color;
+      };
+      const auto resolve_depth = [&] {
+        RenderDepthInfo depth{};
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(),
+                                                           depth);
+        return depth;
+      };
+
+      const auto first = resolve_color();
+      const auto first_depth = resolve_depth();
+      const auto full = RenderExecutorTestAccess::FullTargetResolves(executor);
+      const auto repeated = resolve_color();
+      const auto repeated_depth = resolve_depth();
+      Require(name, "repeated resolve",
+              first.image_id && first_depth.image_id && repeated.image_id == first.image_id &&
+                  repeated.desc.view_info == first.desc.view_info &&
+                  repeated.desc.info.data == first.desc.info.data &&
+                  repeated_depth.image_id == first_depth.image_id &&
+                  repeated_depth.desc.view_info == first_depth.desc.view_info &&
+                  repeated_depth.depth_write_enable &&
+                  RenderExecutorTestAccess::FullTargetResolves(executor) == full,
+              "unchanged target registers did not reuse the previous resolve");
+
+      // A changed register resolves again.
+      registers.SetColorAttrib2(0, {.height = 1, .width = 1, .num_mip_levels = 0});
+      const auto resized = resolve_color();
+      Require(name, "changed registers",
+              RenderExecutorTestAccess::FullTargetResolves(executor) == full + 1 &&
+                  resized.desc.info.extent.width == 2,
+              "a changed colour target reused the previous resolve");
+      registers.SetColorAttrib2(0, {.height = 0, .width = 0, .num_mip_levels = 0});
+      const auto restored = resolve_color();
+      const auto restored_full = RenderExecutorTestAccess::FullTargetResolves(executor);
+      Require(name, "restored registers",
+              restored_full == full + 2 && restored.desc.info.extent.width == 1,
+              "restored colour registers did not resolve again");
+
+      // Deleting a resolved image moves the resolve epoch: the next resolve must not bind it.
+      TextureCacheTestAccess::DeleteImage(cache, restored.image_id);
+      TextureCacheTestAccess::DeleteImage(cache, first_depth.image_id);
+      const auto remapped = resolve_color();
+      const auto remapped_depth = resolve_depth();
+      Require(name, "deleted images",
+              RenderExecutorTestAccess::FullTargetResolves(executor) == restored_full + 2 &&
+                  !TextureCacheTestAccess::Contains(cache, restored.image_id) &&
+                  !TextureCacheTestAccess::Contains(cache, first_depth.image_id) &&
+                  TextureCacheTestAccess::Contains(cache, remapped.image_id) &&
+                  TextureCacheTestAccess::Contains(cache, remapped_depth.image_id),
+              "a target resolve returned an image the texture cache had deleted");
+
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "target mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "target allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -58001,6 +58125,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
     vulkan.CheckTextureResolveCache();
+    vulkan.CheckRenderTargetResolveMemo();
     vulkan.CheckTextureResolveTopology();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
@@ -58112,6 +58237,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
     vulkan.CheckTextureResolveCache();
+    vulkan.CheckRenderTargetResolveMemo();
     vulkan.CheckTextureResolveTopology();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
@@ -58391,6 +58517,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
     vulkan.CheckTextureResolveCache();
+    vulkan.CheckRenderTargetResolveMemo();
     vulkan.CheckTextureResolveTopology();
     vulkan.CheckRenderExecutorColorStandardTileDiscovery();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();

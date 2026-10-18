@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/frameProfiler.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -16,6 +17,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/renderTargetMemo.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -340,7 +342,20 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	     rc.depth_clear_enable || rc.stencil_clear_enable)) {
 		DepthFatal("unsupported depth-to-color copy state");
 	}
-	r.desc = MakeDepthTargetDesc(buffer, z);
+	auto& cache = m_context.GetTextureCache();
+	auto& memo  = m_target_memo->depth;
+	const bool reused =
+	    memo.valid && memo.regs.Matches(z) &&
+	    cache.ReuseImage(memo.image_id, memo.desc, memo.metadata_base_layer, memo.stamp);
+	if (reused) {
+		Common::FrameProfiler::Add(Common::FrameProfiler::Counter::RenderTargetReuses);
+		r.desc = memo.desc;
+	} else {
+		memo.valid = false;
+		m_target_memo->full_resolves++;
+		Common::FrameProfiler::Add(Common::FrameProfiler::Counter::RenderTargetResolves);
+		r.desc = MakeDepthTargetDesc(buffer, z);
+	}
 	r.depth_clear_enable      = rc.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();
 	r.depth_test_enable       = dc.z_enable;
@@ -377,8 +392,19 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 			r.stencil_back = r.stencil_front;
 		}
 	}
-	auto& cache = m_context.GetTextureCache();
-	r.image_id = cache.FindImage(r.desc);
+	if (reused) {
+		r.image_id = memo.image_id;
+	} else {
+		const auto                 metadata_base_layer = r.desc.view_info.base_layer;
+		TextureCache::ResolveStamp stamp;
+		r.image_id = cache.FindImage(r.desc, false, &stamp);
+		memo.regs.Set(z);
+		memo.desc                = r.desc;
+		memo.image_id            = r.image_id;
+		memo.metadata_base_layer = metadata_base_layer;
+		memo.stamp               = stamp;
+		memo.valid               = true;
+	}
 	BindRenderTarget(r.image_id);
 }
 

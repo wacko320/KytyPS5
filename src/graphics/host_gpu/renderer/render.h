@@ -36,6 +36,7 @@ struct DrawEmitInfo;
 struct DrawGpuArgsSource;
 struct DrawIndexBufferSource;
 struct DrawRenderState;
+struct RenderTargetMemo;
 class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
@@ -356,6 +357,7 @@ private:
 	std::unique_ptr<SamplerFrontTable>      m_samplers;
 	// Texture resolves the resolve cache could not answer; tests check that repeats hit.
 	uint64_t m_full_texture_resolves = 0;
+	std::unique_ptr<RenderTargetMemo> m_target_memo;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
