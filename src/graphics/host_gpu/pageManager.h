@@ -25,6 +25,12 @@ public:
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
 
+	// Whether the page holding vaddr is read-protected for tracking. Unlocked: a hint that can
+	// be stale by the time the caller acts on it.
+	[[nodiscard]] bool IsReadWatched(uint64_t vaddr) const noexcept;
+	// Whether a write to the page holding vaddr would fault for tracking. Unlocked hint.
+	[[nodiscard]] bool IsWriteWatched(uint64_t vaddr) const noexcept;
+
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;

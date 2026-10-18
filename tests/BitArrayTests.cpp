@@ -149,6 +149,19 @@ void TestRandomizedDifferential() {
     Check(bits.Any() == any && bits.None() == !any,
           "randomized Any/None diverged");
 
+    const auto query_start = static_cast<size_t>(next_random() % 129);
+    const auto query_end =
+        query_start + static_cast<size_t>(next_random() % (129 - query_start));
+    bool range_any = false;
+    bool range_all = true;
+    for (auto index = query_start; index < query_end; index++) {
+      range_any |= reference[index];
+      range_all &= reference[index];
+    }
+    Check(bits.AnyInRange(query_start, query_end) == range_any &&
+              bits.AllInRange(query_start, query_end) == range_all,
+          "randomized AnyInRange/AllInRange diverged");
+
     const auto range_start = static_cast<size_t>(next_random() % 129);
     auto expected_first_begin = range_start;
     while (expected_first_begin < reference.size() &&
@@ -277,6 +290,21 @@ void TestTrackerSizedRandomizedDifferential() {
       Check(bits.Get(index) == reference[index],
             "tracker-sized randomized bit state diverged");
     }
+
+    const auto query_start =
+        static_cast<size_t>(next_random() % (reference.size() + 1));
+    const auto query_end =
+        query_start + static_cast<size_t>(next_random() %
+                                          (reference.size() + 1 - query_start));
+    bool range_any = false;
+    bool range_all = true;
+    for (auto index = query_start; index < query_end; index++) {
+      range_any |= reference[index];
+      range_all &= reference[index];
+    }
+    Check(bits.AnyInRange(query_start, query_end) == range_any &&
+              bits.AllInRange(query_start, query_end) == range_all,
+          "tracker-sized AnyInRange/AllInRange diverged");
 
     size_t expected = 0;
     for (const auto [begin, end] : bits) {

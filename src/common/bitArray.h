@@ -155,6 +155,15 @@ public:
 
 	[[nodiscard]] constexpr bool Any() const { return !None(); }
 
+	// Range queries without materializing a masked copy. An empty range has no set bit and
+	// counts as all set.
+	[[nodiscard]] constexpr bool AnyInRange(size_t start, size_t end) const {
+		return !TestRange<false>(start, end);
+	}
+	[[nodiscard]] constexpr bool AllInRange(size_t start, size_t end) const {
+		return TestRange<true>(start, end);
+	}
+
 	[[nodiscard]] constexpr Range FirstRangeFrom(size_t start) const {
 		if (start >= N) {
 			return {N, N};
@@ -252,6 +261,38 @@ public:
 	}
 
 private:
+	// Whether every bit of [start, end) equals value.
+	template <bool value>
+	[[nodiscard]] constexpr bool TestRange(size_t start, size_t end) const {
+		if (start >= end || end > N) {
+			return true;
+		}
+
+		const auto first_word = start / BITS_PER_WORD;
+		const auto last_word  = (end - 1) / BITS_PER_WORD;
+		const auto start_bit  = start % BITS_PER_WORD;
+		const auto end_bit    = (end - 1) % BITS_PER_WORD;
+		const auto start_mask = ~uint64_t {0} << start_bit;
+		const auto end_mask =
+		    end_bit == BITS_PER_WORD - 1 ? ~uint64_t {0} : (uint64_t {1} << (end_bit + 1)) - 1;
+		const auto test = [](uint64_t word, uint64_t mask) {
+			return ((value ? ~word : word) & mask) == 0;
+		};
+
+		if (first_word == last_word) {
+			return test(m_data[first_word], start_mask & end_mask);
+		}
+		if (!test(m_data[first_word], start_mask) || !test(m_data[last_word], end_mask)) {
+			return false;
+		}
+		for (auto word = first_word + 1; word < last_word; word++) {
+			if (!test(m_data[word], ~uint64_t {0})) {
+				return false;
+			}
+		}
+		return true;
+	}
+
 	std::array<uint64_t, WORD_COUNT> m_data {};
 };
 

@@ -668,6 +668,15 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
+		// A read of bytes the GPU has not written, on a page protected because it wrote others:
+		// complete the load from the backing store and leave the page protected. Otherwise the
+		// fault waits for the GPU thread, which downloads the page and drains the GPU.
+		if (access == GpuAccess::Read &&
+		    Loader::X64InstructionEmulator::TryEmulateLoad(
+		        info->native_context, info->access_violation_vaddr,
+		        &Libs::LibKernel::Memory::TryReadCleanFaultingBytes)) {
+			return true;
+		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;

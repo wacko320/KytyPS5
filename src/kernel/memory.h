@@ -150,6 +150,9 @@ void WriteBacking(uint64_t vaddr, const void* data, uint64_t size,
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+// Any thread, for a read that faulted at fault_vaddr on a page protected because the GPU wrote to
+// it: reads [vaddr, vaddr + size) from the backing store when none of those bytes is GPU-written.
+bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size);
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

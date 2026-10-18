@@ -91,6 +91,28 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	return true;
 }
 
+bool RenderContext::CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
+                                      uint64_t size) noexcept {
+	return IsMapped(vaddr, size) && m_page_manager.IsReadWatched(fault_vaddr) &&
+	       m_buffer_cache.IsCleanForConcurrentRead(vaddr, size) &&
+	       !m_texture_cache.IsRegionGpuModified(vaddr, size);
+}
+
+void RenderContext::PrepareGpuThreadWrite(uint64_t vaddr, uint64_t size) {
+	constexpr uint64_t PageSize = 4096;
+	for (auto page = vaddr & ~(PageSize - 1); page < vaddr + size; page += PageSize) {
+		if (m_page_manager.IsWriteWatched(page)) {
+			(void)InvalidateMemory(vaddr, size);
+			return;
+		}
+	}
+}
+
+bool RenderContext::TryWriteGpuOrdered(uint64_t vaddr, const void* data, uint64_t size) {
+	return IsMapped(vaddr, size) && !m_texture_cache.IsRegionGpuModified(vaddr, size) &&
+	       m_buffer_cache.TryWriteGpuOrdered(vaddr, data, size);
+}
+
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
@@ -121,12 +143,12 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
-		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
-		// access a range with no cached data, so they must finish before it is unmapped.
-		if (m_command_scheduler.Active() &&
-		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
-		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
-		     m_command_scheduler.HasPendingPriorityOperations())) {
+		// Check cache ownership on the GPU thread. Another lane's work, or a deferred write to
+		// guest memory (registered by the buffer and texture download publishes), may still use
+		// the range. The drain (a full GPU idle) is skipped for ranges no buffer, image, download
+		// or pending guest write involves: games unmap dozens of such pages a frame.
+		if (m_command_scheduler.Active() && (m_buffer_cache.MayBeInUseByGpu(vaddr, size) ||
+		                                     m_texture_cache.IsRegionRegistered(vaddr, size))) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			Common::FrameProfiler::Add(Common::FrameProfiler::Counter::UnmapDrains);
 			m_command_scheduler.Finish(Common::FrameProfiler::WaitSite::UnmapDrain);

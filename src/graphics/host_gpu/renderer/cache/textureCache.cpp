@@ -1821,10 +1821,13 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
+	// An unmap of the range waits for the publish (RenderContext::UnmapMemory).
+	m_buffer_cache.NotePendingGuestWrite(range.address, range.size);
+	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
 		// The guest may have unmapped part of the range since the download was recorded.
 		(void)LibKernel::Memory::WriteMappedBacking(range.address, mapped, range.size);
+		m_buffer_cache.DonePendingGuestWrite(range.address, range.size);
 	});
 	return true;
 }
@@ -1904,6 +1907,21 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	}
 	found->second.clear_mask.set(slice, is_clear);
 	return true;
+}
+
+bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto& image = m_slot_images[id];
+		// A cached image keeps its GPU-modified flag after the CPU reuses its memory.
+		if (!image.depth_id && image.IsGpuModified() && !image.IsDefinitelyCpuDirty()) {
+			return true;
+		}
+	}
+	return false;
 }
 
 bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {

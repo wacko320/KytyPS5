@@ -53,7 +53,17 @@ public:
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	// Any thread: a read of these bytes faulted on a page protected because the GPU wrote to it,
+	// but none of them is GPU-written, so guest memory already holds their value.
+	[[nodiscard]] bool CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
+	                                     uint64_t size) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// GPU thread: see BufferCache::TryWriteGpuOrdered. False when the caller must write guest
+	// memory itself (after PrepareGpuThreadWrite).
+	bool TryWriteGpuOrdered(uint64_t vaddr, const void* data, uint64_t size);
+	// Before the GPU thread stores to guest memory directly: invalidates the range if a write
+	// would fault, so it does not take a fault per page.
+	void PrepareGpuThreadWrite(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	// Calls func(begin, end) for each mapped sub-range of [vaddr, vaddr + size).
 	template <typename Func>

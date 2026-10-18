@@ -115,10 +115,15 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
-// Ordinary (unchecked) SRT reads are plain loads through the guest pointer. An unmapped address
-// (Wolverine reads through a null pointer) reads as zeros, as BDA loads of missing pages do,
-// instead of crashing the emulator.
-bool ReadOrdinaryGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+// Ordinary (unchecked) SRT reads try the checked reader first: on the GPU thread it reads back only
+// the GPU-dirty bytes it overlaps, where a plain load through the guest pointer faults on a page
+// protected for a GPU write and reads back the whole page. Otherwise they are plain loads. An
+// unmapped address (Wolverine reads through a null pointer) reads as zeros, as BDA loads of missing
+// pages do, instead of crashing the emulator.
+bool ReadOrdinaryGuestMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	if (ReadShaderGuestMemory(userdata, address, values)) {
+		return true;
+	}
 	uint64_t mapped = 0;
 	while (mapped < values.size_bytes()) {
 		const auto bytes = Libs::LibKernel::Memory::MappingBytesFrom(address + mapped);

@@ -2,11 +2,13 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
+#include "common/frameProfiler.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <atomic>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 #if defined(_MSC_VER)
@@ -36,15 +38,8 @@ class TrackingSpinLock final {
 public:
 	void lock() noexcept {
 		const auto thread = CurrentThread();
-		while (m_lock.test_and_set(std::memory_order_acquire)) {
-			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
-#if defined(__x86_64__) || defined(_M_X64)
-			_mm_pause();
-#elif defined(_M_ARM64)
-			__yield();
-#elif defined(__aarch64__)
-			asm volatile("yield");
-#endif
+		if (m_lock.test_and_set(std::memory_order_acquire)) {
+			WaitContended(thread);
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
@@ -55,6 +50,34 @@ public:
 	}
 
 private:
+	void WaitContended(uint32_t thread) noexcept {
+		const uint64_t t0    = Common::FrameProfiler::Start();
+		uint32_t       spins = 0;
+		do {
+			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
+			// The holder may be in a protection syscall: after a short spin, give up the core
+			// instead of starving it.
+			if (spins++ < 64) {
+#if defined(__x86_64__) || defined(_M_X64)
+				_mm_pause();
+#elif defined(_M_ARM64)
+				__yield();
+#elif defined(__aarch64__)
+				asm volatile("yield");
+#endif
+			} else {
+				std::this_thread::yield();
+			}
+		} while (m_lock.test_and_set(std::memory_order_acquire));
+		if (t0 != 0) {
+			Common::FrameProfiler::AddSince(
+			    Common::FrameProfiler::CurrentRole() == Common::FrameProfiler::Role::Gpu
+			        ? Common::FrameProfiler::Counter::RegionLockWaitGpuTime
+			        : Common::FrameProfiler::Counter::RegionLockWaitGuestTime,
+			    t0);
+		}
+	}
+
 	static uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		return GetCurrentThreadId();
@@ -77,10 +100,23 @@ private:
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
 
+// Counts the transitions that can make a finished synchronization incomplete. While both still
+// hold the values read before a range was synchronized, synchronizing it again changes nothing:
+// no page of it became CPU-dirty, and none of its GPU-dirty pages was handed back.
+struct TrackerEpochs {
+	std::atomic<uint64_t> cpu_dirtied {0};
+	std::atomic<uint64_t> gpu_cleaned {0};
+	// One bit per region, set while the region may hold CPU-dirty pages (MayHaveCpuDirty), so
+	// syncs of large ranges find those regions a word at a time.
+	std::atomic<uint64_t>* cpu_any_words = nullptr;
+};
+
+static_assert(std::atomic<uint64_t>::is_always_lock_free);
+
 class RegionManager final {
 public:
-	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
-	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr) {
+	RegionManager(PageManager& page_manager, uint64_t cpu_addr, TrackerEpochs* epochs = nullptr)
+	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr), m_epochs(epochs) {
 		if (m_cpu_addr % TRACKER_REGION_SIZE != 0) {
 			EXIT("invalid region tracking manager construction\n");
 		}
@@ -89,38 +125,65 @@ public:
 		m_readable.Fill();
 	}
 
+	// Readable without the lock: false once no page of the region is CPU-dirty, so syncs of
+	// large clean ranges skip the region. A write racing the check lands after the sync.
+	[[nodiscard]] bool MayHaveCpuDirty() const noexcept {
+		return m_cpu_any.load(std::memory_order_acquire);
+	}
+	// Readable without the lock, like MayHaveCpuDirty. Only the GPU thread makes pages
+	// GPU-dirty, so on that thread a false answer holds until it marks some itself.
+	[[nodiscard]] bool MayHaveGpuDirty() const noexcept {
+		return m_gpu_any.load(std::memory_order_acquire);
+	}
+	// Readable without the lock: every page is GPU-dirty, so a written sync of the whole region
+	// has nothing to upload or mark. A racing hand-back of a page orders after that sync.
+	[[nodiscard]] bool IsGpuModifiedThroughout() const noexcept {
+		return m_gpu_full.load(std::memory_order_acquire);
+	}
+	// Requires the lock.
+	[[nodiscard]] bool IsGpuModifiedThroughout(uint64_t offset, uint64_t size) const {
+		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		return m_gpu_dirty.AllInRange(start, end);
+	}
+
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
-		return GetBits<source>().FirstRangeFrom(start).first < end;
+		return GetBits<source>().AnyInRange(start, end);
 	}
 
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		if constexpr (source == DirtySource::Cpu && enable) {
-			if (RegionBits(m_gpu_dirty, start, end).Any()) {
+			if (m_gpu_dirty.AnyInRange(start, end)) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
 			}
 		}
 		if constexpr (source == DirtySource::Gpu && enable) {
-			if (RegionBits(m_cpu_dirty, start, end).Any()) {
+			if (m_cpu_dirty.AnyInRange(start, end)) {
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
 		}
-		auto& bits = GetBits<source>();
+		auto&      bits    = GetBits<source>();
+		const bool changes = enable ? !bits.AllInRange(start, end) : bits.AnyInRange(start, end);
 		if constexpr (enable) {
 			bits.SetRange(start, end);
 		} else {
 			bits.UnsetRange(start, end);
 		}
 		if constexpr (source == DirtySource::Cpu) {
+			UpdateCpuSummary();
 			UpdateProtection<!enable, false>();
 		} else {
+			UpdateGpuSummary();
 			UpdateProtection<enable, true>();
+		}
+		if (changes) {
+			NoteTransition<source, enable>();
 		}
 	}
 
@@ -135,9 +198,14 @@ public:
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
+				UpdateCpuSummary();
 				UpdateProtection<true, false>();
 			} else {
+				UpdateGpuSummary();
 				UpdateProtection<false, true>();
+			}
+			if (mask.Any()) {
+				NoteTransition<source, false>();
 			}
 		}
 		for (const auto [first, last]: mask) {
@@ -148,6 +216,39 @@ public:
 	TrackingSpinLock lock;
 
 private:
+	void UpdateCpuSummary() noexcept {
+		const bool any = m_cpu_dirty.Any();
+		if (m_cpu_any.exchange(any, std::memory_order_acq_rel) == any || m_epochs == nullptr ||
+		    m_epochs->cpu_any_words == nullptr) {
+			return;
+		}
+		const auto index = m_cpu_addr / TRACKER_REGION_SIZE;
+		auto&      word  = m_epochs->cpu_any_words[index / 64u];
+		const auto bit   = uint64_t {1} << (index % 64u);
+		if (any) {
+			word.fetch_or(bit, std::memory_order_release);
+		} else {
+			word.fetch_and(~bit, std::memory_order_release);
+		}
+	}
+	void UpdateGpuSummary() noexcept {
+		m_gpu_any.store(m_gpu_dirty.Any(), std::memory_order_release);
+		m_gpu_full.store(m_gpu_dirty.AllInRange(0, TRACKER_REGION_PAGES), std::memory_order_release);
+	}
+
+	// After the bits changed, so a synchronization that reads the new count sees them.
+	template <DirtySource source, bool enable>
+	void NoteTransition() noexcept {
+		if (m_epochs == nullptr) {
+			return;
+		}
+		if constexpr (source == DirtySource::Cpu && enable) {
+			m_epochs->cpu_dirtied.fetch_add(1, std::memory_order_acq_rel);
+		} else if constexpr (source == DirtySource::Gpu && !enable) {
+			m_epochs->gpu_cleaned.fetch_add(1, std::memory_order_acq_rel);
+		}
+	}
+
 	template <bool track, bool is_read>
 	void UpdateProtection() {
 		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
@@ -188,12 +289,16 @@ private:
 		        static_cast<size_t>((offset + size + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE)};
 	}
 
-	PageManager& m_page_manager;
-	uint64_t     m_cpu_addr = 0;
-	RegionBits   m_cpu_dirty;
-	RegionBits   m_gpu_dirty;
-	RegionBits   m_writable;
-	RegionBits   m_readable;
+	PageManager&      m_page_manager;
+	uint64_t          m_cpu_addr = 0;
+	TrackerEpochs*    m_epochs   = nullptr;
+	RegionBits        m_cpu_dirty;
+	RegionBits        m_gpu_dirty;
+	std::atomic<bool> m_cpu_any {true};
+	std::atomic<bool> m_gpu_any {false};
+	std::atomic<bool> m_gpu_full {false};
+	RegionBits        m_writable;
+	RegionBits        m_readable;
 };
 
 } // namespace Libs::Graphics

@@ -962,6 +962,12 @@ bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noex
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
 }
 
+bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size) {
+	return g_gpu_resources != nullptr &&
+	       g_gpu_resources->CanServeCleanRead(fault_vaddr, vaddr, size) &&
+	       TryReadBacking(vaddr, data, size);
+}
+
 struct PrtAperture {
 	uint64_t address = 0;
 	uint64_t size    = 0;

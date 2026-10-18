@@ -472,6 +472,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (bindings.uses_bindless) {
 		m_context.GetBindlessHeap().Finish();
 	}
+	m_context.GetBufferCache().CommitWrittenRanges();
 	ResetBindings();
 }
 
@@ -594,6 +595,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (bindings.uses_bindless) {
 		m_context.GetBindlessHeap().Finish();
 	}
+	m_context.GetBufferCache().CommitWrittenRanges();
 	ResetBindings();
 }
 

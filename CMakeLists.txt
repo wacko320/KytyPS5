@@ -449,6 +449,14 @@ add_executable(trophy_system_tests EXCLUDE_FROM_ALL
 target_link_libraries(trophy_system_tests common)
 target_include_directories(trophy_system_tests PRIVATE ${inc_headers})
 
+# Guest loads from protected pages, completed by the instruction emulator.
+add_executable(x64_load_emulation_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/X64LoadEmulationTests.cpp"
+	"${KYTY_SOURCE_DIR}/loader/x64InstructionEmulator.cpp"
+)
+target_link_libraries(x64_load_emulation_tests common Zydis::Zydis)
+target_include_directories(x64_load_emulation_tests PRIVATE ${inc_headers})
+
 add_executable(avplayer_file_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AvPlayerFileTests.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
@@ -488,6 +496,15 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(memory_tracker_tests fmt::fmt common)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
+
+# Not a test: prints per-bind tracker costs.
+add_executable(memory_tracker_benchmark EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/MemoryTrackerBenchmark.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/pageManager.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/memoryTracker.cpp"
+)
+target_link_libraries(memory_tracker_benchmark fmt::fmt common)
+target_include_directories(memory_tracker_benchmark PRIVATE ${inc_headers})
 
 add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderVertexMetadataTests.cpp"
@@ -664,6 +681,7 @@ if(BUILD_TESTING)
 	add_test(NAME frame_profiler COMMAND $<TARGET_FILE:frame_profiler_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
+	add_test(NAME x64_load_emulation COMMAND $<TARGET_FILE:x64_load_emulation_tests>)
 	add_test(NAME trophy_system COMMAND $<TARGET_FILE:trophy_system_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
@@ -710,6 +728,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
 	add_test(NAME command_scheduler_timeline
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
+	add_test(NAME buffer_writeback
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --writeback-only)
 	add_test(NAME stream_buffer_ring
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
 	add_test(NAME gpu_command_lane
@@ -757,6 +777,7 @@ if(BUILD_TESTING)
 		frame_profiler_tests
 		avplayer_file_tests
 		vdecsw_tests
+		x64_load_emulation_tests
 		bit_array_tests
 		lru_cache_tests
 		shader_vertex_metadata_tests

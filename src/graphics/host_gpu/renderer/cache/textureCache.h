@@ -77,6 +77,9 @@ public:
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
+	// Any thread: whether a GPU-modified colour image the CPU has not overwritten covers part of
+	// the range.
+	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 	// Bytes of the registered images, now and at most since start (any thread, relaxed).
 	[[nodiscard]] uint64_t ImageBytes() const noexcept {
 		return m_image_bytes.load(std::memory_order_relaxed);

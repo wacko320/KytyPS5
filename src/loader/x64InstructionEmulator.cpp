@@ -822,4 +822,345 @@ bool TryEmulate(void* native_context) {
 	       TryEmulateCpuExtensions(context);
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+
+namespace {
+
+ZydisDecoder& LoadDecoder() {
+	static ZydisDecoder decoder = [] {
+		ZydisDecoder result {};
+		ZydisDecoderInit(&result, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+		return result;
+	}();
+	return decoder;
+}
+
+uint64_t WidthMask(uint32_t bits) {
+	return bits >= 64 ? ~uint64_t {0} : (uint64_t {1} << bits) - 1u;
+}
+
+// The saved slot of a general-purpose register, and the register's bit position in it.
+greg_t* GprSlot(ucontext_t* context, ZydisRegister reg, uint32_t& shift) {
+	auto& gregs = context->uc_mcontext.gregs;
+	shift       = 0;
+	switch (reg) {
+		case ZYDIS_REGISTER_AH: shift = 8; return &gregs[REG_RAX];
+		case ZYDIS_REGISTER_CH: shift = 8; return &gregs[REG_RCX];
+		case ZYDIS_REGISTER_DH: shift = 8; return &gregs[REG_RDX];
+		case ZYDIS_REGISTER_BH: shift = 8; return &gregs[REG_RBX];
+		default: break;
+	}
+	switch (ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg)) {
+		case ZYDIS_REGISTER_RAX: return &gregs[REG_RAX];
+		case ZYDIS_REGISTER_RCX: return &gregs[REG_RCX];
+		case ZYDIS_REGISTER_RDX: return &gregs[REG_RDX];
+		case ZYDIS_REGISTER_RBX: return &gregs[REG_RBX];
+		case ZYDIS_REGISTER_RSP: return &gregs[REG_RSP];
+		case ZYDIS_REGISTER_RBP: return &gregs[REG_RBP];
+		case ZYDIS_REGISTER_RSI: return &gregs[REG_RSI];
+		case ZYDIS_REGISTER_RDI: return &gregs[REG_RDI];
+		case ZYDIS_REGISTER_R8: return &gregs[REG_R8];
+		case ZYDIS_REGISTER_R9: return &gregs[REG_R9];
+		case ZYDIS_REGISTER_R10: return &gregs[REG_R10];
+		case ZYDIS_REGISTER_R11: return &gregs[REG_R11];
+		case ZYDIS_REGISTER_R12: return &gregs[REG_R12];
+		case ZYDIS_REGISTER_R13: return &gregs[REG_R13];
+		case ZYDIS_REGISTER_R14: return &gregs[REG_R14];
+		case ZYDIS_REGISTER_R15: return &gregs[REG_R15];
+		default: return nullptr;
+	}
+}
+
+bool ReadGpr(ucontext_t* context, ZydisRegister reg, uint32_t bits, uint64_t& value) {
+	uint32_t    shift = 0;
+	const auto* slot  = GprSlot(context, reg, shift);
+	if (slot == nullptr) {
+		return false;
+	}
+	value = (static_cast<uint64_t>(*slot) >> shift) & WidthMask(bits);
+	return true;
+}
+
+// The architectural merge rules: 8- and 16-bit destinations keep the rest of the register,
+// 32-bit ones clear its upper half.
+void WriteGpr(greg_t* slot, uint32_t shift, uint32_t bits, uint64_t value) {
+	if (bits >= 32) {
+		*slot = static_cast<greg_t>(value & WidthMask(bits));
+		return;
+	}
+	const auto mask = WidthMask(bits) << shift;
+	*slot = static_cast<greg_t>((static_cast<uint64_t>(*slot) & ~mask) | ((value << shift) & mask));
+}
+
+bool EffectiveAddress(ucontext_t* context, const ZydisDecodedInstruction& instruction,
+                      const ZydisDecodedOperand& operand, uint64_t& address) {
+	const auto& mem = operand.mem;
+	if (mem.type != ZYDIS_MEMOP_TYPE_MEM || instruction.address_width != 64 ||
+	    mem.segment == ZYDIS_REGISTER_FS || mem.segment == ZYDIS_REGISTER_GS) {
+		return false;
+	}
+	auto result = static_cast<uint64_t>(mem.disp.value);
+	if (mem.base == ZYDIS_REGISTER_RIP) {
+		result += static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RIP]) + instruction.length;
+	} else if (mem.base != ZYDIS_REGISTER_NONE) {
+		uint64_t base = 0;
+		if (!ReadGpr(context, mem.base, 64, base)) {
+			return false;
+		}
+		result += base;
+	}
+	if (mem.index != ZYDIS_REGISTER_NONE) {
+		uint64_t index = 0;
+		if (!ReadGpr(context, mem.index, 64, index)) {
+			return false;
+		}
+		result += index * mem.scale;
+	}
+	address = result;
+	return true;
+}
+
+void SetResultFlags(ucontext_t* context, uint64_t result, uint32_t bits, bool carry, bool adjust,
+                    bool overflow) {
+	constexpr uint64_t Cf = 1u << 0u;
+	constexpr uint64_t Pf = 1u << 2u;
+	constexpr uint64_t Af = 1u << 4u;
+	constexpr uint64_t Zf = 1u << 6u;
+	constexpr uint64_t Sf = 1u << 7u;
+	constexpr uint64_t Of = 1u << 11u;
+	result &= WidthMask(bits);
+	auto flags = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_EFL]) &
+	             ~(Cf | Pf | Af | Zf | Sf | Of);
+	flags |= carry ? Cf : 0;
+	flags |= std::popcount(static_cast<uint32_t>(result & 0xffu)) % 2 == 0 ? Pf : 0;
+	flags |= adjust ? Af : 0;
+	flags |= result == 0 ? Zf : 0;
+	flags |= ((result >> (bits - 1u)) & 1u) != 0 ? Sf : 0;
+	flags |= overflow ? Of : 0;
+	context->uc_mcontext.gregs[REG_EFL] = static_cast<greg_t>(flags);
+}
+
+// The saved upper halves of YMM0-15 in the signal frame's XSAVE area, and whether the AVX state
+// is in its initial (zero) state, which the kernel restores as zeroes. Null without XSAVE data.
+uint8_t* UpperYmm(ucontext_t* context, bool& in_init_state) {
+	auto* state   = reinterpret_cast<uint8_t*>(context->uc_mcontext.fpregs);
+	in_init_state = false;
+	if (state == nullptr) {
+		return nullptr;
+	}
+	uint32_t magic = 0;
+	uint32_t size  = 0;
+	std::memcpy(&magic, state + 464, sizeof(magic));
+	std::memcpy(&size, state + 480, sizeof(size));
+	if (magic != 0x46505853 || size < 832) {
+		return nullptr;
+	}
+	uint64_t features = 0;
+	std::memcpy(&features, state + 512, sizeof(features));
+	in_init_state = (features & 4) == 0;
+	return state + 576;
+}
+
+// Whether the frame's XSAVE header marks the SSE state (XMM registers, MXCSR) in its initial
+// state: its saved values are then stale, and writing one register cannot be expressed.
+bool SseInInitState(ucontext_t* context) {
+	auto*    state = reinterpret_cast<uint8_t*>(context->uc_mcontext.fpregs);
+	uint32_t magic = 0;
+	std::memcpy(&magic, state + 464, sizeof(magic));
+	if (magic != 0x46505853) {
+		return false;
+	}
+	uint64_t features = 0;
+	std::memcpy(&features, state + 512, sizeof(features));
+	return (features & 2) == 0;
+}
+
+// Sets XSTATE_BV bits in the frame's XSAVE header, when it has one: a component whose bit is
+// clear is restored in its initial state, ignoring the values written into the frame.
+void MarkXStateUsed(ucontext_t* context, uint64_t components) {
+	auto*    state = reinterpret_cast<uint8_t*>(context->uc_mcontext.fpregs);
+	uint32_t magic = 0;
+	std::memcpy(&magic, state + 464, sizeof(magic));
+	if (magic != 0x46505853) {
+		return;
+	}
+	uint64_t features = 0;
+	std::memcpy(&features, state + 512, sizeof(features));
+	features |= components;
+	std::memcpy(state + 512, &features, sizeof(features));
+}
+
+bool IsVectorLoad(ZydisMnemonic mnemonic) {
+	switch (mnemonic) {
+		case ZYDIS_MNEMONIC_MOVUPS:
+		case ZYDIS_MNEMONIC_MOVAPS:
+		case ZYDIS_MNEMONIC_MOVUPD:
+		case ZYDIS_MNEMONIC_MOVAPD:
+		case ZYDIS_MNEMONIC_MOVDQU:
+		case ZYDIS_MNEMONIC_MOVDQA:
+		case ZYDIS_MNEMONIC_LDDQU:
+		case ZYDIS_MNEMONIC_MOVSS:
+		case ZYDIS_MNEMONIC_MOVSD:
+		case ZYDIS_MNEMONIC_MOVQ:
+		case ZYDIS_MNEMONIC_MOVD:
+		case ZYDIS_MNEMONIC_VMOVUPS:
+		case ZYDIS_MNEMONIC_VMOVAPS:
+		case ZYDIS_MNEMONIC_VMOVUPD:
+		case ZYDIS_MNEMONIC_VMOVAPD:
+		case ZYDIS_MNEMONIC_VMOVDQU:
+		case ZYDIS_MNEMONIC_VMOVDQA:
+		case ZYDIS_MNEMONIC_VLDDQU:
+		case ZYDIS_MNEMONIC_VMOVSS:
+		case ZYDIS_MNEMONIC_VMOVSD:
+		case ZYDIS_MNEMONIC_VMOVQ:
+		case ZYDIS_MNEMONIC_VMOVD: return true;
+		default: return false;
+	}
+}
+
+} // namespace
+
+bool TryEmulateLoad(void* native_context, uint64_t fault_vaddr, LoadReader read) {
+	auto* context = static_cast<ucontext_t*>(native_context);
+	if (context == nullptr || read == nullptr) {
+		return false;
+	}
+	const auto rip = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RIP]);
+	ZydisDecodedInstruction instruction {};
+	ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
+	if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&LoadDecoder(), reinterpret_cast<const void*>(rip),
+	                                         ZYDIS_MAX_INSTRUCTION_LENGTH, &instruction, operands)) ||
+	    (instruction.encoding != ZYDIS_INSTRUCTION_ENCODING_LEGACY &&
+	     instruction.encoding != ZYDIS_INSTRUCTION_ENCODING_VEX) ||
+	    (instruction.attributes & ZYDIS_ATTRIB_HAS_LOCK) != 0 ||
+	    instruction.operand_count_visible != 2) {
+		return false;
+	}
+	const auto mem_index = operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY   ? 0
+	                       : operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY ? 1
+	                                                                       : -1;
+	if (mem_index < 0) {
+		return false;
+	}
+	const auto& mem     = operands[mem_index];
+	const auto& other   = operands[1 - mem_index];
+	uint64_t    address = 0;
+	const auto  bytes   = static_cast<uint64_t>(mem.size) / 8u;
+	if (!EffectiveAddress(context, instruction, mem, address) || bytes == 0 || bytes > 32 ||
+	    fault_vaddr < address || fault_vaddr - address >= bytes) {
+		return false;
+	}
+	alignas(32) uint8_t data[32] {};
+
+	switch (instruction.mnemonic) {
+		case ZYDIS_MNEMONIC_MOV:
+		case ZYDIS_MNEMONIC_MOVZX:
+		case ZYDIS_MNEMONIC_MOVSX:
+		case ZYDIS_MNEMONIC_MOVSXD: {
+			uint32_t shift = 0;
+			auto*    slot  = mem_index == 1 && other.type == ZYDIS_OPERAND_TYPE_REGISTER
+			                     ? GprSlot(context, other.reg.value, shift)
+			                     : nullptr;
+			if (slot == nullptr || bytes > 8 || !read(fault_vaddr, address, data, bytes)) {
+				return false;
+			}
+			uint64_t value = 0;
+			std::memcpy(&value, data, bytes);
+			if (instruction.mnemonic == ZYDIS_MNEMONIC_MOVSX ||
+			    instruction.mnemonic == ZYDIS_MNEMONIC_MOVSXD) {
+				const auto sign = uint64_t {1} << (mem.size - 1u);
+				value           = (value ^ sign) - sign;
+			}
+			WriteGpr(slot, shift, other.size, value);
+			break;
+		}
+		case ZYDIS_MNEMONIC_CMP:
+		case ZYDIS_MNEMONIC_TEST: {
+			const uint32_t bits  = mem.size;
+			uint64_t       value = 0;
+			if (bits != 8 && bits != 16 && bits != 32 && bits != 64) {
+				return false;
+			}
+			if (other.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+				if (!ReadGpr(context, other.reg.value, bits, value)) {
+					return false;
+				}
+			} else if (other.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+				// Sign-extended by the decoder where the encoding sign-extends.
+				value = other.imm.value.u & WidthMask(bits);
+			} else {
+				return false;
+			}
+			if (!read(fault_vaddr, address, data, bytes)) {
+				return false;
+			}
+			uint64_t loaded = 0;
+			std::memcpy(&loaded, data, bytes);
+			const auto a = mem_index == 0 ? loaded : value;
+			const auto b = mem_index == 0 ? value : loaded;
+			if (instruction.mnemonic == ZYDIS_MNEMONIC_CMP) {
+				const auto result = (a - b) & WidthMask(bits);
+				SetResultFlags(context, result, bits, a < b, ((a ^ b ^ result) & 0x10u) != 0,
+				               (((a ^ b) & (a ^ result)) >> (bits - 1u) & 1u) != 0);
+			} else {
+				SetResultFlags(context, a & b, bits, false, false, false);
+			}
+			break;
+		}
+		default: {
+			if (!IsVectorLoad(instruction.mnemonic) || mem_index != 1 ||
+			    other.type != ZYDIS_OPERAND_TYPE_REGISTER ||
+			    context->uc_mcontext.fpregs == nullptr || SseInInitState(context)) {
+				return false;
+			}
+			const auto reg = other.reg.value;
+			const bool ymm = reg >= ZYDIS_REGISTER_YMM0 && reg <= ZYDIS_REGISTER_YMM15;
+			if (!ymm && (reg < ZYDIS_REGISTER_XMM0 || reg > ZYDIS_REGISTER_XMM15)) {
+				return false; // MMX, or a general-purpose destination
+			}
+			const auto index = static_cast<uint32_t>(reg - (ymm ? ZYDIS_REGISTER_YMM0
+			                                                    : ZYDIS_REGISTER_XMM0));
+			const bool vex   = instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX;
+			bool       init  = false;
+			auto*      upper = vex ? UpperYmm(context, init) : nullptr;
+			// A VEX load writes the whole YMM register; without the AVX state in the frame its
+			// upper half would survive the fault unchanged.
+			if (vex && upper == nullptr) {
+				return false;
+			}
+			if (bytes > (ymm ? 32u : 16u) || !read(fault_vaddr, address, data, bytes)) {
+				return false;
+			}
+			// Scalar loads (MOVSS, MOVSD, MOVQ, MOVD) clear the rest of the XMM register; the
+			// buffer is zero beyond the loaded bytes.
+			std::memcpy(context->uc_mcontext.fpregs->_xmm[index].element, data, 16);
+			MarkXStateUsed(context, 2);
+			if (vex) {
+				std::memcpy(upper + index * 16u, data + 16, 16);
+				if (ymm && init) {
+					// The other registers' upper halves were zero in the initial state; the
+					// frame now holds them explicitly.
+					for (uint32_t i = 0; i < 16; i++) {
+						if (i != index) {
+							std::memset(upper + i * 16u, 0, 16);
+						}
+					}
+					MarkXStateUsed(context, 4);
+				}
+			}
+			break;
+		}
+	}
+	context->uc_mcontext.gregs[REG_RIP] = static_cast<greg_t>(rip + instruction.length);
+	return true;
+}
+
+#else
+
+bool TryEmulateLoad(void* /*native_context*/, uint64_t /*fault_vaddr*/, LoadReader /*read*/) {
+	return false;
+}
+
+#endif
+
 } // namespace Loader::X64InstructionEmulator

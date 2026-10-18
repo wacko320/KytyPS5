@@ -8,7 +8,9 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <queue>
 #include <source_location>
@@ -52,6 +54,14 @@ public:
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
+	// Runs just before each submit of a command buffer with command registers, while it still
+	// records and operations are still accepted. The hook may submit (a stream-buffer wrap):
+	// that nested submit does not run it again.
+	void SetPreSubmitHook(std::function<void()> hook) { m_pre_submit = std::move(hook); }
+	// Any thread: whether the command buffer of the tick has been handed to the queue.
+	[[nodiscard]] bool IsSubmitted(uint64_t tick) const noexcept {
+		return m_submitted.load(std::memory_order_acquire) >= tick;
+	}
 	// The current command buffer ends with a memory barrier to host reads (for shader writes the
 	// host reads once the submission completes, such as bindless miss records). A barrier after
 	// a draw would sit inside its render pass.
@@ -121,6 +131,9 @@ private:
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
 	bool                         m_host_barrier_requested = false;
+	std::function<void()>        m_pre_submit;
+	bool                         m_in_pre_submit = false;
+	std::atomic<uint64_t>        m_submitted {0};
 };
 
 } // namespace Libs::Graphics

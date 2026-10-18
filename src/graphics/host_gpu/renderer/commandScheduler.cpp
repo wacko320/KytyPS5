@@ -370,6 +370,21 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
+	const bool pre_submit = m_in_pre_submit;
+	if (m_pre_submit && !m_in_pre_submit && m_command.m_registers != nullptr) {
+		bool open = false;
+		{
+			std::lock_guard lock(m_operation_mutex);
+			open = m_operation_state == OperationState::Open;
+		}
+		if (open) {
+			// The hook may record and wrap stream buffers, which submits through here again.
+			m_in_pre_submit = true;
+			m_pre_submit();
+			m_in_pre_submit = false;
+		}
+	}
+
 	if (m_host_barrier_requested) {
 		m_host_barrier_requested = false;
 		m_command.EndRendering();
@@ -429,12 +444,14 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
+	m_submitted.store(tick, std::memory_order_release);
 	m_timestamps.Submitted(timing, tick);
 	if (profile.t0 != 0) {
 		using Common::FrameProfiler::Counter;
 		// SubmitsCommand is the rest of QueueSubmits (the capture reads the debug counters).
-		if (m_command.m_registers == nullptr) {
-			Common::FrameProfiler::Add(Counter::SubmitsOther);
+		if (m_command.m_registers == nullptr || pre_submit) {
+			Common::FrameProfiler::Add(m_command.m_registers == nullptr ? Counter::SubmitsOther
+			                                                            : Counter::SubmitsPreSubmit);
 		}
 	}
 	m_command.m_buffer = nullptr;

@@ -1240,6 +1240,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (std::ranges::any_of(stages, [](const PreparedBindings* stage) { return stage->uses_bindless; })) {
 		m_context.GetBindlessHeap().Finish();
 	}
+	// The draw that writes its bound ranges is recorded.
+	m_context.GetBufferCache().CommitWrittenRanges();
 
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);

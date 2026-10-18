@@ -84,6 +84,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <functional>
+#include <future>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -204,6 +205,33 @@ struct BufferCacheTestAccess {
 
   static bool IsBufferAllocated(const BufferCache &cache, BufferId id) {
     return cache.m_slot_buffers.is_allocated(id);
+  }
+
+  // Pages that already cost a readback, as Rift Apart's title screen accumulates them.
+  static void AddWritebackHotPages(BufferCache &cache, uint64_t address,
+                                   uint64_t pages) {
+    for (uint64_t page = 0; page < pages; ++page) {
+      cache.m_writeback_hot_pages[(address >> 12u) + page] =
+          cache.m_scheduler.CurrentTick();
+    }
+  }
+
+  static size_t WritebackHotPageCount(const BufferCache &cache) {
+    return cache.m_writeback_hot_pages.size();
+  }
+
+  // Records a download of the range's GPU-dirty bytes in the current tick, unsubmitted (GPU
+  // thread only).
+  static bool RecordDownload(BufferCache &cache, uint64_t address, uint64_t size) {
+    auto &buffer = cache.m_slot_buffers[cache.FindBuffer(address, size)];
+    return cache.DownloadBufferMemory<true>(buffer, address, size);
+  }
+
+  // The submit whose write-back holds the page's GPU-dirty bytes, or 0.
+  static uint64_t WritebackTick(BufferCache &cache, uint64_t address) {
+    std::lock_guard lock(cache.m_writeback_mutex);
+    const auto entry = cache.m_writeback_pages.find(address >> 12u);
+    return entry == cache.m_writeback_pages.end() ? 0 : entry->second;
   }
 };
 
@@ -2413,6 +2441,163 @@ public:
                 static_cast<double>(region_ns) / 1e6);
   }
 
+  // Per-frame cost of writable bindings on Rift Apart's title screen (measured): ~530 written
+  // obtains a frame, 45% repeats within a submit, 56 over 1 MiB, ~4000 write-back hot pages.
+  void BenchmarkWritableBindings() {
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    constexpr uint64_t base = 0x0000000204000000ull;
+    constexpr uint64_t size = 64ull << 20u;
+    int64_t direct_offset = -1;
+    Require("WritableBindingsBench", "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size,
+                0x10000, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require("WritableBindingsBench", "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, size, 0x3, 0x10, direct_offset, 0x10000) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "direct-memory mapping failed");
+    context.MapMemory(base, size);
+    auto &cache = context.GetBufferCache();
+    (void)cache.ObtainBuffer(base, size, false);
+    // 4000 hot pages spread over the first 32 MiB: every other page of 8000.
+    for (uint64_t page = 0; page < 8000; page += 2) {
+      BufferCacheTestAccess::AddWritebackHotPages(cache, base + page * 4096, 1);
+    }
+
+    struct Binding { uint64_t address; uint64_t size; };
+    std::vector<Binding> frame;
+    for (uint32_t i = 0; i < 56; ++i) {  // large, over hot pages
+      frame.push_back({base + (i % 14) * (2ull << 20u), 2ull << 20u});
+    }
+    for (uint32_t i = 0; i < 220; ++i) {  // small, over hot pages
+      frame.push_back({base + (i % 120) * 0x40000ull, 0x10000});
+    }
+    for (uint32_t i = 0; i < 254; ++i) {  // small, no hot page
+      frame.push_back({base + (32ull << 20u) + (i % 140) * 0x20000ull, 0x10000});
+    }
+    constexpr uint32_t Frames = 200;
+    constexpr uint32_t SubmitsPerFrame = 6;
+    double obtain_ns = 0;
+    double submit_ns = 0;
+    for (uint32_t f = 0; f < Frames + 10; ++f) {
+      double frame_obtain = 0;
+      double frame_submit = 0;
+      for (uint32_t submit = 0; submit < SubmitsPerFrame; ++submit) {
+        const auto begin = std::chrono::steady_clock::now();
+        for (size_t i = submit; i < frame.size(); i += SubmitsPerFrame) {
+          (void)cache.ObtainBuffer(frame[i].address, frame[i].size, true);
+          cache.CommitWrittenRanges();  // as the draw using the binding is recorded
+        }
+        const auto obtained = std::chrono::steady_clock::now();
+        scheduler.Flush();
+        const auto submitted = std::chrono::steady_clock::now();
+        frame_obtain += std::chrono::duration<double, std::nano>(obtained - begin).count();
+        frame_submit += std::chrono::duration<double, std::nano>(submitted - obtained).count();
+      }
+      // CPU accesses keep using write-backs of a quarter of the hot pages every frame.
+      for (uint64_t page = 0; page < 8000; page += 8) {
+        BufferCacheTestAccess::AddWritebackHotPages(cache, base + page * 4096, 1);
+      }
+      if (f >= 10) {  // warm-up frames excluded
+        obtain_ns += frame_obtain;
+        submit_ns += frame_submit;
+      }
+    }
+    std::printf("[bench] writable bindings: %.3f ms/frame obtaining %zu written bindings, "
+                "%.3f ms/frame in submits (write-backs), %zu hot pages at the end\n",
+                obtain_ns / Frames / 1e6, frame.size(), submit_ns / Frames / 1e6,
+                BufferCacheTestAccess::WritebackHotPageCount(cache));
+    scheduler.Finish();
+    context.UnmapMemory(base, size);
+    (void)Libs::LibKernel::Memory::KernelMunmap(base, size);
+    (void)Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, size);
+  }
+
+  // Read-only bindings shaped like Rift Apart's title screen: ~28k read-only buffer
+  // obtains per frame, most of them repeats, over large ranges into geometry pools
+  // (77 MiB and up) while the CPU dirties a few pages per frame.
+  void BenchmarkReadOnlyBindings() {
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    constexpr uint64_t base = 0x0000000220000000ull;
+    constexpr uint64_t size = 512ull << 20u;
+    int64_t direct_offset = -1;
+    Require("ReadOnlyBindingsBench", "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size,
+                0x10000, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require("ReadOnlyBindingsBench", "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, size, 0x3, 0x10, direct_offset, 0x10000) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "direct-memory mapping failed");
+    context.MapMemory(base, size);
+    auto &cache = context.GetBufferCache();
+    (void)cache.ObtainBuffer(base, size, false);
+
+    struct Binding { uint64_t address; uint64_t size; };
+    std::vector<Binding> frame;
+    // 7000 distinct ranges, each bound by 4 draws in a row.
+    for (uint32_t i = 0; i < 7000; ++i) {
+      const uint64_t length = i % 10 == 0 ? (480ull << 20u) : (77ull << 20u);
+      const uint64_t offset = (static_cast<uint64_t>(i) * 0x1a2c0ull) % (size - length);
+      for (uint32_t repeat = 0; repeat < 4; ++repeat) {
+        frame.push_back({base + (offset & ~uint64_t{0xf}), length});
+      }
+    }
+    constexpr uint32_t Frames = 100;
+    constexpr uint32_t SubmitsPerFrame = 6;
+    double obtain_ns = 0;
+    for (uint32_t f = 0; f < Frames + 5; ++f) {
+      // The CPU writes 40 scattered pages between frames (as the write fault reports them).
+      for (uint64_t i = 0; i < 40; ++i) {
+        const auto page = base + ((i * 7919u + f * 104729u) % (size >> 12u)) * 4096u;
+        cache.InvalidateMemory(page, 4096);
+      }
+      double frame_obtain = 0;
+      for (uint32_t submit = 0; submit < SubmitsPerFrame; ++submit) {
+        const auto begin = std::chrono::steady_clock::now();
+        const size_t first = frame.size() * submit / SubmitsPerFrame;
+        const size_t last = frame.size() * (submit + 1) / SubmitsPerFrame;
+        for (size_t i = first; i < last; ++i) {
+          (void)cache.ObtainBuffer(frame[i].address, frame[i].size, false);
+        }
+        frame_obtain += std::chrono::duration<double, std::nano>(
+                            std::chrono::steady_clock::now() - begin).count();
+        scheduler.Flush();
+      }
+      if (f >= 5) {  // warm-up frames excluded
+        obtain_ns += frame_obtain;
+      }
+    }
+    std::printf("[bench] read-only bindings: %.3f ms/frame obtaining %zu bindings\n",
+                obtain_ns / Frames / 1e6, frame.size());
+    scheduler.Finish();
+    context.UnmapMemory(base, size);
+    (void)Libs::LibKernel::Memory::KernelMunmap(base, size);
+    (void)Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, size);
+  }
+
   void CheckSchedulerTimeline() {
     EnsureRuntimeContext();
     CommandScheduler scheduler(Renderer(), m_runtime_context);
@@ -2581,6 +2766,68 @@ public:
             reentrant == 2 && concurrent_completed.load(),
             "shutdown lost reentrant or concurrent deferred work");
     std::printf("[host]    %-32s ok\n", "SchedulerTimeline");
+  }
+
+  // A command-processor write into a GPU-written page goes to the GPU after the
+  // work before it, with no readback first, and through to guest memory: the
+  // bytes are no longer GPU-dirty, and the GPU's copy holds them too. A page
+  // the GPU does not own is left to the caller to write.
+  void CheckGpuOrderedWriteData() {
+    constexpr const char *name = "GpuOrderedWriteData";
+    constexpr uint64_t base = 0x0000000206000000ull;
+    constexpr uint64_t size = 0x40000;
+    constexpr uint64_t gpu_offset = 0x100;
+    constexpr uint64_t clean_offset = 0x20100;
+    constexpr uint32_t stale = 0x0badf00du;
+    constexpr uint32_t value = 0x13572468u;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size,
+                0x10000, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, size, 0x3, 0x10, direct_offset, 0x10000) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "direct-memory mapping failed");
+    Libs::LibKernel::Memory::WriteBacking(base + gpu_offset, &stale, sizeof(stale));
+    context.MapMemory(base, size);
+    auto &cache = context.GetBufferCache();
+    (void)cache.ObtainBuffer(base, 0x10000, true);
+    Require(name, "GPU-written page",
+            context.TryWriteGpuOrdered(base + gpu_offset, &value, sizeof(value)),
+            "a write into a GPU-dirty page was not recorded on the GPU");
+    Require(name, "page not GPU-written",
+            !context.TryWriteGpuOrdered(base + clean_offset, &value, sizeof(value)),
+            "a write into a page the GPU does not own was recorded on the GPU");
+    uint32_t backing = 0;
+    Libs::LibKernel::Memory::TryReadBacking(base + gpu_offset, &backing, sizeof(backing));
+    Require(name, "write-through", backing == value &&
+                !cache.HasGpuDirtyBytes(base + gpu_offset, sizeof(value)),
+            "the write did not reach guest memory or its bytes stayed GPU-dirty");
+    // The GPU's copy: own the page again and read it back.
+    (void)cache.ObtainBuffer(base, 0x10000, true);
+    Libs::LibKernel::Memory::WriteBacking(base + gpu_offset, &stale, sizeof(stale));
+    cache.ReadMemory(base + gpu_offset, sizeof(value));
+    Libs::LibKernel::Memory::TryReadBacking(base + gpu_offset, &backing, sizeof(backing));
+    Require(name, "GPU copy", backing == value,
+            "the GPU's copy of the buffer did not get the write");
+    scheduler.Finish();
+    context.UnmapMemory(base, size);
+    context.ShutdownGpu();
+    (void)Libs::LibKernel::Memory::KernelMunmap(base, size);
+    (void)Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, size);
+    std::printf("[host]    %-32s ok\n", name);
   }
 
   void CheckGpuMappedRangeLifecycle() {
@@ -3626,8 +3873,16 @@ public:
 
     auto &scheduler = context.GetCommandScheduler();
     std::atomic<bool> completion_published{false};
+    // A deferred guest-memory write declares its range, as the buffer and image
+    // download publishes do; an unmap of that range waits for it.
     gpu.SendCommandSync([&] {
-      scheduler.DeferPriorityOperation([&] { completion_published = true; });
+      context.GetBufferCache().NotePendingGuestWrite(empty_unmap_base,
+                                                     empty_unmap_size);
+      scheduler.DeferPriorityOperation([&] {
+        completion_published = true;
+        context.GetBufferCache().DonePendingGuestWrite(empty_unmap_base,
+                                                       empty_unmap_size);
+      });
     });
     resources.MapMemory(empty_unmap_base, empty_unmap_size);
     resources.UnmapMemory(empty_unmap_base, empty_unmap_size);
@@ -3639,9 +3894,14 @@ public:
     std::binary_semaphore priority_entered{0};
     std::binary_semaphore release_priority{0};
     gpu.SendCommandSync([&] {
+      // A deferred guest-memory write into the range (registered, as above).
+      context.GetBufferCache().NotePendingGuestWrite(empty_unmap_base,
+                                                     empty_unmap_size);
       scheduler.DeferPriorityOperation([&] {
         priority_entered.release();
         release_priority.acquire();
+        context.GetBufferCache().DonePendingGuestWrite(empty_unmap_base,
+                                                       empty_unmap_size);
       });
       scheduler.Flush();
     });
@@ -3669,6 +3929,36 @@ public:
             !unmap_overtook_priority &&
                 !resources.IsMapped(empty_unmap_base, empty_unmap_size),
             "unmap returned before an earlier guest-memory callback");
+
+    // A completion that writes no guest memory in the range (none registered, no
+    // buffer or image there) does not hold an unmap back: no drain.
+    std::binary_semaphore unrelated_entered{0};
+    std::binary_semaphore release_unrelated{0};
+    gpu.SendCommandSync([&] {
+      scheduler.DeferPriorityOperation([&] {
+        unrelated_entered.release();
+        release_unrelated.acquire();
+      });
+      scheduler.Flush();
+    });
+    unrelated_entered.acquire();
+    resources.MapMemory(empty_unmap_base, empty_unmap_size);
+    std::binary_semaphore unrelated_unmap_complete{0};
+    std::jthread unrelated_unmap_thread([&] {
+      resources.UnmapMemory(empty_unmap_base, empty_unmap_size);
+      unrelated_unmap_complete.release();
+    });
+    const bool unrelated_unmap_returned =
+        unrelated_unmap_complete.try_acquire_for(std::chrono::seconds(2));
+    release_unrelated.release();
+    if (!unrelated_unmap_returned) {
+      unrelated_unmap_complete.acquire();
+    }
+    unrelated_unmap_thread.join();
+    Require("GpuCommandLane", "unmap skips the drain",
+            unrelated_unmap_returned &&
+                !resources.IsMapped(empty_unmap_base, empty_unmap_size),
+            "an unmap of a range no GPU work or pending write involves drained the GPU");
 
     constexpr uintptr_t fault_base = 0x0000000200500000ull;
     constexpr uint64_t fault_size = 0x10000;
@@ -10944,6 +11234,640 @@ public:
             "call fixture release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
+
+
+  // Guest memory for the buffer-coherence tests: a fresh RenderContext whose GPU thread runs
+  // body(context, processor) with the range mapped. Writes before the body are the CPU's.
+  template <typename Before, typename Body>
+  void RunEpochFixture(const char *name, uintptr_t base, uint64_t size, Before &&before,
+                       Body &&body) {
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0,
+                &direct_offset) == 0,
+            "allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10,
+                                                           direct_offset, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "mapping failed");
+    std::memset(mapped, 0, size);
+    before();
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      GraphicsInitJmpTables();
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      body(context, processor);
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, size) == 0, "mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, size) == 0,
+            "allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Copies the dword at s[0:3] to s[4:7]: a read binding and a written one.
+  static const std::vector<u32> &EpochCopyShader() {
+    static const std::vector<u32> code = [] {
+      std::vector<u32> result;
+      result.push_back(EncodeMubuf0(0x0cu, 0, false, false)); // buffer_load_dword v1, off, s[0:3]
+      result.push_back(EncodeMubuf1(1, 0, 0));
+      result.push_back(EncodeMubuf0(0x1cu, 0, false, false)); // buffer_store_dword v1, off, s[4:7]
+      result.push_back(EncodeMubuf1(1, 1, 0));
+      AppendEnd(&result);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(result.data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<uint32_t>(result.size() * sizeof(u32))});
+      return result;
+    }();
+    return code;
+  }
+
+  // A raw buffer: bounds mode 3 checks offsets against the byte size (mode 0 with a zero
+  // stride makes every read out of bounds).
+  static ShaderBufferResource EpochDwordBuffer(uint64_t address, uint32_t bytes) {
+    ShaderBufferResource resource{};
+    resource.UpdateAddress48(address);
+    resource.fields[2] = bytes;
+    resource.fields[3] = DstSel(4, 5, 6, 7) |
+        (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u) | (3u << 28u);
+    return resource;
+  }
+
+  // A dispatch of EpochCopyShader from [from, from + from_bytes) to the dword at to.
+  static void AppendEpochCopy(std::vector<u32> &commands, uint64_t from, uint32_t from_bytes,
+                              uint64_t to) {
+    const auto in = EpochDwordBuffer(from, from_bytes);
+    const auto out = EpochDwordBuffer(to, sizeof(u32));
+    commands.insert(commands.end(),
+                    {KYTY_PM4(10, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+                     in.fields[0], in.fields[1], in.fields[2], in.fields[3], out.fields[0],
+                     out.fields[1], out.fields[2], out.fields[3],
+                     KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u, 0x41u});
+  }
+
+  // Runs a command-buffer slice with `code` as the compute shader.
+  static void RunEpochSlice(const char *name, CommandProcessor &processor,
+                            const std::vector<u32> &code, u32 sgprs,
+                            const std::vector<u32> &commands) {
+    processor.GetShCtx().SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                                      .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                                      .wave_size = 64, .user_sgpr = static_cast<uint8_t>(sgprs)});
+    Pm4Execution execution;
+    Require(name, "command stream",
+            processor.Process(execution, commands) == Pm4ProcessResult::Complete,
+            "a command-buffer slice did not complete");
+  }
+
+
+  // Finishes the recorded work and its completions (guest-memory publishes).
+  static void FinishWithCompletions(CommandScheduler &scheduler) {
+    const auto tick = scheduler.CurrentTick();
+    scheduler.Finish();
+    scheduler.WaitPriorityOperations(tick);
+  }
+
+
+  // A dispatch writes a hot page (one whose write-backs the CPU uses), and the staging ring
+  // wraps after the page is bound but before the dispatch is recorded (its second binding
+  // uploads a CPU write): the wrap submits on its own. The page's write-back belongs to the
+  // submit holding the dispatch; one taken at the wrap copies the bytes from before the write,
+  // and a guest read resolved by it returns them. The earlier write to the page is a dispatch
+  // in an earlier submit, or (same_tick) one in the same slice, whose committed range is still
+  // wanted when the wrap submits.
+  void CheckWritebackAfterSplitSubmit(bool same_tick) {
+    const char *name = same_tick ? "WritebackAfterSameTickSplit" : "WritebackAfterSplitSubmit";
+    const uintptr_t base = same_tick ? 0x000000020a800000ull : 0x000000020a600000ull;
+    constexpr uint64_t size = 0x100000;
+    const uint64_t target = base + 0x4100;
+    const uint64_t uploaded = base + 0x8100;
+    const uint64_t spare = base + 0xc100;
+    const uint64_t output = base + 0x80000;
+    constexpr u32 first_value = 0x5b170001u;
+    constexpr u32 second_value = 0x5b170002u;
+    constexpr u32 cpu_value = 0x5b17c0deu;
+    // s[0:3] = s4, or with 9 user SGPRs s[0:3] = s[4:7] = s8.
+    const auto shader = [](bool second) {
+      std::vector<u32> code;
+      code.push_back(EncodeVop1(0x01u, 1, second ? 8 : 4)); // v_mov_b32 v1, s4 / s8
+      code.push_back(EncodeMubuf0(0x1cu, 0, false, false)); // buffer_store_dword v1, off, s[0:3]
+      code.push_back(EncodeMubuf1(1, 0, 0));
+      if (second) {
+        code.push_back(EncodeMubuf0(0x1cu, 0, false, false)); // buffer_store_dword v1, off, s[4:7]
+        code.push_back(EncodeMubuf1(1, 1, 0));
+      }
+      AppendEnd(&code);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+      return code;
+    };
+    static const std::vector<u32> writer = shader(false);
+    static const std::vector<u32> writer2 = shader(true);
+    const auto &copy = EpochCopyShader();
+    // A writer2 dispatch: the value to s[0:3] and s[4:7].
+    const auto dispatch2 = [](std::vector<u32> &commands, const ShaderBufferResource &a,
+                              const ShaderBufferResource &b, u32 value) {
+      commands.insert(commands.end(),
+                      {KYTY_PM4(11, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+                       a.fields[0], a.fields[1], a.fields[2], a.fields[3], b.fields[0],
+                       b.fields[1], b.fields[2], b.fields[3], value,
+                       KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u, 0x41u});
+    };
+
+    RunEpochFixture(
+        name, base, size, [] {},
+        [&](RenderContext &context, CommandProcessor &processor) {
+          auto &cache = context.GetBufferCache();
+          auto &scheduler = context.GetCommandScheduler();
+          // One cached buffer over the pages.
+          std::vector<u32> read_all;
+          AppendEpochCopy(read_all, base, 0x10000, output);
+          RunEpochSlice(name, processor, copy, 8, read_all);
+          BufferCacheTestAccess::AddWritebackHotPages(cache, target, 1);
+          const auto first = EpochDwordBuffer(target, sizeof(u32));
+          if (!same_tick) {
+            RunEpochSlice(name, processor, writer, 5,
+                          {KYTY_PM4(7, Pm4::IT_SET_SH_REG, Pm4::R_ZERO),
+                           Pm4::COMPUTE_USER_DATA_0, first.fields[0], first.fields[1],
+                           first.fields[2], first.fields[3], first_value,
+                           KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u,
+                           0x41u});
+            FinishWithCompletions(scheduler);
+          }
+          Require(name, "fixture",
+                  (same_tick || (cache.IsRegionGpuModified(target, sizeof(u32)) &&
+                                 BufferCacheTestAccess::WritebackTick(cache, target) != 0)) &&
+                      BufferCacheTestAccess::PageOwner(cache, target) ==
+                          BufferCacheTestAccess::PageOwner(cache, uploaded),
+                  "the first dispatch did not leave a written-back, GPU-owned page");
+          // A full staging ring: the upload of the second binding's CPU write wraps it and
+          // waits for the recording submit.
+          auto &ring = cache.GetUtilityBuffer(MemoryUsage::Upload);
+          const auto [filled, filled_offset] = ring.Map(ring.Size(), 4);
+          Require(name, "staging ring", filled != nullptr && filled_offset == 0,
+                  "the staging buffer could not be filled");
+          ring.Commit();
+          // A CPU write the second binding's sync uploads.
+          (void)context.InvalidateMemory(uploaded, sizeof(u32));
+          *reinterpret_cast<volatile u32 *>(uploaded) = cpu_value;
+          std::vector<u32> commands;
+          if (same_tick) {
+            // Records and commits the page's range in the tick the wrap submits.
+            dispatch2(commands, first, EpochDwordBuffer(spare, sizeof(u32)), first_value);
+          }
+          dispatch2(commands, first, EpochDwordBuffer(uploaded, sizeof(u32)), second_value);
+          const auto before_dispatch = scheduler.CurrentTick();
+          RunEpochSlice(name, processor, writer2, 9, commands);
+          Require(name, "split submit", scheduler.CurrentTick() > before_dispatch,
+                  "no submit came between binding the page and recording the dispatch");
+          // The wrap submit holds no write of the second dispatch: it publishes no write-back
+          // for the page, which a fault would otherwise resolve with the older bytes.
+          Require(name, "no write-back at the wrap",
+                  BufferCacheTestAccess::WritebackTick(cache, target) == 0,
+                  "the page has a write-back from tick " +
+                      std::to_string(BufferCacheTestAccess::WritebackTick(cache, target)) +
+                      " before the dispatch's submit");
+          FinishWithCompletions(scheduler);
+          // A guest thread's read resolves through the write-back alone: it never needs this
+          // (GPU) thread, which joins it.
+          const auto tick = BufferCacheTestAccess::WritebackTick(cache, target);
+          Require(name, "write-back", tick != 0 && scheduler.IsSubmitted(tick),
+                  "the second dispatch's page has no submitted write-back");
+          u32 seen = 0;
+          std::thread([&] {
+            cache.ReadMemory(target, sizeof(u32));
+            (void)LibKernel::Memory::TryReadBacking(target, &seen, sizeof(seen));
+          }).join();
+          Require(name, "value", seen == second_value,
+                  "the guest read " + Hex(seen) + ", expected " + Hex(second_value) +
+                      " (the dispatch's write)");
+        });
+  }
+
+  // Four consecutive hot pages written in one submit and written back. A guest read of the
+  // first waits for that write-back and hands the pages after it back too, so they are no
+  // longer GPU-owned and reading them does not fault. The run stops at the third page when it
+  // was written again after the write-backs (its own write-back is a later submit's) or when a
+  // publish recorded after the write-back (a download) has yet to reach it; a read of that page
+  // then returns the newer bytes and hands the fourth page back with it.
+  enum class ResolveRunCase { HandsBack, NewerWrite, PendingPublish };
+  void CheckResolveRun(ResolveRunCase variant) {
+    const char *name = variant == ResolveRunCase::HandsBack    ? "ResolveRunHandsBackFollowingPages"
+                       : variant == ResolveRunCase::NewerWrite ? "ResolveRunStopsAtNewerWrite"
+                                                               : "ResolveRunSkipsPendingPublish";
+    const uintptr_t base = variant == ResolveRunCase::HandsBack    ? 0x000000020aa00000ull
+                           : variant == ResolveRunCase::NewerWrite ? 0x000000020ac00000ull
+                                                                   : 0x000000020ae00000ull;
+    constexpr uint64_t size = 0x100000;
+    constexpr uint64_t page_size = 0x1000;
+    constexpr uint32_t count = 4;
+    // The first page the run must stop at. Pages 0-1 and 2-3 lie in different 16 KiB caching
+    // pages, the granularity of pending publishes.
+    constexpr uint32_t stop = 2;
+    const auto page = [base](uint32_t index) { return base + 0x12000u + index * page_size; };
+    const auto dword = [&page](uint32_t index) { return page(index) + 0x100u; };
+    const auto value = [](uint32_t round, uint32_t index) {
+      return 0x7e5a0000u + round * 0x100u + index;
+    };
+    const uint64_t output = base + 0x80000;
+    static const std::vector<u32> writer = [] {
+      std::vector<u32> code;
+      code.push_back(EncodeVop1(0x01u, 1, 4)); // v_mov_b32 v1, s4
+      code.push_back(EncodeMubuf0(0x1cu, 0, false, false)); // buffer_store_dword v1, off, s[0:3]
+      code.push_back(EncodeMubuf1(1, 0, 0));
+      AppendEnd(&code);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+      return code;
+    }();
+    const auto &copy = EpochCopyShader();
+    const auto write = [&dword](std::vector<u32> &commands, uint32_t index, u32 word) {
+      const auto out = EpochDwordBuffer(dword(index), sizeof(u32));
+      commands.insert(commands.end(),
+                      {KYTY_PM4(7, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+                       out.fields[0], out.fields[1], out.fields[2], out.fields[3], word,
+                       KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u, 0x41u});
+    };
+    std::array<u32, count> seen{};
+    // A guest thread reads the dwords of pages [first, last) in order; its reads fault through
+    // the production route and resolve through write-backs alone, never needing this (GPU)
+    // thread, which joins it. A read that needs this thread would wait for it forever: fail
+    // instead.
+    const auto guest_read = [&](uint32_t first, uint32_t last) {
+      std::promise<void> read;
+      auto               done = read.get_future();
+      std::thread        reader([&] {
+        for (auto i = first; i < last; i++) {
+          seen[i] = *reinterpret_cast<volatile u32 *>(dword(i));
+        }
+        read.set_value();
+      });
+      Require(name, "guest read", done.wait_for(std::chrono::seconds(10)) == std::future_status::ready,
+              "reading pages " + std::to_string(first) + "-" + std::to_string(last - 1) +
+                  " did not resolve through write-backs");
+      reader.join();
+    };
+    // Whether pages [first, last) are GPU-owned, as a fault on them would find them.
+    const auto owned = [&](RenderContext &context, uint32_t first, uint32_t last) {
+      bool all = true;
+      bool none = true;
+      for (auto i = first; i < last; i++) {
+        const bool gpu = context.GetBufferCache().IsRegionGpuModified(page(i), page_size);
+        all &= gpu;
+        none &= !gpu;
+      }
+      return std::pair {all, none};
+    };
+
+    RunEpochFixture(
+        name, base, size, [] {},
+        [&](RenderContext &context, CommandProcessor &processor) {
+          auto &cache = context.GetBufferCache();
+          auto &scheduler = context.GetCommandScheduler();
+          // One cached buffer over the pages.
+          std::vector<u32> read_all;
+          AppendEpochCopy(read_all, base, 0x20000, output);
+          RunEpochSlice(name, processor, copy, 8, read_all);
+          BufferCacheTestAccess::AddWritebackHotPages(cache, page(0), count);
+          std::vector<u32> commands;
+          for (uint32_t i = 0; i < count; i++) {
+            write(commands, i, value(0, i));
+          }
+          RunEpochSlice(name, processor, writer, 5, commands);
+          FinishWithCompletions(scheduler);
+          const auto tick = BufferCacheTestAccess::WritebackTick(cache, page(0));
+          bool written_back = tick != 0;
+          for (uint32_t i = 0; i < count; i++) {
+            written_back &= BufferCacheTestAccess::WritebackTick(cache, page(i)) == tick &&
+                            cache.IsRegionGpuModified(page(i), page_size);
+          }
+          Require(name, "fixture", written_back,
+                  "the writes did not leave GPU-owned pages written back by one submit");
+          u32 newest = value(0, stop);
+          if (variant == ResolveRunCase::NewerWrite) {
+            newest = value(1, stop);
+            commands.clear();
+            write(commands, stop, newest);
+            RunEpochSlice(name, processor, writer, 5, commands);
+            FinishWithCompletions(scheduler);
+            Require(name, "newer write-back",
+                    BufferCacheTestAccess::WritebackTick(cache, page(stop)) > tick,
+                    "the second write left no later write-back");
+          } else if (variant == ResolveRunCase::PendingPublish) {
+            // As a download is declared and published, at the current tick.
+            newest = value(2, stop);
+            cache.NotePendingGuestWrite(page(stop), page_size);
+            scheduler.DeferPriorityOperation([&cache, address = dword(stop),
+                                              start = page(stop), newest] {
+              LibKernel::Memory::WriteBacking(address, &newest, sizeof(newest));
+              cache.DonePendingGuestWrite(start, page_size);
+            });
+          }
+          const uint32_t first_run = variant == ResolveRunCase::HandsBack ? count : stop;
+          guest_read(0, 1);
+          // The pages from the stop on stay GPU-owned.
+          Require(name, "run hand-back",
+                  owned(context, 1, first_run).second &&
+                      (first_run == count || owned(context, first_run, count).first),
+                  "reading page 0 did not hand back exactly pages 1-" +
+                      std::to_string(first_run - 1));
+          guest_read(1, first_run);
+          if (variant != ResolveRunCase::HandsBack) {
+            if (variant == ResolveRunCase::PendingPublish) {
+              // The publish lands; the page's own write-back is then current.
+              scheduler.Flush();
+              FinishWithCompletions(scheduler);
+            }
+            guest_read(stop, stop + 1);
+            Require(name, "second run", owned(context, stop, count).second,
+                    "reading page " + std::to_string(stop) + " did not hand back the page after it");
+            guest_read(stop + 1, count);
+          }
+          for (uint32_t i = 0; i < count; i++) {
+            const auto expected =
+                i == stop && variant != ResolveRunCase::HandsBack ? newest : value(0, i);
+            Require(name, "value", seen[i] == expected,
+                    "page " + std::to_string(i) + " read " + Hex(seen[i]) + ", expected " +
+                        Hex(expected));
+          }
+        });
+  }
+
+  enum class InFlightSiblingCase {
+    // A guest thread reads the second dword.
+    GuestRead,
+    // A guest thread invalidates a range from the second dword into the next page, as a file
+    // read into guest memory does: the range must be handed back when the call returns.
+    GuestInvalidate,
+    // The GPU thread reads the second dword.
+    GpuRead,
+    // The GPU thread reads a range from the second dword into the next page.
+    GpuRange,
+    // As GuestRead, with the first read's download wrapping the download ring while the ring's
+    // tail is still in the open command buffer: the wrap must submit that tick itself before
+    // waiting for it. No gate (it would hold the wait the wrap makes on the GPU thread), so the
+    // download may publish before the second read starts: it then starts after the first.
+    Wrap,
+    // As Wrap with the tail submitted ahead of the gate: the wrap waits for a submitted tick, and
+    // the gate holds the download, so the second read must find it pending.
+    WrapGated,
+    // No first read: this thread records the download of both pages and does not submit it.
+    // The guest read of the second dword must submit it itself.
+    Unsubmitted,
+  };
+
+  // Two GPU-written dwords in one tracker page. A guest thread's read of the first downloads
+  // the page's GPU-dirty bytes, both dwords, and waits for the GPU; a read of the second
+  // meanwhile finds no GPU-dirty bytes left on it, and must wait for that download's publish
+  // instead of reading guest memory before it lands. A host-set event holds the GPU behind the writes until the second read is
+  // under way (set after a timeout at the latest).
+  // Guest commands reach this (GPU) thread only between PM4 packets: the body serves them with
+  // NOP packets and never joins the guest threads.
+  void CheckReadbackInFlightSibling(InFlightSiblingCase variant) {
+    using Case = InFlightSiblingCase;
+    const char *name = [variant] {
+      switch (variant) {
+      case Case::GuestRead:
+        return "ReadbackInFlightSibling";
+      case Case::GuestInvalidate:
+        return "ReadbackInFlightInvalidate";
+      case Case::GpuRead:
+        return "ReadbackInFlightGpuRead";
+      case Case::GpuRange:
+        return "ReadbackInFlightGpuRange";
+      case Case::Wrap:
+        return "ReadbackInFlightWrap";
+      case Case::WrapGated:
+        return "ReadbackInFlightWrapGated";
+      case Case::Unsubmitted:
+        return "ReadbackUnsubmittedSibling";
+      }
+      return "ReadbackInFlightSibling";
+    }();
+    const bool gpu_reader = variant == Case::GpuRead || variant == Case::GpuRange;
+    const bool gated = variant != Case::Wrap && variant != Case::Unsubmitted;
+    constexpr uintptr_t base = 0x000000020b000000ull;
+    constexpr uint64_t size = 0x100000;
+    // One tracker page: a readback of either takes both (readbacks take the GPU-dirty bytes of
+    // the tracker pages they cover).
+    constexpr uint64_t first = base + 0x10100;
+    constexpr uint64_t second = base + 0x10200;
+    // From the second dword into the next page.
+    constexpr uint64_t range_size = 0x4100;
+    constexpr u32 first_value = 0x51b10001u;
+    constexpr u32 second_value = 0x51b10002u;
+    const uint64_t output = base + 0x80000;
+    static const std::vector<u32> writer = [] {
+      std::vector<u32> code;
+      code.push_back(EncodeVop1(0x01u, 1, 4)); // v_mov_b32 v1, s4
+      code.push_back(EncodeMubuf0(0x1cu, 0, false, false)); // buffer_store_dword v1, off, s[0:3]
+      code.push_back(EncodeMubuf1(1, 0, 0));
+      AppendEnd(&code);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+      return code;
+    }();
+    const auto &copy = EpochCopyShader();
+    const auto write = [](std::vector<u32> &commands, uint64_t address, u32 word) {
+      const auto out = EpochDwordBuffer(address, sizeof(u32));
+      commands.insert(commands.end(),
+                      {KYTY_PM4(7, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+                       out.fields[0], out.fields[1], out.fields[2], out.fields[3], word,
+                       KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u, 0x41u});
+    };
+    const std::vector<u32> nop{KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO), 0u};
+
+    vk::Event gate{};
+    const vk::EventCreateInfo gate_info{};
+    RequireVk(name, "event", m_device.createEvent(&gate_info, nullptr, &gate), "createEvent");
+    std::mutex gate_mutex;
+    bool gate_set = false;
+    const auto release = [&] {
+      std::lock_guard lock(gate_mutex);
+      if (!gate_set) {
+        gate_set = true;
+        (void)m_device.setEvent(gate);
+      }
+    };
+    if (!gated) {
+      release();
+    }
+    std::promise<void> released;
+    // The GPU wait is bounded: the gate opens after the timeout whatever the test does.
+    std::thread watchdog([&release, done = released.get_future()] {
+      if (done.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+        release();
+      }
+    });
+    // Opens the gate while this thread waits in a GPU-thread read.
+    std::thread opener;
+    std::atomic<bool> first_done{false};
+    std::atomic<bool> second_done{false};
+    u32 first_seen = 0;
+    u32 second_seen = 0;
+    bool second_handed_back = true;
+    std::thread first_reader;
+    std::thread second_reader;
+    bool second_started = false;
+
+    RunEpochFixture(
+        name, base, size, [] {},
+        [&](RenderContext &context, CommandProcessor &processor) {
+          auto &cache = context.GetBufferCache();
+          auto &scheduler = context.GetCommandScheduler();
+          // One cached buffer over the pages.
+          std::vector<u32> read_all;
+          AppendEpochCopy(read_all, base, 0x40000, output);
+          RunEpochSlice(name, processor, copy, 8, read_all);
+          std::vector<u32> commands;
+          write(commands, first, first_value);
+          write(commands, second, second_value);
+          RunEpochSlice(name, processor, writer, 5, commands);
+          Require(name, "fixture",
+                  cache.HasGpuDirtyBytes(first, sizeof(u32)) &&
+                      cache.HasGpuDirtyBytes(second, sizeof(u32)) &&
+                      cache.IsRegionGpuModified(first, sizeof(u32)) &&
+                      cache.IsRegionGpuModified(second, sizeof(u32)),
+                  "the writes did not leave both pages GPU-owned");
+          // Positions the download ring's tail so the next download wraps it, noted at the open
+          // command buffer's tick.
+          const auto ring_tail = [&] {
+            auto &download = BufferCacheTestAccess::DownloadBuffer(cache);
+            auto [tail, tail_offset] = download.Map(download.Size() - sizeof(u32), 4);
+            Require(name, "ring tail", tail != nullptr && tail_offset == 0,
+                    "failed to position the download ring near its wrap");
+            download.Commit();
+            return scheduler.CurrentTick();
+          };
+          if (variant == Case::WrapGated) {
+            // The tail goes in its own submission, ahead of the gate: the wrap waits for the
+            // tail's tick, and the gate then holds the download, so its publish cannot pass
+            // unseen.
+            (void)ring_tail();
+            scheduler.Flush();
+          }
+          // Everything submitted after this waits for the gate.
+          auto &command = scheduler.Current();
+          command.EndRendering();
+          command.Handle().waitEvents(1, &gate, vk::PipelineStageFlagBits::eHost,
+                                      vk::PipelineStageFlagBits::eAllCommands, 0, nullptr, 0,
+                                      nullptr, 0, nullptr);
+          scheduler.Flush();
+          if (variant == Case::Wrap) {
+            // The tail stays in the open command buffer: the first read's download wraps the
+            // ring and so submits the tick it was noted at.
+            const auto tail_tick = ring_tail();
+            Require(name, "unsubmitted tail",
+                    tail_tick == scheduler.CurrentTick() && !scheduler.IsFree(tail_tick),
+                    "the ring tail's tick was not the open command buffer's");
+          }
+          if (variant == Case::Unsubmitted) {
+            Require(name, "unsubmitted download",
+                    BufferCacheTestAccess::RecordDownload(cache, base, 0x40000) &&
+                        cache.HasPendingGuestWrite(second, sizeof(u32)),
+                    "recording the download noted no pending write");
+            first_done.store(true, std::memory_order_release);
+          } else {
+            first_reader = std::thread([&] {
+              first_seen = *reinterpret_cast<volatile u32 *>(first);
+              first_done.store(true, std::memory_order_release);
+            });
+          }
+          bool opened = !gated;
+          const auto start = std::chrono::steady_clock::now();
+          auto second_start = start;
+          while (!(first_done.load(std::memory_order_acquire) &&
+                   second_done.load(std::memory_order_acquire)) &&
+                 std::chrono::steady_clock::now() - start < std::chrono::seconds(20)) {
+            Pm4Execution execution;
+            (void)processor.Process(execution, nop);
+            const auto now = std::chrono::steady_clock::now();
+            // The first read's download, recorded and submitted behind the gate, covers the
+            // second dword. Without a gate it can publish before this loop sees it pending: the
+            // second read then starts once the first is done (it must still see the GPU's value).
+            if (!second_started && (cache.HasPendingGuestWrite(second, sizeof(u32)) ||
+                                    (!gated && first_done.load(std::memory_order_acquire)))) {
+              second_started = true;
+              second_start = now;
+              if (gpu_reader) {
+                opener = std::thread([&release] {
+                  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                  release();
+                });
+                opened = true;
+                cache.ReadMemory(second, variant == Case::GpuRange ? range_size : sizeof(u32));
+                second_handed_back = !cache.IsRegionGpuModified(second, sizeof(u32));
+                second_seen = *reinterpret_cast<volatile u32 *>(second);
+                second_done.store(true, std::memory_order_release);
+              } else {
+                second_reader = std::thread([&] {
+                  if (variant == Case::GuestInvalidate) {
+                    cache.InvalidateMemory(second, range_size);
+                    second_handed_back = !cache.IsRegionGpuModified(second, sizeof(u32));
+                  }
+                  second_seen = *reinterpret_cast<volatile u32 *>(second);
+                  second_done.store(true, std::memory_order_release);
+                });
+              }
+            }
+            // Open once the second read has finished or is blocked.
+            if (second_started && !opened &&
+                (second_done.load(std::memory_order_acquire) ||
+                 now - second_start > std::chrono::milliseconds(300))) {
+              opened = true;
+              release();
+            }
+          }
+          release();
+          // Nothing serves a reader still inside a guest command once this body returns.
+          Require(name, "readers done",
+                  first_done.load(std::memory_order_acquire) &&
+                      second_done.load(std::memory_order_acquire),
+                  "a read did not finish (started second read: " +
+                      std::string(second_started ? "yes" : "no") + ")");
+          if (variant == Case::Unsubmitted) {
+            cache.ReadMemory(first, sizeof(u32));
+            first_seen = *reinterpret_cast<volatile u32 *>(first);
+          }
+        });
+    released.set_value();
+    watchdog.join();
+    if (opener.joinable()) {
+      opener.join();
+    }
+    if (first_reader.joinable()) {
+      first_reader.join();
+    }
+    if (second_reader.joinable()) {
+      second_reader.join();
+    }
+    m_device.destroyEvent(gate, nullptr);
+    Require(name, "sibling read", second_started,
+            "the first read's download never covered the second dword");
+    Require(name, "first value", first_seen == first_value,
+            "the first read " + Hex(first_seen) + ", expected " + Hex(first_value));
+    Require(name, "second value", second_seen == second_value,
+            "the second read " + Hex(second_seen) + ", expected " + Hex(second_value) +
+                " (it read guest memory before the first read's download published it)");
+    Require(name, "second handed back", second_handed_back,
+            "the second read returned with its page still GPU-owned");
+  }
+
 
   // A cached buffer over two pages outlives the unmap of the second, whose backing goes with it
   // (the unmap leaves the page pending). A sync over both pages then takes only the page still
@@ -50458,6 +51382,33 @@ int main(int argc, char **argv) {
     CheckReferenceClockScale();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--writable-bindings-bench") == 0) {
+    VulkanHarness vulkan;
+    vulkan.BenchmarkWritableBindings();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--writeback-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckWritebackAfterSplitSubmit(false);
+    vulkan.CheckWritebackAfterSplitSubmit(true);
+    vulkan.CheckResolveRun(VulkanHarness::ResolveRunCase::HandsBack);
+    vulkan.CheckResolveRun(VulkanHarness::ResolveRunCase::NewerWrite);
+    vulkan.CheckResolveRun(VulkanHarness::ResolveRunCase::PendingPublish);
+    vulkan.CheckReadbackInFlightSibling(VulkanHarness::InFlightSiblingCase::GuestRead);
+    vulkan.CheckReadbackInFlightSibling(VulkanHarness::InFlightSiblingCase::GuestInvalidate);
+    vulkan.CheckReadbackInFlightSibling(VulkanHarness::InFlightSiblingCase::GpuRead);
+    vulkan.CheckReadbackInFlightSibling(VulkanHarness::InFlightSiblingCase::GpuRange);
+    vulkan.CheckReadbackInFlightSibling(VulkanHarness::InFlightSiblingCase::Wrap);
+    vulkan.CheckReadbackInFlightSibling(VulkanHarness::InFlightSiblingCase::WrapGated);
+    vulkan.CheckReadbackInFlightSibling(VulkanHarness::InFlightSiblingCase::Unsubmitted);
+    vulkan.CheckGpuOrderedWriteData();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--readonly-bindings-bench") == 0) {
+    VulkanHarness vulkan;
+    vulkan.BenchmarkReadOnlyBindings();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--scheduler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckSchedulerTimeline();
@@ -51123,6 +52074,19 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuCommandLane();
   vulkan.CheckScalarLeafCall();
   vulkan.CheckPartialUnmapSync();
+  vulkan.CheckWritebackAfterSplitSubmit(false);
+  vulkan.CheckWritebackAfterSplitSubmit(true);
+  vulkan.CheckResolveRun(VulkanHarness::ResolveRunCase::HandsBack);
+  vulkan.CheckResolveRun(VulkanHarness::ResolveRunCase::NewerWrite);
+  vulkan.CheckResolveRun(VulkanHarness::ResolveRunCase::PendingPublish);
+  vulkan.CheckReadbackInFlightSibling(VulkanHarness::InFlightSiblingCase::GuestRead);
+  vulkan.CheckReadbackInFlightSibling(VulkanHarness::InFlightSiblingCase::GuestInvalidate);
+  vulkan.CheckReadbackInFlightSibling(VulkanHarness::InFlightSiblingCase::GpuRead);
+  vulkan.CheckReadbackInFlightSibling(VulkanHarness::InFlightSiblingCase::GpuRange);
+  vulkan.CheckReadbackInFlightSibling(VulkanHarness::InFlightSiblingCase::Wrap);
+  vulkan.CheckReadbackInFlightSibling(VulkanHarness::InFlightSiblingCase::WrapGated);
+  vulkan.CheckReadbackInFlightSibling(VulkanHarness::InFlightSiblingCase::Unsubmitted);
+  vulkan.CheckGpuOrderedWriteData();
   if (skipped_device_checks) {
     std::printf(
         "ShaderRecompilerComputeTests: device rasterization checks skipped, this "

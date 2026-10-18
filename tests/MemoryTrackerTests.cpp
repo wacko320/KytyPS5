@@ -11,6 +11,7 @@
 #include <cstring>
 #include <mutex>
 #include <semaphore>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -1104,6 +1105,395 @@ void TestFullRegionGpuUnmarkBatching() {
   Release(memory);
 }
 
+struct UploadCounter {
+  uint32_t uploads = 0;
+  std::vector<std::pair<uint64_t, uint64_t>> ranges;
+};
+
+void Sync(MemoryTracker &tracker, uint64_t vaddr, uint64_t size,
+          bool is_written, UploadCounter &counter) {
+  tracker.ForEachUploadRange(
+      vaddr, size, is_written,
+      [&](uint64_t address, uint64_t bytes) noexcept {
+        counter.ranges.push_back({address, bytes});
+      },
+      [&]() noexcept { counter.uploads++; });
+}
+
+uint8_t *AllocateRegions(uintptr_t base, uint64_t regions) {
+  const auto size = Libs::Graphics::TRACKER_REGION_SIZE * regions;
+  auto *memory = static_cast<uint8_t *>(
+      VirtualAlloc(reinterpret_cast<void *>(base), size,
+                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  Check(memory == reinterpret_cast<void *>(base),
+        "region-aligned allocation failed");
+  return memory;
+}
+
+void TestRepeatedSyncSkipsUnchangedRange() {
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = Allocate(harness.page_manager, 16);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  UploadCounter written;
+  Sync(tracker, address + 16, page_size * 4, true, written);
+  Check(written.uploads == 1 && written.ranges.size() == 1 &&
+            written.ranges[0].first == address &&
+            written.ranges[0].second == page_size * 5,
+        "first written sync did not upload its pages");
+  written = {};
+  ResetProtectionLog();
+  Sync(tracker, address + 16, page_size * 4, true, written);
+  Check(written.uploads == 0 && written.ranges.empty() &&
+            g_protection_calls == 0,
+        "repeated written sync of a GPU-owned range was not skipped");
+
+  // A read of a range still GPU-owned throughout is just as redundant.
+  Sync(tracker, address + 16, page_size * 4, false, written);
+  Check(written.uploads == 0, "read sync of a GPU-owned range was not skipped");
+
+  UploadCounter read;
+  Sync(tracker, address + page_size * 8, page_size * 4, false, read);
+  Check(read.uploads == 1 && read.ranges.size() == 1,
+        "first read sync did not upload its pages");
+  read = {};
+  Sync(tracker, address + page_size * 8, page_size * 4, false, read);
+  Check(read.uploads == 0, "repeated read sync of a clean range was not skipped");
+
+  // The shortcut is keyed on the exact range; a subrange walks and finds nothing.
+  Sync(tracker, address + page_size * 9, page_size, false, read);
+  Check(read.uploads == 1 && read.ranges.empty(),
+        "clean subrange sync uploaded pages");
+
+  // A written sync does not ride on a read-only record.
+  read = {};
+  Sync(tracker, address + page_size * 8, page_size * 4, true, read);
+  Check(read.uploads == 1 && read.ranges.empty() &&
+            tracker.IsRegionGpuModified(address + page_size * 8, page_size * 4),
+        "written sync after a read sync skipped its GPU marking");
+
+  tracker.UnmarkRegionAsGpuModified(address, page_size * 16);
+  tracker.MarkRegionAsCpuModified(address, page_size * 16);
+  tracker.UntrackMemory(address, page_size * 16);
+  Release(memory);
+}
+
+void TestSyncRecordInvalidation() {
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = Allocate(harness.page_manager, 16);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto written_range = address;
+  const auto read_range = address + page_size * 8;
+  const auto other_page = address + page_size * 15;
+
+  UploadCounter counter;
+  Sync(tracker, written_range, page_size * 4, true, counter);
+  Sync(tracker, read_range, page_size * 4, false, counter);
+  Sync(tracker, other_page, page_size, false, counter);
+
+  // A GPU page handed back to the CPU and written: the next written sync must
+  // upload it and take it back.
+  tracker.UnmarkRegionAsGpuModified(written_range + page_size * 2, page_size);
+  tracker.MarkRegionAsCpuModified(written_range + page_size * 2, 8);
+  counter = {};
+  Sync(tracker, written_range, page_size * 4, true, counter);
+  Check(counter.uploads == 1 && counter.ranges.size() == 1 &&
+            counter.ranges[0].first == written_range + page_size * 2 &&
+            counter.ranges[0].second == page_size &&
+            tracker.IsRegionGpuModified(written_range + page_size * 2, page_size) &&
+            !tracker.IsRegionCpuModified(written_range, page_size * 4),
+        "written sync missed a page handed back to the CPU");
+
+  // A handed-back page nobody wrote still needs GPU ownership again.
+  tracker.UnmarkRegionAsGpuModified(written_range + page_size, page_size);
+  counter = {};
+  Sync(tracker, written_range, page_size * 4, true, counter);
+  Check(counter.uploads == 1 && counter.ranges.empty() &&
+            tracker.IsRegionGpuModified(written_range + page_size, page_size),
+        "written sync did not reacquire a handed-back page");
+
+  // A CPU write through a fault: the next read sync uploads exactly that page.
+  tracker.InvalidateRegion(read_range + page_size * 3 + 100, 8, [] {
+    Check(false, "clean page invalidation requested a GPU flush");
+  });
+  counter = {};
+  Sync(tracker, read_range, page_size * 4, false, counter);
+  Check(counter.uploads == 1 && counter.ranges.size() == 1 &&
+            counter.ranges[0].first == read_range + page_size * 3 &&
+            counter.ranges[0].second == page_size,
+        "read sync missed a CPU write");
+
+  // A CPU write elsewhere costs a walk but uploads nothing here.
+  tracker.MarkRegionAsCpuModified(other_page, 8);
+  counter = {};
+  Sync(tracker, read_range, page_size * 4, false, counter);
+  Check(counter.uploads == 1 && counter.ranges.empty(),
+        "unrelated CPU write changed a clean range's upload");
+
+  tracker.UnmarkRegionAsGpuModified(address, page_size * 16);
+  tracker.MarkRegionAsCpuModified(address, page_size * 16);
+  tracker.UntrackMemory(address, page_size * 16);
+  Release(memory);
+}
+
+void TestWrittenSyncSkipsGpuOwnedRegions() {
+  constexpr uintptr_t base = 0x0000000204000000ull;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = AllocateRegions(base, 3);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  // Partial first and last regions around a whole one.
+  const auto begin = address + page_size * 7;
+  const auto size = region_size * 3 - page_size * 12;
+
+  UploadCounter counter;
+  Sync(tracker, begin, size, true, counter);
+  Check(tracker.IsRegionGpuModified(begin, size) &&
+            !tracker.IsRegionCpuModified(begin, size),
+        "multi-region written sync did not take ownership");
+
+  // Hand back one page of the whole middle region and one of the last.
+  const auto middle_page = address + region_size + page_size * 100;
+  const auto last_page = address + region_size * 2 + page_size * 5;
+  for (const auto page : {middle_page, last_page}) {
+    tracker.UnmarkRegionAsGpuModified(page, page_size);
+    tracker.MarkRegionAsCpuModified(page, page_size);
+  }
+  counter = {};
+  ResetProtectionLog();
+  Sync(tracker, begin, size, true, counter);
+  bool touched_first_region = false;
+  for (const auto &call : g_protection_log) {
+    touched_first_region |= call.address < address + region_size;
+  }
+  Check(counter.uploads == 1 && counter.ranges.size() == 2 &&
+            counter.ranges[0].first == middle_page &&
+            counter.ranges[1].first == last_page && !touched_first_region,
+        "multi-region written sync did not upload only the handed-back pages");
+  for (auto page = begin; page < begin + size; page += page_size) {
+    Check(tracker.IsRegionGpuModified(page, page_size),
+          "multi-region written sync left a page CPU-owned");
+  }
+
+  tracker.UnmarkRegionAsGpuModified(address, region_size * 3);
+  tracker.MarkRegionAsCpuModified(address, region_size * 3);
+  tracker.UntrackMemory(address, region_size * 3);
+  Release(memory);
+}
+
+void TestUnlockedModificationQueries() {
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = Allocate(harness.page_manager, 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  UploadCounter counter;
+  Sync(tracker, address, page_size * 4, false, counter);
+  Check(!tracker.IsRegionCpuModified(address, page_size * 4) &&
+            !tracker.IsRegionGpuModified(address, page_size * 4),
+        "clean region answered modified");
+  Sync(tracker, address + page_size, page_size, true, counter);
+  Check(tracker.IsRegionGpuModified(address, page_size * 4) &&
+            !tracker.IsRegionGpuModified(address, page_size) &&
+            !tracker.IsRegionCpuModified(address, page_size * 4),
+        "GPU-dirty page was not reported exactly");
+  tracker.MarkRegionAsCpuModified(address + page_size * 3, 8);
+  Check(tracker.IsRegionCpuModified(address, page_size * 4) &&
+            !tracker.IsRegionCpuModified(address, page_size * 3),
+        "CPU-dirty page was not reported exactly");
+
+  tracker.UnmarkRegionAsGpuModified(address, page_size * 4);
+  tracker.MarkRegionAsCpuModified(address, page_size * 4);
+  tracker.UntrackMemory(address, page_size * 4);
+  Release(memory);
+}
+
+// A fault thread hands GPU pages back to the CPU (BufferCache::TryResolveWrittenBack)
+// while the GPU thread keeps re-binding writable ranges. As in the buffer cache, a
+// page is handed back only while no bind of it is in flight. Once the fault thread
+// stops, one more bind of each range must own every page again.
+void TestConcurrentHandBacksAreNeverMissed() {
+  constexpr uintptr_t base = 0x0000000208000000ull;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = AllocateRegions(base, 3);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  constexpr std::pair<uint64_t, uint64_t> ranges[] = {
+      {page_size * 3, region_size * 3 - page_size * 8},
+      {region_size, region_size},
+      {page_size * 10, page_size * 20},
+      {region_size * 2 + page_size * 50, page_size}};
+  constexpr uint64_t first_page = 3;
+  constexpr uint64_t last_page = (region_size * 3 - page_size * 5) / page_size;
+
+  std::mutex writeback_mutex;
+  std::set<uint64_t> writeback_pages;
+  const auto bind = [&](uint64_t offset, uint64_t size) {
+    {
+      std::lock_guard lock(writeback_mutex);
+      writeback_pages.erase(writeback_pages.lower_bound(offset / page_size),
+                            writeback_pages.upper_bound((offset + size - 1) /
+                                                        page_size));
+    }
+    tracker.ForEachUploadRange(
+        address + offset, size, true, [](uint64_t, uint64_t) noexcept {},
+        []() noexcept {});
+  };
+  for (const auto &[offset, size] : ranges) {
+    bind(offset, size);
+  }
+
+  std::atomic_bool done{false};
+  std::atomic_uint64_t handed_back{0};
+  std::jthread faults([&] {
+    uint64_t random = 0x9e3779b97f4a7c15ull;
+    while (!done.load(std::memory_order_acquire)) {
+      random ^= random << 13;
+      random ^= random >> 7;
+      random ^= random << 17;
+      const auto page = first_page + random % (last_page - first_page);
+      std::lock_guard lock(writeback_mutex);
+      if (writeback_pages.erase(page) == 0) {
+        continue;
+      }
+      tracker.UnmarkRegionAsGpuModified(address + page * page_size, page_size);
+      if ((random & 1) != 0) {
+        tracker.MarkRegionAsCpuModified(address + page * page_size, 8);
+      }
+      handed_back.fetch_add(1, std::memory_order_relaxed);
+    }
+  });
+  uint64_t random = 0xda942042e4dd58b5ull;
+  for (uint32_t pass = 0; pass < 20000; pass++) {
+    const auto &[offset, size] = ranges[pass % std::size(ranges)];
+    bind(offset, size);
+    // RecordWritebacks: some GPU-owned pages become eligible for hand-back.
+    std::lock_guard lock(writeback_mutex);
+    for (uint32_t i = 0; i < 4; i++) {
+      random ^= random << 13;
+      random ^= random >> 7;
+      random ^= random << 17;
+      writeback_pages.insert(first_page + random % (last_page - first_page));
+    }
+  }
+  done.store(true, std::memory_order_release);
+  faults.join();
+  Check(handed_back.load(std::memory_order_relaxed) != 0,
+        "hand-back thread never ran");
+
+  for (const auto &[offset, size] : ranges) {
+    bind(offset, size);
+  }
+  for (auto page = first_page; page < last_page; page++) {
+    Check(tracker.IsRegionGpuModified(address + page * page_size, page_size) &&
+              !tracker.IsRegionCpuModified(address + page * page_size, page_size),
+          "a page handed back during repeated binds was never reacquired");
+  }
+
+  tracker.UnmarkRegionAsGpuModified(address, region_size * 3);
+  tracker.MarkRegionAsCpuModified(address, region_size * 3);
+  tracker.UntrackMemory(address, region_size * 3);
+  Release(memory);
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+MemoryTracker *g_fault_tracker = nullptr;
+std::atomic_uint64_t g_fault_begin{0};
+std::atomic_uint64_t g_fault_end{0};
+
+// What BufferCache::InvalidateMemory does for a write to a clean protected page.
+bool HandleTrackedWrite(const Common::HostException::ExceptionInfo &info) {
+  using namespace Common::HostException;
+  const auto address = info.access_violation_vaddr;
+  if (info.type != ExceptionType::AccessViolation ||
+      info.access_violation_type != AccessViolationType::Write ||
+      address < g_fault_begin.load() || address >= g_fault_end.load()) {
+    return false;
+  }
+  g_fault_tracker->InvalidateRegion(address, 1, [] { std::_Exit(3); });
+  return true;
+}
+
+// CPU writes fault and invalidate pages on one thread while another keeps
+// re-synchronizing the same ranges (taking the repeat shortcut whenever it can)
+// into a copy. Once the writer stops, one more sync must bring every write over.
+void TestConcurrentCpuWritesAreNeverMissed() {
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  constexpr uint64_t pages = 64;
+  constexpr uint64_t size = page_size * pages;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = Allocate(harness.page_manager, pages);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  std::vector<uint8_t> copy(size);
+
+  const auto sync = [&](uint64_t first_page, uint64_t count) {
+    std::vector<std::pair<uint64_t, uint64_t>> uploads;
+    tracker.ForEachUploadRange(
+        address + first_page * page_size, count * page_size, false,
+        [&](uint64_t range, uint64_t bytes) noexcept {
+          uploads.push_back({range, bytes});
+        },
+        [&]() noexcept {
+          for (const auto &[range, bytes] : uploads) {
+            std::memcpy(copy.data() + (range - address),
+                        reinterpret_cast<const void *>(range), bytes);
+          }
+        });
+  };
+  // A few ranges bound over and over, overlapping each other.
+  constexpr std::pair<uint64_t, uint64_t> ranges[] = {
+      {0, pages}, {0, 16}, {8, 8}, {20, 30}, {63, 1}, {32, 32}};
+  for (const auto &[first, count] : ranges) {
+    sync(first, count);
+  }
+
+  g_fault_tracker = &tracker;
+  g_fault_begin.store(address);
+  g_fault_end.store(address + size);
+  Check(Common::HostException::InstallHandler(HandleTrackedWrite),
+        "install tracked-write handler failed");
+
+  std::atomic_bool done{false};
+  std::jthread writer([&] {
+    uint64_t random = 0x2545f4914f6cdd1dull;
+    for (uint64_t value = 1; value <= 4000; value++) {
+      random ^= random << 13;
+      random ^= random >> 7;
+      random ^= random << 17;
+      const auto slot = random % (size / sizeof(uint64_t));
+      reinterpret_cast<volatile uint64_t *>(memory)[slot] = value;
+    }
+    done.store(true, std::memory_order_release);
+  });
+  uint64_t passes = 0;
+  while (!done.load(std::memory_order_acquire)) {
+    const auto &[first, count] = ranges[passes++ % std::size(ranges)];
+    sync(first, count);
+  }
+  writer.join();
+  for (const auto &[first, count] : ranges) {
+    sync(first, count);
+  }
+  Check(std::memcmp(copy.data(), memory, size) == 0,
+        "a CPU write racing repeated syncs never reached the copy");
+
+  g_fault_end.store(g_fault_begin.load());
+  tracker.MarkRegionAsCpuModified(address, size);
+  tracker.UntrackMemory(address, size);
+  Release(memory);
+}
+#endif
+
 [[noreturn]] void RunDeathCase(const char *name) {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1294,9 +1684,16 @@ int main(int argc, char **argv) {
   TestDownloadDoesNotSerializeDisjointRegion();
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
+  TestRepeatedSyncSkipsUnchangedRange();
+  TestSyncRecordInvalidation();
+  TestWrittenSyncSkipsGpuOwnedRegions();
+  TestUnlockedModificationQueries();
+  TestConcurrentHandBacksAreNeverMissed();
   TestFatalPaths();
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
   TestFaultOnProtectedStack();
+  // Last: it leaves its write-fault handler installed.
+  TestConcurrentCpuWritesAreNeverMissed();
 #endif
   std::puts("MemoryTrackerTests: all cases passed");
   return 0;

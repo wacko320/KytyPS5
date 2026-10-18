@@ -364,6 +364,13 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
+	const auto bytes = static_cast<uint64_t>(write_one_address ? 1u : dw_num) * sizeof(uint32_t);
+	// Repeated writes to one address leave the last.
+	const auto* data = write_one_address ? src + (dw_num - 1u) : src;
+	if (m_renderer.TryWriteGpuOrdered(reinterpret_cast<uint64_t>(dst), data, bytes)) {
+		return;
+	}
+	m_renderer.PrepareGpuThreadWrite(reinterpret_cast<uint64_t>(dst), bytes);
 	if (write_one_address) {
 		for (uint32_t i = 0; i < dw_num; i++) {
 			dst[0] = src[i];
@@ -380,6 +387,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		     num_bytes);
 	}
 	const auto value = Sync::ReadReferenceClock();
+	m_renderer.PrepareGpuThreadWrite(dst_address, num_bytes);
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
