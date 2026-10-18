@@ -13,6 +13,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
+#include "graphics/shader/recompiler/frontend/decode/CallLinker.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
@@ -34,6 +35,7 @@
 
 #include <algorithm>
 #include <array>
+#include <map>
 #include <bit>
 #include <cstdint>
 #include <cstdio>
@@ -2281,6 +2283,28 @@ void TestDisabledDebugBranches() {
           "disabled debug branch lost its identity or fallthrough write");
     CheckSpirvBinaryValidates(result.spirv);
   }
+}
+
+void TestScalarDefinitionThroughJoin() {
+  using namespace ShaderRecompiler;
+  // s4 is written once before a branch whose two paths join: both reach the same definition.
+  const uint32_t shader[] = {
+      EncodeSMovB32(4, 135), // s_mov_b32 s4, 7
+      EncodeSopp(0x04, 1),   // s_cbranch_scc0 to the join
+      EncodeSMovB32(5, 129), // s_mov_b32 s5, 1
+      EncodeSopp(0x00),      // join: s_nop
+      EncodeSopp(0x01),      // s_endpgm
+  };
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(shader, decoded);
+  const auto graph = CFG::BuildGraph(decoded);
+  const auto* join = graph.FindBlockByPc(12u);
+  Check(join != nullptr && join->predecessors.size() == 2u,
+        "scalar definition test lost its join block");
+  Check(CFG::FindScalarDefinition(decoded, graph, 3u, 4u) == 0u,
+        "a join whose paths share a scalar definition did not resolve to it");
+  Check(CFG::FindScalarDefinition(decoded, graph, 3u, 8u) == UINT32_MAX,
+        "a scalar register no path writes did not resolve to the entry");
 }
 
 void TestNewShaderRecompilerRdna2ScalarOpcodes() {
@@ -11104,6 +11128,148 @@ void TestMemoryFedScalarLeafCall() {
 #endif
 }
 
+// CompileOptions::table_calls: two S_SWAPPC_B64 sites, which upstream's single-leaf linking
+// rejects, link through their code-pointer tables. The linked program is rebuilt only when a
+// site's targets change.
+void TestTableCallsLinkThroughShaderSource() {
+  using namespace ShaderRecompiler;
+  constexpr uint64_t CalleeA = 0x0000000100000000ull;
+  constexpr uint64_t CalleeB = 0x0000000200000000ull;
+  constexpr uint64_t Table = 0x0000000300000000ull;
+  std::vector<uint32_t> code;
+  for (const auto [offset, pair] : {std::pair{16u, 30u}, std::pair{24u, 32u}}) {
+    code.push_back(EncodeSmem0(0x09, 20, 0)); // s_buffer_load_dwordx2 s[20:21], s[0:3], offset
+    code.push_back(offset | (0x7du << 25u));
+    code.push_back(EncodeSopp(0x0c, 0));      // s_waitcnt 0
+    code.push_back(EncodeSop1(0x04, pair, 20)); // s_mov_b64 s[pair], s[20:21]
+    code.push_back(EncodeSop1(0x21, pair, pair)); // s_swappc_b64 s[pair], s[pair]
+  }
+  code.push_back(EncodeSopp(0x01));
+  // Each callee returns through its site's pair.
+  constexpr uint64_t CalleeC = 0x0000000400000000ull;
+  std::map<uint64_t, uint32_t> memory;
+  for (const auto [callee, pair] : {std::pair{CalleeA, 30u}, std::pair{CalleeB, 32u},
+                                    std::pair{CalleeC, 32u}}) {
+    memory[callee] = EncodeSMovB32(40, 129);        // s_mov_b32 s40, 1
+    memory[callee + 4] = EncodeSop1(0x20, 0, pair); // s_setpc_b64 s[pair]
+  }
+  const auto set_pointer = [&](uint32_t offset, uint64_t pointer) {
+    memory[Table + offset] = static_cast<uint32_t>(pointer);
+    memory[Table + offset + 4] = static_cast<uint32_t>(pointer >> 32u);
+  };
+  set_pointer(16, CalleeA);
+  set_pointer(24, CalleeB);
+  const auto read = [](void *data, uint64_t address, std::span<uint32_t> out) {
+    const auto &words = *static_cast<std::map<uint64_t, uint32_t> *>(data);
+    for (size_t i = 0; i < out.size(); ++i) {
+      const auto found = words.find(address + i * 4u);
+      out[i] = found != words.end() ? found->second : 0u;
+    }
+    return true;
+  };
+  std::array<uint32_t, 64> user_data{};
+  user_data[0] = static_cast<uint32_t>(Table);
+  user_data[1] = static_cast<uint32_t>(Table >> 32u);
+  user_data[2] = 64u;
+  user_data[3] = 3u << 28u;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  options.table_calls = true;
+  IR::SrtRuntime runtime{.user_data = user_data, .read_memory = read, .userdata = &memory,
+                         .read_specialization_memory = read};
+  auto source = PrepareShaderSource(code, options);
+  Check(source.call && source.table && source.table->analysis.sites.size() == 2u,
+        "table calls did not analyze both call sites");
+  const auto *linked = &RefreshShaderSource(source, runtime);
+  Check(!linked->has_swap_pc && source.revision == 1 && source.reads.empty() &&
+            source.linked->key.size() == 3u &&
+            source.table->targets == std::vector<std::vector<uint64_t>>{{CalleeA}, {CalleeB}},
+        "table calls did not link both sites");
+  (void)TranslateProgram(*linked, options);
+  const auto key = source.linked->key;
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 1 && source.linked->key == key,
+        "unchanged call targets relinked the program");
+  set_pointer(24, CalleeC);
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 2 && source.linked->key != key &&
+            source.table->targets[1] == std::vector<uint64_t>{CalleeC},
+        "a new table pointer did not relink the program");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  auto leaf_only = options;
+  leaf_only.table_calls = false;
+  ExpectFatal([&] { (void)PrepareShaderSource(code, leaf_only); },
+              "several calls were accepted without table calls");
+  // Calls whose targets come from no table are still rejected.
+  const uint32_t multiple[] = {EncodeSop1(0x21, 14, 14), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
+  ExpectFatal([&] { (void)PrepareShaderSource(multiple, options); },
+              "table calls accepted calls without a code-pointer table");
+#endif
+}
+
+// CompileOptions::table_calls: a call source whose paths reach different definitions is not one
+// uniform value, so the single-leaf search hands the call to table mode instead of exiting. Here a
+// 32-bit write of s11 on one path counts as a possible write of the SRT pair s[12:13] that the
+// table descriptor is loaded through, while the other path reaches it as user data.
+void TestTableCallsTakeSourcesWithDifferingDefinitions() {
+  using namespace ShaderRecompiler;
+  constexpr uint64_t Callee = 0x0000000100000000ull;
+  constexpr uint64_t Srt = 0x0000000200000000ull;
+  constexpr uint64_t Table = 0x0000000300000000ull;
+  const uint32_t code[] = {
+      EncodeSopp(0x04, 1),            // s_cbranch_scc0 to the join
+      EncodeSMovB32(11, 129),         // s_mov_b32 s11, 1
+      EncodeSmem0(0x02, 4, 6),        // join: s_load_dwordx4 s[4:7], s[12:13], 0x10
+      0x10u | (0x7du << 25u),
+      EncodeSopp(0x0c, 0),            // s_waitcnt 0
+      EncodeSmem0(0x09, 20, 2),       // s_buffer_load_dwordx2 s[20:21], s[4:7], 16
+      16u | (0x7du << 25u),
+      EncodeSopp(0x0c, 0),            // s_waitcnt 0
+      EncodeSop1(0x04, 30, 20),       // s_mov_b64 s[30:31], s[20:21]
+      EncodeSop1(0x21, 30, 30),       // s_swappc_b64 s[30:31], s[30:31]
+      EncodeSopp(0x01),
+  };
+  std::map<uint64_t, uint32_t> memory;
+  memory[Srt + 0x10] = static_cast<uint32_t>(Table);
+  memory[Srt + 0x14] = static_cast<uint32_t>(Table >> 32u);
+  memory[Srt + 0x18] = 64u;
+  memory[Srt + 0x1c] = 3u << 28u;
+  memory[Table + 16] = static_cast<uint32_t>(Callee);
+  memory[Table + 20] = static_cast<uint32_t>(Callee >> 32u);
+  memory[Callee] = EncodeSMovB32(40, 129);     // s_mov_b32 s40, 1
+  memory[Callee + 4] = EncodeSop1(0x20, 0, 30); // s_setpc_b64 s[30:31]
+  const auto read = [](void *data, uint64_t address, std::span<uint32_t> out) {
+    const auto &words = *static_cast<std::map<uint64_t, uint32_t> *>(data);
+    for (size_t i = 0; i < out.size(); ++i) {
+      const auto found = words.find(address + i * 4u);
+      out[i] = found != words.end() ? found->second : 0u;
+    }
+    return true;
+  };
+  std::array<uint32_t, 64> user_data{};
+  user_data[12] = static_cast<uint32_t>(Srt);
+  user_data[13] = static_cast<uint32_t>(Srt >> 32u);
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  options.table_calls = true;
+  IR::SrtRuntime runtime{.user_data = user_data, .read_memory = read, .userdata = &memory,
+                         .read_specialization_memory = read};
+  auto source = PrepareShaderSource(code, options);
+  Check(source.call && source.table && source.table->analysis.sites.size() == 1u,
+        "a call source with differing reaching definitions did not fall back to table calls");
+  const auto &linked = RefreshShaderSource(source, runtime);
+  Check(!linked.has_swap_pc &&
+            source.table->targets == std::vector<std::vector<uint64_t>>{{Callee}},
+        "a call source with differing reaching definitions did not link its table target");
+  (void)TranslateProgram(linked, options);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  auto leaf_only = options;
+  leaf_only.table_calls = false;
+  ExpectFatal([&] { (void)PrepareShaderSource(code, leaf_only); },
+              "differing reaching definitions were accepted without table calls");
+#endif
+}
+
 void TestNewShaderRecompilerSetpcBranch() {
   const uint32_t shader[] = {
       EncodeSop1(0x1f, 4, 0),      // s_getpc_b64 s[4:5]
@@ -16712,10 +16878,95 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 } // namespace
 } // namespace Libs::Graphics
 
+// The call shape of Rift Apart's ray-tracing kernels: a hit group's code pointer comes from a
+// 16-byte record of a table whose V# the SRT holds, and the waterfall copies it into the call
+// pair.
+void TestCallTableAnalysis() {
+  using namespace Libs::Graphics;
+  namespace D = Libs::Graphics::ShaderRecompiler::Decoder;
+  std::vector<uint32_t> code;
+  code.push_back(EncodeSmem0(0x02, 16, 6)); // s_load_dwordx4 s[16:19], s[12:13], 0x270
+  code.push_back(0x270u | (125u << 25u));
+  code.push_back(EncodeSop2(0x1e, 106, 106, 132)); // s_lshl_b32 vcc_lo, vcc_lo, 4
+  code.push_back(EncodeSmem0(0x0a, 8, 8)); // s_buffer_load_dwordx4 s[8:11], s[16:19], vcc_lo
+  code.push_back(106u << 25u);
+  code.push_back(EncodeSopp(0x0c, 0));      // s_waitcnt 0
+  code.push_back(EncodeSMovB32(14, 8));
+  code.push_back(EncodeSMovB32(15, 9));
+  code.push_back(EncodeSop1(0x21, 14, 14)); // s_swappc_b64 s[14:15], s[14:15]
+  code.push_back(EncodeSopp(0x01));         // s_endpgm
+  Check(D::MayContainCalls(code), "call prefilter must see S_SWAPPC_B64");
+
+  const auto analysis = D::AnalyzeCalls(code, 64);
+  Check(analysis.failure.empty() && analysis.sites.size() == 1u,
+        ("call table must resolve: " + analysis.failure).c_str());
+  const auto &site = analysis.sites[0];
+  Check(site.pc == 0x20u && site.return_sgpr == 14u && site.pointer_sgpr == 14u &&
+            !site.descriptor_in_user_data && site.srt_sgpr == 12u &&
+            site.descriptor_offset == 0x270u && site.record_stride == 16u &&
+            site.pointer_offset == 0u,
+        "call table must describe the SRT descriptor and record stride");
+
+  // Guest memory: the SRT at 0x1000 holds the V# of a four-record table at 0x2000.
+  std::map<uint64_t, uint32_t> memory;
+  const uint32_t descriptor[4] = {0x2000u, 16u << 16u, 4u, 0u};
+  for (uint32_t i = 0; i < 4; i++) memory[0x1000 + 0x270 + i * 4] = descriptor[i];
+  const uint64_t pointers[4] = {0x7000100ull, 0, 0x7000100ull, 0x5000200ull};
+  for (uint32_t i = 0; i < 4; i++) {
+    memory[0x2000 + i * 16] = static_cast<uint32_t>(pointers[i]);
+    memory[0x2000 + i * 16 + 4] = static_cast<uint32_t>(pointers[i] >> 32u);
+    memory[0x2000 + i * 16 + 8] = 0xdeadbeefu;
+  }
+  const D::ReadGuestWords read = [&](uint64_t address, std::span<uint32_t> words) {
+    for (size_t i = 0; i < words.size(); i++) {
+      const auto found = memory.find(address + i * 4);
+      words[i] = found != memory.end() ? found->second : 0u;
+    }
+    return true;
+  };
+  std::array<uint32_t, 16> user_data{};
+  user_data[12] = 0x1000u;
+  std::vector<uint64_t> targets;
+  std::string failure;
+  Check(D::ReadCallTargets(site, user_data, read, targets, failure),
+        ("call targets must be readable: " + failure).c_str());
+  Check(targets == std::vector<uint64_t>{0x5000200ull, 0x7000100ull},
+        "call targets must be the distinct non-null record pointers");
+}
+
+// Linked programs: PcOverride replaces a branch target beyond a SOPP's 16-bit reach and the PC an
+// S_GETPC_B64 reads.
+void TestDecoderPcOverrides() {
+  using namespace Libs::Graphics;
+  using namespace Libs::Graphics::ShaderRecompiler;
+  constexpr uint32_t Far = 40000u; // words, beyond a SOPP's 32K-word reach
+  std::vector<uint32_t> code;
+  code.push_back(EncodeSop1(0x1f, 4, 0)); // s_getpc_b64 s[4:5]
+  code.push_back(EncodeSopp(0x02, 0));    // s_branch, retargeted to Far
+  code.resize(Far, EncodeSopp(0x00));     // s_nop padding
+  code.push_back(EncodeSopp(0x01));       // s_endpgm
+  const std::array<Decoder::PcOverride, 2> overrides{
+      Decoder::PcOverride{.pc = 0u, .value = 0x1234u, .getpc = true},
+      Decoder::PcOverride{.pc = 4u, .value = Far * 4u}};
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(code, decoded, overrides);
+  Check(decoded.instructions.size() == Far + 1u &&
+            decoded.instructions[0].getpc_origin == 0x1234u &&
+            decoded.instructions[1].branch_target == Far * 4u,
+        "decoder PC overrides were not applied while decoding");
+  Decoder::Program plain;
+  Decoder::DecodeProgram(code, plain);
+  Check(plain.instructions.size() == Far + 1u && plain.instructions[0].getpc_origin == UINT32_MAX &&
+            plain.instructions[1].branch_target == 8u,
+        "decoding without overrides changed");
+}
+
 int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  TestDecoderPcOverrides();
+  TestCallTableAnalysis();
   TestRayTracingInstructions();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
@@ -16845,6 +17096,8 @@ int main() {
   TestNewShaderRecompilerSetpcBranch();
   TestGraphicsComputeGetreg();
   TestMemoryFedScalarLeafCall();
+  TestTableCallsLinkThroughShaderSource();
+  TestTableCallsTakeSourcesWithDifferingDefinitions();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();
@@ -16910,6 +17163,7 @@ int main() {
   TestCapturedBufferStoreFormatD16HiXDecode();
   TestCapturedBufferStoreD16XyzwDecode();
   TestNewShaderRecompilerUnsupportedMemoryDecode();
+  TestScalarDefinitionThroughJoin();
 
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
 

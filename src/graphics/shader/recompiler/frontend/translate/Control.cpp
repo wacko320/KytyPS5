@@ -212,8 +212,9 @@ void Translator::S_INST_PREFETCH() {
 
 void Translator::S_GETPC_B64(const Decoder::Instruction& inst) {
 	const auto base    = IR::U64(ir.Emit(IR::ValueOpcode::GetShaderBase));
+	const auto pc      = inst.getpc_origin != UINT32_MAX ? inst.getpc_origin : inst.pc;
 	const auto address = IR::U64(
-	    ir.Emit(IR::ValueOpcode::IAdd64, {base, IR::Value(static_cast<uint64_t>(inst.pc) + 4u)}));
+	    ir.Emit(IR::ValueOpcode::IAdd64, {base, IR::Value(static_cast<uint64_t>(pc) + 4u)}));
 	if (inst.dst.kind == Decoder::OperandKind::Null) {
 		return;
 	}

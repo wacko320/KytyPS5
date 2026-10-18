@@ -408,7 +408,8 @@ Program DecodeFrontProgram(std::span<const uint32_t> front) {
 	return result;
 }
 
-void DecodeProgram(std::span<const uint32_t> code, Program& program) {
+void DecodeProgram(std::span<const uint32_t> code, Program& program,
+                   std::span<const PcOverride> overrides) {
 	program.instructions.clear();
 	program.instructions.reserve(code.size());
 	program.code = code;
@@ -419,7 +420,16 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 		program.instructions.emplace_back();
 		DecodeInstruction(code, word_index, program.instructions.back());
 
-		const auto& inst = program.instructions.back();
+		auto& inst = program.instructions.back();
+		while (!overrides.empty() && overrides.front().pc < inst.pc) {
+			overrides = overrides.subspan(1);
+		}
+		if (!overrides.empty() && overrides.front().pc == inst.pc) {
+			const auto& entry = overrides.front();
+			EXIT_IF(entry.getpc != (inst.opcode == Opcode::S_GETPC_B64));
+			EXIT_IF(!entry.getpc && !IsDirectBranch(inst.opcode));
+			(entry.getpc ? inst.getpc_origin : inst.branch_target) = entry.value;
+		}
 		program.has_swap_pc |= inst.opcode == Opcode::S_SWAPPC_B64;
 		word_index += inst.word_count;
 

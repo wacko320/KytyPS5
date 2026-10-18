@@ -44,6 +44,7 @@
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/frontend/decode/CallLinker.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/BindlessImages.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -1363,6 +1364,8 @@ struct TestCase {
   std::vector<uint64_t> expected_fault_pages;
   u32 loop_watchdog_limit = 0;
   bool untracked_writes = false;
+  // Decoder overrides for linked code (Decoder::LinkCalls).
+  std::vector<ShaderRecompiler::Decoder::PcOverride> pc_overrides;
   // Bindless heap for images whose T# the GPU computes (CompileOptions::bindless_images): the
   // table either holds the shader's T# (user data s[0:7]) at slot 1, the test's sampled image, or
   // is empty, and the miss must then be recorded.
@@ -1701,7 +1704,13 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   options.untracked_writes = test.untracked_writes;
   options.bindless_images = test.bindless_table != TestCase::BindlessTable::None;
 
-  auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
+  ShaderRecompiler::Decoder::Program decoded;
+  if (!test.pc_overrides.empty()) {
+    ShaderRecompiler::Decoder::DecodeProgram(test.code, decoded, test.pc_overrides);
+  }
+  auto translated = test.pc_overrides.empty()
+                        ? ShaderRecompiler::TranslateProgram(test.code, options)
+                        : ShaderRecompiler::TranslateProgram(decoded, options);
   auto resource_plan =
       ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
@@ -32175,6 +32184,171 @@ TestCase BufferLoadUbyteGpuSelectedDescriptors64() {
   return BufferLoadGpuSelectedDescriptors(64u, ShaderOpcode::BUFFER_LOAD_UBYTE);
 }
 
+// S_SWAPPC_B64 through a pointer read from the test buffer: the linker stitches both callees
+// into the program, the matching one runs and returns, and a pointer outside the table skips
+// the call.
+TestCase LinkedCallSelectsCallee(u32 variant, u32 padding = 0) {
+  using O = ShaderOpcode;
+  namespace D = ShaderRecompiler::Decoder;
+  constexpr uint64_t kCalleeA = 0x0000000100000000ull;
+  constexpr uint64_t kCalleeB = 0x0000000200001000ull;
+  constexpr uint64_t kMiss = 0x0000000300000000ull;
+  const uint64_t pointer = variant == 0 ? kCalleeA : variant == 1 ? kCalleeB : kMiss;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 7);
+  code.push_back(EncodeSmem0(0x09, 20, 0)); // s_buffer_load_dwordx2 s[20:21], s[0:3], 16
+  code.push_back(EncodeSmem1(16, 0x7d));
+  code.push_back(EncodeSopp(0x0c, 0));      // s_waitcnt 0
+  code.push_back(EncodeSop1(0x04, 30, 20)); // s_mov_b64 s[30:31], s[20:21]
+  code.push_back(EncodeSop1(0x21, 30, 30)); // s_swappc_b64 s[30:31], s[30:31]
+  code.push_back(EncodeVop2(0x25, 1, InlineU32(1), 1)); // v1 += 1 after the return
+  AppendStoreVgpr(&code, 1, 0);
+  AppendEnd(&code);
+
+  std::map<uint64_t, std::vector<u32>> callees;
+  auto &a = callees[kCalleeA];
+  // Padding pushes the callees past a branch's 32K-word reach, so the linker needs overrides.
+  a.assign(padding, EncodeSopp(0x00));
+  AppendVMovU32(&a, 1, 0x100);
+  a.push_back(EncodeSop1(0x20, 0, 30)); // s_setpc_b64 s[30:31]
+  auto &b = callees[kCalleeB];
+  b.assign(padding, EncodeSopp(0x00));
+  AppendVMovU32(&b, 1, 0x200);
+  b.push_back(EncodeSopp(0x02, 2)); // s_branch over the next v_mov and its literal
+  AppendVMovU32(&b, 1, 0x300);
+  b.push_back(EncodeVop2(0x25, 1, InlineU32(2), 1)); // v1 += 2
+  b.push_back(EncodeSop1(0x20, 0, 30));
+
+  const D::ReadGuestWords read = [&](uint64_t address, std::span<uint32_t> words) {
+    std::fill(words.begin(), words.end(), 0u);
+    for (const auto &[base, body] : callees) {
+      if (address >= base && address < base + body.size() * 4u) {
+        const auto first = (address - base) / 4u;
+        std::copy_n(body.begin() + first,
+                    std::min<size_t>(words.size(), body.size() - first),
+                    words.begin());
+      }
+    }
+    return true;
+  };
+  const auto analysis = D::AnalyzeCalls(code, 64);
+  Require("LinkedCallSelectsCallee", "call analysis",
+          analysis.failure.empty() && analysis.sites.size() == 1u &&
+              analysis.sites[0].descriptor_in_user_data &&
+              analysis.sites[0].descriptor_sgpr == 0u &&
+              analysis.sites[0].record_stride == 0u &&
+              analysis.sites[0].pointer_offset == 16u &&
+              analysis.sites[0].return_sgpr == 30u,
+          analysis.failure);
+  const std::vector<std::vector<uint64_t>> targets = {{kCalleeA, kCalleeB}};
+  auto linked = D::LinkCalls(code, analysis, targets, read);
+  Require("LinkedCallSelectsCallee", "call linking", linked.failure.empty(),
+          linked.failure);
+
+  TestCase test;
+  test.name = padding != 0  ? "LinkedCallReachesFarCallee"
+              : variant == 0 ? "LinkedCallSelectsCalleeA"
+              : variant == 1 ? "LinkedCallSelectsCalleeB"
+                             : "LinkedCallSkipsUnknownPointer";
+  test.code = std::move(linked.code);
+  test.pc_overrides = std::move(linked.overrides);
+  test.initial = {0x55555555u, 0, 0, 0, static_cast<u32>(pointer),
+                  static_cast<u32>(pointer >> 32u)};
+  test.expected = test.initial;
+  test.expected[0] = variant == 0 ? 0x101u : variant == 1 ? 0x203u : 8u;
+  test.opcodes = {O::V_MOV_B32,    O::S_BUFFER_LOAD_DWORDX2, O::S_WAITCNT,
+                  O::S_MOV_B64,    O::S_BRANCH,              O::S_CMP_EQ_U32,
+                  O::S_CBRANCH_SCC0, O::S_CBRANCH_SCC1,      O::V_ADD_NC_U32,
+                  O::BUFFER_STORE_DWORD, O::S_NOP,           O::S_ENDPGM};
+  return test;
+}
+
+// A call inside a loop: the linker places the callee after the call, so the loop's backedge
+// crosses it (beyond a branch's reach with padding), and an S_GETPC_B64 after the call still
+// reads its PC in the guest code.
+TestCase LinkedCallInLoop(u32 padding) {
+  using O = ShaderOpcode;
+  namespace D = ShaderRecompiler::Decoder;
+  constexpr uint64_t kCallee = 0x0000000100000000ull;
+  // A second copy of the callee that never runs, so that padding adds up past 32K words.
+  constexpr uint64_t kOther = 0x0000000100100000ull;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  code.push_back(EncodeSopk(0x00, 40, 3));  // s_movk_i32 s40, 3
+  const auto getpc_before = static_cast<u32>(code.size());
+  code.push_back(EncodeSop1(0x1f, 42, 0));  // s_getpc_b64 s[42:43]
+  const auto loop = static_cast<u32>(code.size());
+  code.push_back(EncodeSmem0(0x09, 20, 0)); // s_buffer_load_dwordx2 s[20:21], s[0:3], 16
+  code.push_back(EncodeSmem1(16, 0x7d));
+  code.push_back(EncodeSopp(0x0c, 0));      // s_waitcnt 0
+  code.push_back(EncodeSop1(0x04, 30, 20)); // s_mov_b64 s[30:31], s[20:21]
+  code.push_back(EncodeSop1(0x21, 30, 30)); // s_swappc_b64 s[30:31], s[30:31]
+  code.push_back(EncodeSop2(0x01, 40, 40, InlineU32(1))); // s_sub_u32 s40, s40, 1
+  code.push_back(EncodeSopc(0x07, 40, InlineU32(0)));     // s_cmp_lg_u32 s40, 0
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(loop - (code.size() + 1u)) & 0xffffu));
+  const auto getpc_after = static_cast<u32>(code.size());
+  code.push_back(EncodeSop1(0x1f, 44, 0));  // s_getpc_b64 s[44:45]
+  code.push_back(EncodeSop2(0x01, 44, 44, 42)); // s_sub_u32 s44, s44, s42
+  code.push_back(EncodeVop1(0x01, 2, 44));  // v_mov_b32 v2, s44
+  AppendStoreVgpr(&code, 1, 0);
+  AppendStoreVgpr(&code, 2, 1);
+  AppendEnd(&code);
+
+  std::vector<u32> callee(padding, EncodeSopp(0x00));
+  callee.push_back(EncodeVop2(0x25, 1, InlineU32(64), 1)); // v1 += 64
+  callee.push_back(EncodeSop1(0x20, 0, 30));               // s_setpc_b64 s[30:31]
+  const D::ReadGuestWords read = [&](uint64_t address, std::span<uint32_t> words) {
+    std::fill(words.begin(), words.end(), 0u);
+    const auto base = address >= kOther ? kOther + ((address - kOther) & ~0xfffffull) : kCallee;
+    if (address >= base && address < base + callee.size() * 4u) {
+      const auto first = (address - base) / 4u;
+      std::copy_n(callee.begin() + first, std::min<size_t>(words.size(), callee.size() - first),
+                  words.begin());
+    }
+    return true;
+  };
+  const auto analysis = D::AnalyzeCalls(code, 64);
+  Require("LinkedCallInLoop", "call analysis",
+          analysis.failure.empty() && analysis.sites.size() == 1u, analysis.failure);
+  std::vector<std::vector<uint64_t>> targets = {{kCallee, kOther}};
+  auto linked = D::LinkCalls(code, analysis, targets, read);
+  Require("LinkedCallInLoop", "call linking", linked.failure.empty(), linked.failure);
+  const bool far = std::ranges::any_of(linked.overrides, [](const D::PcOverride &entry) {
+    return !entry.getpc;
+  });
+  const bool moved = std::ranges::any_of(linked.overrides, [&](const D::PcOverride &entry) {
+    return entry.getpc && entry.value == getpc_after * 4u;
+  });
+  Require("LinkedCallInLoop", "overrides", far == (padding != 0) && moved,
+          "far branches and the moved S_GETPC_B64 need overrides");
+
+  TestCase test;
+  test.name = padding != 0 ? "LinkedCallInLoopReachesAcrossCallee" : "LinkedCallInLoop";
+  test.code = std::move(linked.code);
+  test.pc_overrides = std::move(linked.overrides);
+  test.initial = {0x55555555u, 0x55555555u, 0, 0, static_cast<u32>(kCallee),
+                  static_cast<u32>(kCallee >> 32u)};
+  test.expected = test.initial;
+  test.expected[0] = 3u * 64u;
+  test.expected[1] = (getpc_after - getpc_before) * 4u;
+  test.opcodes = {O::V_MOV_B32,      O::S_MOVK_I32,     O::S_GETPC_B64,
+                  O::S_BUFFER_LOAD_DWORDX2, O::S_WAITCNT, O::S_MOV_B64,
+                  O::S_NOP,          O::S_CMP_EQ_U32,   O::S_CBRANCH_SCC0,
+                  O::S_CBRANCH_SCC1, O::S_BRANCH,       O::V_ADD_NC_U32,
+                  O::S_SUB_U32,      O::S_CMP_LG_U32,   O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  return test;
+}
+
+TestCase LinkedCallSelectsCalleeA() { return LinkedCallSelectsCallee(0); }
+TestCase LinkedCallSelectsCalleeB() { return LinkedCallSelectsCallee(1); }
+TestCase LinkedCallSkipsUnknownPointer() { return LinkedCallSelectsCallee(2); }
+TestCase LinkedCallReachesFarCallee() { return LinkedCallSelectsCallee(1, 20000); }
+TestCase LinkedCallInLoopNear() { return LinkedCallInLoop(0); }
+TestCase LinkedCallInLoopReachesAcrossCallee() { return LinkedCallInLoop(17000); }
+
 // BUFFER_LOAD_FORMAT_XYZW and TBUFFER_LOAD_FORMAT_XYZ through V#s read from memory at a
 // GPU-computed offset: the format (the V#'s, or the instruction's for typed loads) and dst_sel are
 // decoded at run time by the shared conversion functions. Out of range, dst_sel constants still apply and typed loads
@@ -43549,6 +43723,12 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadUbyteGpuSelectedDescriptors);
   AddCase(BufferLoadUbyteGpuSelectedDescriptors64);
   AddCase(IndirectFormattedBufferLoads);
+  AddCase(LinkedCallSelectsCalleeA);
+  AddCase(LinkedCallSelectsCalleeB);
+  AddCase(LinkedCallSkipsUnknownPointer);
+  AddCase(LinkedCallReachesFarCallee);
+  AddCase(LinkedCallInLoopNear);
+  AddCase(LinkedCallInLoopReachesAcrossCallee);
   AddCase(BufferStoresGpuSelectedDescriptor);
   AddCase(BufferStoreDwordx4DropsOnlyOutOfBoundsTail);
   AddCase(BufferLoadFormatXyzwRejectsPartialRecord);

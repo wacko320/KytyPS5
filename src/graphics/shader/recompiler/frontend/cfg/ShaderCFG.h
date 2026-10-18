@@ -5,6 +5,8 @@
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
+#include <optional>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::CFG {
@@ -114,8 +116,14 @@ struct Graph {
 
 Graph       BuildGraph(const Decoder::Program& program);
 bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code);
+// The instruction whose write of scalar register `code` reaches `before`, or UINT32_MAX when
+// none does (user data). Exits when the paths reach different definitions or only cycle.
 uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
                               uint32_t before, uint32_t code);
+// As FindScalarDefinition, but returns nullopt with the reason instead of exiting.
+std::optional<uint32_t> TryFindScalarDefinition(const Decoder::Program& program,
+                                                const Graph& graph, uint32_t before, uint32_t code,
+                                                std::string& failure);
 // Returns structured control flow or failure diagnostics without changing the native graph.
 // On failure, failure_block is an original block ID or UINT32_MAX.
 Graph       Structurize(const Graph& graph);

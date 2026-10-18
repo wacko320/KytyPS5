@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/frontend/decode/CallLinker.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shader.h"
 
@@ -42,6 +43,10 @@ struct CompileOptions {
 	// not be specialized (MaterializeResources reported them). Tracking does not plan a table for
 	// them, so they are sampled through the bindless heap instead.
 	std::vector<uint32_t>       bindless_image_pcs;
+	// Calls upstream's single-leaf linking cannot take (several S_SWAPPC_B64s, a target that is
+	// not a uniform runtime value, a callee that is not a scalar leaf) are linked through their
+	// code-pointer tables (Decoder::LinkCalls) instead of failing.
+	bool                        table_calls         = false;
 };
 
 struct TranslateResult {
@@ -67,12 +72,24 @@ struct ShaderSource {
 		std::vector<uint32_t> code;
 		Decoder::Program decoded;
 		std::vector<uint32_t> observed_function;
+		// Identifies the linked code for the pipeline cache: the callee's words (leaf), or a
+		// hash and the size of the linked code (table calls).
+		std::vector<uint32_t> key;
+	};
+	// CompileOptions::table_calls: the call sites, linked with each site's targets.
+	struct TableCalls {
+		Decoder::CallAnalysis              analysis;
+		std::vector<std::vector<uint64_t>> targets;
 	};
 	std::vector<uint32_t> code;
 	Decoder::Program decoded;
 	IR::ResourcePlan call_targets;
+	// The leaf call; with table calls, the first call site (its target is not queried).
 	std::optional<Call> call;
+	std::optional<TableCalls> table;
 	std::optional<Linked> linked;
+	bool     table_calls = false;
+	uint32_t wave_size   = 64;
 	uint64_t revision = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> reads;
 };

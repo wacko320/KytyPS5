@@ -239,10 +239,10 @@ struct PipelineCache::ProgramCache {
 			permutations.reserve(8);
 		}
 
+		// The linked code's key: the leaf callee's words, or a hash of a table-linked program.
 		std::span<const uint32_t> FunctionCode() const {
-			return call_source
-			    ? std::span<const uint32_t>(call_source->linked->code).subspan(call_source->code.size())
-			    : std::span<const uint32_t>{};
+			return call_source ? std::span<const uint32_t>(call_source->linked->key)
+			                   : std::span<const uint32_t>{};
 		}
 
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {
@@ -435,6 +435,7 @@ struct PipelineCache::ProgramCache {
 		options.loop_watchdog_limit = Config::ShaderLoopLimit();
 		options.untracked_writes    = true;
 		options.bindless_images     = true;
+		options.table_calls         = true;
 		options.user_data   = user_data;
 		options.back_code      = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;

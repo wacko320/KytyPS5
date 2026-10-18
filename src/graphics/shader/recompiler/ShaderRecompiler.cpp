@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
+#include "graphics/shader/recompiler/frontend/decode/CallLinker.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
@@ -25,6 +26,7 @@
 #include <map>
 #include <span>
 #include <utility>
+#include <xxhash.h>
 
 namespace Libs::Graphics::ShaderRecompiler {
 
@@ -481,11 +483,19 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 	return result;
 }
 
-void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
+// Prepares upstream's single-leaf call. With CompileOptions::table_calls, returns false instead of
+// exiting for a call it cannot take: several calls, a target that is not a uniform runtime value,
+// or a target the search cannot pin to one definition.
+bool TryPrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 	using namespace IR;
 	for (uint32_t i = 0; i < source.decoded.instructions.size(); ++i) {
 		if (source.decoded.instructions[i].opcode != Decoder::Opcode::S_SWAPPC_B64) continue;
-		EXIT_NOT_IMPLEMENTED(source.call.has_value() || options.stage != ShaderType::Compute);
+		EXIT_NOT_IMPLEMENTED(options.stage != ShaderType::Compute);
+		if (source.call.has_value() && options.table_calls) {
+			source.call.reset();
+			return false;
+		}
+		EXIT_NOT_IMPLEMENTED(source.call.has_value());
 		source.call = ShaderSource::Call {.instruction = i};
 	}
 	EXIT_IF(options.input_info.compute == nullptr);
@@ -523,8 +533,18 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 		for (size_t i = 0; i < inst->NumArgs(); ++i) inst->SetArg(i, Resolve(before, inst->Arg(i)));
 		return value;
 	};
+	// A source the search cannot pin to one definition (paths that reach different ones, or a
+	// definition that turns out not to write it) is not one uniform value: table mode links it.
+	std::string unresolved;
 	Register = [&](uint32_t before, uint32_t code) -> Value {
-		const auto index = CFG::FindScalarDefinition(source.decoded, graph, before, code);
+		if (!unresolved.empty()) return Value(0u);
+		const auto found = CFG::TryFindScalarDefinition(source.decoded, graph, before, code, unresolved);
+		if (!found.has_value()) {
+			EXIT_IF(unresolved.empty());
+			if (!options.table_calls) EXIT("%s\n", unresolved.c_str());
+			return Value(0u);
+		}
+		const auto index = *found;
 		if (index == UINT32_MAX) {
 			EXIT_IF(code < query.user_data_base || code - query.user_data_base >= query.user_data_count);
 			return IREmitter(&block).GetUserData(static_cast<ScalarReg>(code));
@@ -554,11 +574,26 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 			block.Instructions().splice(block.end(), translated.Instructions());
 			producer.ready = true;
 		}
-		EXIT_IF(!producer.ready || !producer.values.contains(code));
+		EXIT_IF(!producer.ready);
+		if (!producer.values.contains(code)) {
+			// The search counts a 32-bit write as a possible pair write; this one is not.
+			unresolved = fmt::format("scalar shader call source s{} is not written by its definition {}",
+			    code, Decoder::InstructionToString(source.decoded.instructions[index]));
+			if (!options.table_calls) EXIT("%s\n", unresolved.c_str());
+			return Value(0u);
+		}
 		return producer.values.at(code).Resolve();
 	};
 	for (uint32_t i = 0; i < 2u; ++i) {
 		const auto value = Register(source.call->instruction, call.src0.reg + i);
+		if (!unresolved.empty()) {
+			source.call.reset();
+			return false;
+		}
+		if (options.table_calls && !ValidateRuntimeValue(query, value, RuntimeValueType::Integer)) {
+			source.call.reset();
+			return false;
+		}
 		EXIT_IF(!ValidateRuntimeValue(query, value, RuntimeValueType::Integer));
 		auto& root = query.value_storage.emplace_back(ValueOpcode::ReferenceU32);
 		root.SetArg(0, value);
@@ -577,6 +612,76 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 	}
 	query.value_storage.splice(query.value_storage.end(), block.Instructions());
 	source.call_targets = std::move(static_cast<ResourcePlan&>(query));
+	return true;
+}
+
+// Table mode (CompileOptions::table_calls): the call sites and the tables their targets come
+// from. Exits when the calls cannot be analyzed.
+void PrepareTableCalls(ShaderSource& source, std::span<const uint32_t> user_data) {
+	auto& table    = source.table.emplace();
+	table.analysis = Decoder::AnalyzeCalls(source.code, source.wave_size);
+	if (!table.analysis.failure.empty()) {
+		EXIT("shader calls cannot be linked: %s\n", table.analysis.failure.c_str());
+	}
+	for (const auto& site: table.analysis.sites) {
+		const auto [first, count] =
+		    site.pointer_in_user_data      ? std::pair {site.pointer_user_sgpr, 2u}
+		    : site.descriptor_in_user_data ? std::pair {site.descriptor_sgpr, 4u}
+		                                   : std::pair {site.srt_sgpr, 2u};
+		if (first + count > user_data.size()) {
+			EXIT("shader call at pc 0x%08x reads its target outside the user SGPRs\n", site.pc);
+		}
+	}
+	table.targets.resize(table.analysis.sites.size());
+	// The pipeline cache keys on call; its target is not queried in table mode.
+	const auto first = std::ranges::find_if(source.decoded.instructions, [](const auto& inst) {
+		return inst.opcode == Decoder::Opcode::S_SWAPPC_B64;
+	});
+	source.call = ShaderSource::Call {
+	    .instruction = static_cast<uint32_t>(first - source.decoded.instructions.begin())};
+	source.linked.reset();
+}
+
+// Reads every site's targets and links them into the caller when they changed. The tables and
+// callees are read through the strict reader directly: they are not specialization reads.
+const Decoder::Program& RefreshTableCalls(ShaderSource& source, const IR::SrtRuntime& runtime) {
+	auto& table = *source.table;
+	source.reads.clear();
+	if (runtime.read_specialization_memory == nullptr) {
+		EXIT("shader calls need a strict memory reader\n");
+	}
+	const Decoder::ReadGuestWords read = [&](uint64_t address, std::span<uint32_t> words) {
+		return runtime.read_specialization_memory(runtime.userdata, address, words);
+	};
+	bool                  changed = !source.linked.has_value();
+	std::vector<uint64_t> targets;
+	for (size_t index = 0; index < table.analysis.sites.size(); ++index) {
+		const auto& site = table.analysis.sites[index];
+		std::string failure;
+		if (!Decoder::ReadCallTargets(site, runtime.user_data, read, targets, failure)) {
+			EXIT("shader call at pc 0x%08x: %s\n", site.pc, failure.c_str());
+		}
+		if (targets != table.targets[index]) {
+			table.targets[index] = targets;
+			changed              = true;
+		}
+	}
+	if (!changed) {
+		return source.linked->decoded;
+	}
+	auto program = Decoder::LinkCalls(source.code, table.analysis, table.targets, read);
+	if (!program.failure.empty()) {
+		EXIT("shader calls cannot be linked: %s\n", program.failure.c_str());
+	}
+	ShaderSource::Linked linked {.code = std::move(program.code)};
+	Decoder::DecodeProgram(linked.code, linked.decoded, program.overrides);
+	// Comparing the whole linked program on every dispatch would cost too much.
+	const auto hash = XXH3_64bits(linked.code.data(), linked.code.size() * sizeof(uint32_t));
+	linked.key      = {static_cast<uint32_t>(hash), static_cast<uint32_t>(hash >> 32u),
+	                   static_cast<uint32_t>(linked.code.size())};
+	source.linked   = std::move(linked);
+	++source.revision;
+	return source.linked->decoded;
 }
 
 } // namespace
@@ -595,14 +700,30 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 		Decoder::DecodeProgram(code, source.decoded);
 	}
 	if (source.decoded.has_swap_pc) {
-		PrepareCallTarget(source, options);
+		source.table_calls = options.table_calls;
+		source.wave_size   = options.wave_size;
+		const bool leaf    = TryPrepareCallTarget(source, options);
 		source.code.assign(code.begin(), code.end());
 		source.decoded.code = source.code;
+		if (!leaf) {
+			PrepareTableCalls(source, options.user_data);
+		}
 	}
 	return source;
 }
 
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime) {
+	if (source.table) {
+		return RefreshTableCalls(source, runtime);
+	}
+	// A callee upstream's leaf linking cannot take: link through table mode instead (sticky).
+	const auto table_fallback = [&]() -> bool {
+		if (!source.table_calls) {
+			return false;
+		}
+		PrepareTableCalls(source, runtime.user_data);
+		return true;
+	};
 	auto& reads = source.reads;
 	reads.clear();
 	IR::SrtReadCapture capture(runtime, reads);
@@ -634,15 +755,18 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 	const auto function_pc = last.pc + last.word_count * sizeof(uint32_t);
 	for (uint32_t index = 0;;) {
 		// The observed queue helper is a scalar leaf. Scalar encodings need at most one literal.
+		if (index >= 64u && table_fallback()) return RefreshTableCalls(source, runtime);
 		EXIT_IF(index >= 64u || address > UINT64_MAX - (uint64_t {index} + 2u) * sizeof(uint32_t));
 		std::array<uint32_t, 2> words {};
 		if (!clean.read_memory(clean.userdata, address + uint64_t {index} * sizeof(uint32_t),
 		                       std::span(words).first(1)))
 			EXIT("shader call at pc 0x%08x cannot read leaf code", call.pc);
 		const auto family = Decoder::GetInstructionFamily(words[0]);
-		EXIT_NOT_IMPLEMENTED(family != Decoder::Family::SOP1 && family != Decoder::Family::SOP2 &&
-		                     family != Decoder::Family::SOPC && family != Decoder::Family::SOPK &&
-		                     family != Decoder::Family::SOPP);
+		const bool scalar = family == Decoder::Family::SOP1 || family == Decoder::Family::SOP2 ||
+		                    family == Decoder::Family::SOPC || family == Decoder::Family::SOPK ||
+		                    family == Decoder::Family::SOPP;
+		if (!scalar && table_fallback()) return RefreshTableCalls(source, runtime);
+		EXIT_NOT_IMPLEMENTED(!scalar);
 		Decoder::Instruction inst;
 		Decoder::DecodeInstruction(words, 0u, inst);
 		if (inst.word_count == 2u) {
@@ -656,13 +780,20 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 		if (Decoder::IsDirectBranch(inst.opcode)) inst.branch_target += inst.pc;
 		linked.code.insert(linked.code.end(), inst.raw, inst.raw + inst.word_count);
 		index += inst.word_count;
-		EXIT_NOT_IMPLEMENTED(inst.opcode == Decoder::Opcode::S_SWAPPC_B64 ||
-		                     inst.opcode == Decoder::Opcode::S_GETPC_B64 ||
-		                     inst.opcode == Decoder::Opcode::S_ENDPGM);
-		EXIT_IF(CFG::MayWriteScalarRegister(inst, call.dst.reg) || CFG::MayWriteScalarRegister(inst, call.dst.reg + 1u));
-		const bool returns = inst.opcode == Decoder::Opcode::S_SETPC_B64;
+		const bool unsupported = inst.opcode == Decoder::Opcode::S_SWAPPC_B64 ||
+		                         inst.opcode == Decoder::Opcode::S_GETPC_B64 ||
+		                         inst.opcode == Decoder::Opcode::S_ENDPGM;
+		const bool clobbers = CFG::MayWriteScalarRegister(inst, call.dst.reg) ||
+		                      CFG::MayWriteScalarRegister(inst, call.dst.reg + 1u);
+		const bool returns  = inst.opcode == Decoder::Opcode::S_SETPC_B64;
+		const bool foreign_return =
+		    returns && (inst.src0.kind != Decoder::OperandKind::Sgpr || inst.src0.reg != call.dst.reg);
+		if ((unsupported || clobbers || foreign_return) && table_fallback())
+			return RefreshTableCalls(source, runtime);
+		EXIT_NOT_IMPLEMENTED(unsupported);
+		EXIT_IF(clobbers);
 		if (returns) {
-			EXIT_NOT_IMPLEMENTED(inst.src0.kind != Decoder::OperandKind::Sgpr || inst.src0.reg != call.dst.reg);
+			EXIT_NOT_IMPLEMENTED(foreign_return);
 			inst.opcode = Decoder::Opcode::S_BRANCH;
 			inst.branch_target = call.pc + call.word_count * sizeof(uint32_t);
 		} else if (Decoder::IsDirectBranch(inst.opcode)) {
@@ -685,6 +816,8 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 	linked.decoded.instructions[source.call->instruction].branch_target = function_pc;
 	linked.decoded.code = linked.code;
 	linked.observed_function.resize(linked.code.size() - source.code.size());
+	linked.key.assign(linked.code.begin() + static_cast<ptrdiff_t>(source.code.size()),
+	                  linked.code.end());
 	source.linked = std::move(linked);
 	++source.revision;
 	return source.linked->decoded;

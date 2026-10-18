@@ -862,6 +862,8 @@ struct Instruction {
 	bool           offen                                        = false;
 	bool           image_r128                                   = false;
 	uint32_t       branch_target                                = 0;
+	// The PC an S_GETPC_B64 reads, when the call linker moved it (UINT32_MAX: pc).
+	uint32_t       getpc_origin                                 = UINT32_MAX;
 	struct {
 		uint32_t target = 0;
 		uint32_t en     = 0;
@@ -878,12 +880,25 @@ struct Program {
 	bool                     has_swap_pc = false;
 };
 
+// Replaces what the instruction at pc decodes to, for code the call linker produced: a branch's
+// target beyond a SOPP's reach, or the PC an S_GETPC_B64 had before the linker moved it.
+struct PcOverride {
+	uint32_t pc    = 0;
+	uint32_t value = 0;
+	bool     getpc = false;
+
+	bool operator==(const PcOverride&) const = default;
+};
+
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.
 Family GetInstructionFamily(uint32_t word);
 // The output object must be freshly initialized.
 void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 Program DecodeFrontProgram(std::span<const uint32_t> front);
-void DecodeProgram(std::span<const uint32_t> code, Program& program);
+// overrides are sorted by pc. They apply while decoding: S_ENDPGM ends the program only when no
+// branch decoded so far targets the next word.
+void DecodeProgram(std::span<const uint32_t> code, Program& program,
+                   std::span<const PcOverride> overrides = {});
 bool IsConditionalBranch(Opcode opcode);
 bool IsDirectBranch(Opcode opcode);
 

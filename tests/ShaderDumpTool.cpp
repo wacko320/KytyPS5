@@ -90,7 +90,17 @@ int main(int argc, char** argv) {
 	// As the emulator compiles them (see PipelineCache).
 	options.untracked_writes   = true;
 	options.bindless_images    = true;
-	auto        result         = ShaderRecompiler::TranslateProgram(code, options);
+	options.table_calls        = true;
+	// Calls link against the dump's (zero) user data and no guest memory: a pointer passed in
+	// user SGPRs has no target, so the call is skipped and only the caller is translated.
+	auto source = ShaderRecompiler::PrepareShaderSource(code, options);
+	const ShaderRecompiler::IR::SrtRuntime runtime {
+	    .user_data                  = user_data,
+	    .read_specialization_memory = +[](void*, uint64_t, std::span<uint32_t>) { return false; },
+	};
+	auto result = ShaderRecompiler::TranslateProgram(
+	    source.call ? ShaderRecompiler::RefreshShaderSource(source, runtime) : source.decoded,
+	    options);
 	const auto& program        = result.program;
 	std::printf("uses_dma=%d srt_reads=%zu buffers=%zu images=%zu\n", program.info.uses_dma,
 	            program.srt_reads.size(), program.info.buffers.size(), program.info.images.size());

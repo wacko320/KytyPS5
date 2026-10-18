@@ -6,7 +6,9 @@
 #include <fmt/format.h>
 #include <iterator>
 #include <deque>
+#include <functional>
 #include <list>
+#include <optional>
 #include <map>
 #include <span>
 
@@ -1734,27 +1736,71 @@ bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code) {
 	       (ScalarOperandCode(inst.dst, destination) && code == destination + 1u);
 }
 
-uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                              uint32_t before, uint32_t code) {
+std::optional<uint32_t> TryFindScalarDefinition(const Decoder::Program& program,
+                                                const Graph& graph, uint32_t before, uint32_t code,
+                                                std::string& failure) {
 	EXIT_IF(before >= program.instructions.size());
 	const auto found = std::ranges::find_if(graph.blocks, [before](const auto& block) {
 		return block.inst_begin <= before && before < block.inst_end;
 	});
 	EXIT_IF(found == graph.blocks.end());
-	const auto* block = &*found;
-	for (size_t depth = 0; depth < graph.blocks.size(); ++depth) {
-		for (uint32_t i = before; i > block->inst_begin;) {
+	// A join is accepted when every path into it reaches the same definition (or none). Paths
+	// that only come back around a loop add no definition of their own.
+	constexpr uint32_t    Cycle = UINT32_MAX - 1u;
+	constexpr uint32_t    Failed = UINT32_MAX - 2u;
+	std::vector<uint32_t> visited;
+	const auto            describe = [&](uint32_t index) {
+		return index == UINT32_MAX ? std::string("the entry (user data)")
+		                           : Decoder::InstructionToString(program.instructions[index]);
+	};
+	std::function<uint32_t(const BasicBlock*, uint32_t)> search =
+	    [&](const BasicBlock* block, uint32_t end) -> uint32_t {
+		for (uint32_t i = end; i > block->inst_begin;) {
 			const auto& inst = program.instructions[--i];
-			EXIT_IF(inst.opcode == Opcode::S_SWAPPC_B64);
+			if (inst.opcode == Opcode::S_SWAPPC_B64) {
+				failure = fmt::format("scalar shader call source s{} is reached through a call", code);
+				return Failed;
+			}
 			if (MayWriteScalarRegister(inst, code)) return i;
 		}
 		if (block->id == graph.entry_block) return UINT32_MAX;
-		EXIT_IF(block->predecessors.size() != 1u);
-		block = graph.FindBlock(block->predecessors[0]);
-		EXIT_IF(block == nullptr);
-		before = block->inst_end;
+		if (std::ranges::find(visited, block->id) != visited.end()) return Cycle;
+		visited.push_back(block->id);
+		EXIT_IF(block->predecessors.empty());
+		uint32_t reaching = Cycle;
+		for (const auto id: block->predecessors) {
+			const auto* predecessor = graph.FindBlock(id);
+			EXIT_IF(predecessor == nullptr);
+			const auto result = search(predecessor, predecessor->inst_end);
+			if (result == Failed) return Failed;
+			if (result == Cycle) continue;
+			if (reaching != Cycle && reaching != result) {
+				failure = fmt::format(
+				    "scalar shader call source s{} has more than one reaching definition: {} and {}",
+				    code, describe(reaching), describe(result));
+				return Failed;
+			}
+			reaching = result;
+		}
+		return reaching;
+	};
+	const auto index = search(&*found, before);
+	if (index == Failed) return std::nullopt;
+	if (index == Cycle) {
+		failure = fmt::format("scalar shader call source s{} has cyclic reaching definitions", code);
+		return std::nullopt;
 	}
-	EXIT("scalar shader call source has cyclic reaching definitions");
+	return index;
+}
+
+uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
+                              uint32_t before, uint32_t code) {
+	std::string failure;
+	const auto  index = TryFindScalarDefinition(program, graph, before, code, failure);
+	if (!index.has_value()) {
+		EXIT("%s\n", failure.c_str());
+	}
+	return *index;
 }
 
 std::string BranchConditionToString(BranchCondition condition) {
