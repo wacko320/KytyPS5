@@ -1,0 +1,99 @@
+#version 450
+
+// Colour fast-clear expansion on the GPU (TextureCache::MaterializeColorClear): DCC/CMask
+// metadata the GPU wrote is checked where it lies, so the decision never waits for a readback.
+// A slice is cleared to candidate code k's colour iff every byte of it equals the code.
+//
+// Mode 0 (check): workgroup row y checks slice y; each group ORs into the slice's mask word a bit
+//   per candidate some dword of its part differs from.
+// Mode 1 (finalize): one invocation per slice and candidate writes the predicate record
+//   {matches ? groups.x : 0, groups.y, 1, 0}: a conditional-rendering predicate (non-zero
+//   first word) and a vkCmdDispatchIndirect group count at once.
+// Mode 2 (expand): workgroup row y writes 0xff over slice y if any of its predicates is set, as
+//   the hardware does when it decompresses the cleared slice.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer metadata {
+    uint words[];
+};
+
+layout(std430, binding = 1) buffer results {
+    uint result[];
+};
+
+layout(push_constant) uniform constants {
+    uint  mode;
+    uint  first_word;      // slice 0's first dword in the metadata binding
+    uint  slice_words;
+    uint  slice_count;
+    uint  code_count;
+    uint  mask_index;      // slice 0's mask word in the results binding
+    uint  predicate_index; // slice 0's first predicate record
+    uint  pad;
+    uvec2 codes;           // candidate codes, one per byte
+    uvec2 groups;          // storage-clear workgroup counts
+} pc;
+
+shared uint s_mask;
+
+uint Code(uint k) {
+    return ((k < 4u ? pc.codes.x : pc.codes.y) >> (8u * (k & 3u))) & 0xffu;
+}
+
+bool AnyPredicate(uint slice) {
+    for (uint k = 0u; k < pc.code_count; k++) {
+        if (result[pc.predicate_index + (slice * pc.code_count + k) * 4u] != 0u) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void main() {
+    const uint slice  = gl_WorkGroupID.y;
+    const uint base   = pc.first_word + slice * pc.slice_words;
+    const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    if (pc.mode == 0u) {
+        if (gl_LocalInvocationIndex == 0u) {
+            s_mask = 0u;
+        }
+        barrier();
+        const uint all = (1u << pc.code_count) - 1u;
+        uint       mask = 0u;
+        for (uint i = gl_GlobalInvocationID.x; i < pc.slice_words && mask != all; i += stride) {
+            const uint word = words[base + i];
+            for (uint k = 0u; k < pc.code_count; k++) {
+                if (word != Code(k) * 0x01010101u) {
+                    mask |= 1u << k;
+                }
+            }
+        }
+        if (mask != 0u) {
+            atomicOr(s_mask, mask);
+        }
+        barrier();
+        if (gl_LocalInvocationIndex == 0u && s_mask != 0u) {
+            atomicOr(result[pc.mask_index + slice], s_mask);
+        }
+    } else if (pc.mode == 1u) {
+        const uint entry = gl_GlobalInvocationID.x;
+        if (entry >= pc.slice_count * pc.code_count) {
+            return;
+        }
+        const uint k       = entry % pc.code_count;
+        const bool matches = (result[pc.mask_index + entry / pc.code_count] & (1u << k)) == 0u;
+        const uint record  = pc.predicate_index + entry * 4u;
+        result[record]      = matches ? pc.groups.x : 0u;
+        result[record + 1u] = pc.groups.y;
+        result[record + 2u] = 1u;
+        result[record + 3u] = 0u;
+    } else {
+        if (!AnyPredicate(slice)) {
+            return;
+        }
+        for (uint i = gl_GlobalInvocationID.x; i < pc.slice_words; i += stride) {
+            words[base + i] = 0xffffffffu;
+        }
+    }
+}

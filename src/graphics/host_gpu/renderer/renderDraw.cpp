@@ -1221,6 +1221,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
 	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
 
+	// Stores through GPU-selected V#s and addresses are no binding. Noted before the draw is
+	// recorded, after the last submit the bindings above may make.
+	const bool untracked_writes =
+	    std::any_of(vertex_stages.begin(), vertex_stages.end(),
+	                [](const auto& stage) { return stage.stage.program->has_address_writes; }) ||
+	    (state.ps_active && state.ps_input_info.stage.program->has_address_writes);
+	if (untracked_writes) {
+		m_context.GetBufferCache().NoteUntrackedWrites();
+	}
 	LogDrawPhase(draw.Name(), "BeginRendering");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);

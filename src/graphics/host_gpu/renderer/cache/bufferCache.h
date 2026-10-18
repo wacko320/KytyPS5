@@ -60,6 +60,14 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// A guest write fault at vaddr: InvalidateMemory over its byte, noting the page in the write
+	// history. Returns how many bytes above and below the page the CPU's run of writes may reach
+	// soon (MemoryTracker::InvalidateFault), for InvalidateAhead.
+	[[nodiscard]] MemoryTracker::AheadCandidates InvalidateFault(uint64_t vaddr);
+	// Run-ahead: makes [vaddr, vaddr + size), a window from InvalidateFault extending in
+	// direction, CPU-dirty and writable before the CPU writes it. The caller checks images and
+	// mappings. Returns the bytes made CPU-dirty.
+	uint64_t               InvalidateAhead(uint64_t vaddr, uint64_t size, AheadDirection direction);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	// ReadMemory from a guest thread: the GPU thread records the download, submits it and goes
 	// on; this thread waits for it, then a second short command hands back the pages no GPU
@@ -82,6 +90,9 @@ public:
 	// are copied back (hot pages only) at the end of the submit that holds the write, not of one
 	// a stream-buffer wrap made between the binding and the command.
 	void CommitWrittenRanges();
+	// Called once a command that may store through GPU-selected V#s (untracked writes) is
+	// recorded: no GPU-thread readback reads buffer memory directly until it has completed.
+	void NoteUntrackedWrites();
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
@@ -108,6 +119,18 @@ public:
 	[[nodiscard]] bool IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// GPU thread. A range whose buffer bytes a caller compares between lookups: the generation
+	// changes whenever a written binding, an upload of CPU writes, a command-processor write or a
+	// new buffer may have changed them (untracked BDA stores are not seen). CPU writes not yet
+	// uploaded are not part of it (IsRegionCpuModified). The first call starts watching the
+	// range; UnwatchWrites ends watches starting inside a range, UnwatchRange the one watch.
+	[[nodiscard]] uint64_t WriteGeneration(uint64_t vaddr, uint64_t size);
+	void                   UnwatchWrites(uint64_t vaddr, uint64_t size);
+	void                   UnwatchRange(uint64_t vaddr, uint64_t size);
+	// Notes of possible changes to any watched range so far (a caller tells its own from others').
+	[[nodiscard]] uint64_t WriteNotes() const;
+	// Any thread: whether a watched range overlaps the range.
+	[[nodiscard]] bool     OverlapsWatchedWrites(uint64_t vaddr, uint64_t size) const;
 	// GPU thread: a command-processor write into pages the GPU owns, recorded after the GPU work
 	// before it instead of draining the GPU to merge it into guest memory. False (nothing
 	// recorded) unless every tracker page of the range is GPU-dirty.
@@ -164,6 +187,9 @@ private:
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
+	// Moves the generation of the watched ranges overlapping a range whose buffer bytes may
+	// have changed (WriteGeneration).
+	void NoteBufferWrite(uint64_t vaddr, uint64_t size);
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
@@ -194,6 +220,38 @@ private:
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// GPU-thread readback read from the buffer's host mapping (Buffer::HostReadable) instead of a
+	// GPU copy: every GPU-dirty byte of the request's tracker pages was last written by work
+	// that has completed (no untracked write still running, no publish pending into the pages).
+	// The bytes are copied to the guest backing and the pages handed back; nothing is recorded,
+	// submitted or waited for. Anything else is left to the download. Only the request's pages:
+	// uncached reads cost about 2.5 us per KiB, and taking more ready pages around them cost
+	// more than the readbacks it saved.
+	enum class DirectReadback : uint8_t {
+		Copied,
+		Unmapped,
+		Writer,
+		Untracked,
+		Pending,
+		Size,
+	};
+	// blocking_tick receives the tick a Writer or Untracked refusal waits for, when one does (0
+	// for a write whose command is not recorded yet).
+	[[nodiscard]] DirectReadback TryReadDirect(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                            uint64_t& copied,
+	                                            uint64_t* blocking_tick = nullptr);
+	// A buffer write the open command buffer records (or a command it has yet to record binds)
+	// that may leave GPU-dirty bytes: a write binding, a join's copy, an image-to-buffer sync.
+	// Its bytes take the command buffer's tick (m_write_ticks) once it is submitted, and it ends
+	// with a host barrier so that a direct readback may read them once that tick completes.
+	// Uploads and write-throughs copy CPU bytes, which a direct readback never takes from the
+	// mapping.
+	void NoteOpenWrite(uint64_t vaddr, uint64_t size);
+	// The open command buffer's writes so far.
+	[[nodiscard]] const RangeSet& OpenWrites();
+	void                          MergeOpenWrites();
+	void                          FollowOpenTick();
+	void                          PruneWriteTicks();
 	// Records a copy of buffer ranges to the guest backing in the current command buffer. `async`:
 	// published once the submission completes (a priority operation); else this waits for it and
 	// publishes before returning. The caller has noted the copies as pending guest writes
@@ -290,6 +348,34 @@ private:
 	};
 	std::vector<ResolvedRun>                          m_writeback_resolved;
 	std::atomic<bool>                                 m_writeback_resolved_any {false};
+	// GPU thread only. The writes of the command buffer recording at m_open_tick: appended as
+	// noted, merged into m_open_written when a readback asks.
+	std::vector<std::pair<uint64_t, uint64_t>>        m_open_writes;
+	RangeSet                                          m_open_written;
+	size_t                                            m_open_merged = 0;
+	uint64_t                                          m_open_tick   = 0;
+	// GPU thread only. The tick of the command buffer that last wrote each byte noted, up to the
+	// last one submitted (the open one's are in m_open_writes). Ranges of completed ticks are
+	// dropped now and then (m_write_ticks_pruned).
+	RangeTickMap                                      m_write_ticks;
+	uint64_t                                          m_write_ticks_pruned = 0;
+	// The tick of the last command buffer that recorded a command with untracked writes.
+	uint64_t                                          m_untracked_write_tick = 0;
+	// Whether new buffers are made host-readable (Buffer::HostReadableSupported).
+	bool                                              m_host_readable_buffers = false;
+	// Aligned staging for direct readbacks (TryReadDirect).
+	std::vector<uint8_t>                              m_direct_staging;
+	std::atomic<uint64_t>                             m_direct_readbacks {0};
+	// Watched ranges by [begin, end): the generation of their last possible change. Changed on
+	// the GPU thread, and erased by an unmap on the guest thread while the GPU thread drains at
+	// shutdown, so every access holds the lock; m_write_watches_any lets writes skip it.
+	void                                              RecomputeLargestWatch();
+	mutable std::shared_mutex                         m_write_watch_mutex;
+	std::map<std::pair<uint64_t, uint64_t>, uint64_t> m_write_watches;
+	std::atomic<bool>                                 m_write_watches_any {false};
+	uint64_t                                          m_write_watch_largest = 0;
+	uint64_t                                          m_write_generation    = 0;
+	uint64_t                                          m_write_notes         = 0;
 };
 
 } // namespace Libs::Graphics

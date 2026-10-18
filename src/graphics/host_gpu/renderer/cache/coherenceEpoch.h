@@ -40,6 +40,8 @@ public:
 	// GPU thread: uploads the range to the buffers over it now, after the GPU work recorded so far.
 	void SyncRangeNow(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] uint64_t EpochId() const noexcept { return m_epoch_id; }
+	// Any thread: counts the takes of a non-empty pending set (MemoryTracker::BdaSyncGeneration).
+	[[nodiscard]] uint64_t Generation() const noexcept;
 
 private:
 	BufferCache& m_cache;

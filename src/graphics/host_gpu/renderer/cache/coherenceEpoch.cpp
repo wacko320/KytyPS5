@@ -21,6 +21,10 @@ bool CoherenceEpoch::HasPending() const noexcept {
 	return m_cache.m_memory_tracker.HasBdaSync();
 }
 
+uint64_t CoherenceEpoch::Generation() const noexcept {
+	return m_cache.m_memory_tracker.BdaSyncGeneration();
+}
+
 void CoherenceEpoch::Acquire() {
 	// After a WAIT_REG_MEM the caller just read a guest value that a guest thread stored after
 	// noting its writes pending: that read must not move past the load below.

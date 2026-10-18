@@ -896,7 +896,10 @@ public:
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
+		// Tracking protection changes only read the mapping table, and fault handlers on many
+		// threads issue them at once. Changes to one page are ordered by the page manager's
+		// region lock, which every caller holds.
+		std::shared_lock lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 

@@ -460,6 +460,44 @@ void TestBdaSyncDirtiness() {
   Release(memory);
 }
 
+// A take (TakeBdaSync) returns the set a hold queued into only once the hold is dropped; a hold
+// queued after the take belongs to the next set and does not hold that take.
+void TestBdaSyncTakeWaitsForHolds() {
+  constexpr auto page = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = Allocate(harness.page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  (void)tracker.TakeBdaSync();
+  Check(!tracker.HasBdaSync(), "an empty queue reported pending BDA work");
+
+  std::atomic<bool> taken{false};
+  Libs::Graphics::RangeSet result;
+  {
+    auto hold = tracker.HoldBdaSync(address + 17, 1);
+    Check(tracker.HasBdaSync(), "a hold did not queue its range");
+    std::jthread taker([&] {
+      result = tracker.TakeBdaSync();
+      taken.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    Check(!taken.load(std::memory_order_acquire), "a take returned before the hold it took");
+    // Queued into the next set: the waiting take must not wait for it as well.
+    auto later = tracker.HoldBdaSync(address + page, 1);
+    { auto drop = std::move(hold); }
+    taker.join();
+    Check(taken.load(std::memory_order_acquire) && result.Contains(address, page) &&
+              !result.Intersects(address + page, page),
+          "a take did not return its held range alone");
+  }
+  const auto next = tracker.TakeBdaSync();
+  Check(next.Contains(address + page, page) && !tracker.HasBdaSync(),
+        "a hold queued after a take was lost");
+  tracker.UntrackMemory(address, 2 * page);
+  (void)tracker.TakeBdaSync();
+  Release(memory);
+}
+
 void TestBdaSyncConcurrentDrain() {
   constexpr auto page = Libs::Graphics::TRACKER_PAGE_SIZE;
   TrackerHarness harness;
@@ -483,6 +521,43 @@ void TestBdaSyncConcurrentDrain() {
             tracker.IsRegionCpuModified(address, page),
         "concurrent drain lost a completed CPU dirty transition");
   tracker.UntrackMemory(address, page);
+  Release(memory);
+}
+
+// A lazy release (BufferCache's direct readback hand-back) leaves a GPU-written page unreadable
+// while its watchers would let it be read: the GPU writing it again needs no protection change,
+// and a fault applies what the watchers ask.
+void TestLazyRelease() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  tracker.ForEachUploadRange(address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+                             []() noexcept {});
+  tracker.MarkRegionAsGpuModified(address, page_size);
+  Check(Protection(memory) == PAGE_NOACCESS, "a GPU-written page stayed readable");
+
+  const auto lazy_release = [&] {
+    Check(!PageManager::SetLazyRelease(true), "lazy release was already set");
+    tracker.UnmarkRegionAsGpuModified(address, page_size);
+    Check(PageManager::SetLazyRelease(false), "lazy release changed");
+  };
+  lazy_release();
+  Check(!tracker.IsRegionGpuModified(address, page_size) && Protection(memory) == PAGE_NOACCESS,
+        "a lazy release changed the page's protection");
+  tracker.MarkRegionAsGpuModified(address, page_size);
+  Check(Protection(memory) == PAGE_NOACCESS && !page_manager.ApplyDeferred(address),
+        "a GPU write after a lazy release left the page as left");
+
+  lazy_release();
+  Check(page_manager.ApplyDeferred(address) && Protection(memory) == PAGE_READONLY &&
+            !page_manager.ApplyDeferred(address),
+        "a fault after a lazy release did not apply the watchers' protection once");
+  Check(Protection(memory + page_size) == PAGE_READONLY, "the neighbour page changed");
+
+  tracker.UntrackMemory(address, page_size * 2);
   Release(memory);
 }
 
@@ -1628,6 +1703,540 @@ void TestFatalPaths() {
   }
 }
 
+// Run-ahead (MemoryTracker::InvalidateFault / InvalidateAhead). Pages are numbered from the
+// allocation; history epochs are passed in directly.
+struct AheadHarness {
+  explicit AheadHarness(uint64_t pages = 64)
+      : page_size(harness.page_manager.GetPageSize()),
+        memory(Allocate(harness.page_manager, pages)),
+        address(reinterpret_cast<uint64_t>(memory)), size(page_size * pages) {
+    Clean(0, pages);
+  }
+  ~AheadHarness() {
+    tracker().MarkRegionAsCpuModified(address, size);
+    tracker().UntrackMemory(address, size);
+    Release(memory);
+  }
+  MemoryTracker &tracker() { return harness.tracker; }
+  uint64_t Page(uint64_t page) const { return address + page * page_size; }
+  // A write fault on the page; returns both run-ahead candidates in pages.
+  std::pair<uint64_t, uint64_t> FaultBoth(uint64_t page, uint64_t epoch = 0) {
+    const auto ahead = tracker().InvalidateFault(
+        Page(page) + 8, epoch, [] { Check(false, "run-ahead fault requested a GPU flush"); },
+        [](uint64_t, uint64_t) noexcept { return 0; });
+    Check(ahead.up_bytes % page_size == 0 && ahead.down_bytes % page_size == 0,
+          "run-ahead candidate was not whole pages");
+    return {ahead.up_bytes / page_size, ahead.down_bytes / page_size};
+  }
+  // The candidate above the page.
+  uint64_t Fault(uint64_t page, uint64_t epoch = 0) { return FaultBoth(page, epoch).first; }
+  // The candidate below the page.
+  uint64_t FaultDown(uint64_t page, uint64_t epoch = 0) { return FaultBoth(page, epoch).second; }
+  // Faults each page of [first, last), building write history.
+  void FaultEach(uint64_t first, uint64_t last, uint64_t epoch = 0) {
+    for (auto page = first; page < last; page++) {
+      (void)Fault(page, epoch);
+    }
+  }
+  // As FaultEach, from the top page down.
+  void FaultEachDown(uint64_t first, uint64_t last, uint64_t epoch = 0) {
+    for (auto page = last; page > first; page--) {
+      (void)Fault(page - 1, epoch);
+    }
+  }
+  uint64_t Ahead(uint64_t page, uint64_t pages, uint64_t epoch = 0) {
+    return tracker().InvalidateAhead(Page(page), pages * page_size,
+                                     Libs::Graphics::AheadDirection::Up, epoch,
+                                     [](uint64_t, uint64_t) noexcept { return 0; }) /
+           page_size;
+  }
+  // The downward window of pages [end - pages, end), walked from end - 1.
+  uint64_t Below(uint64_t end, uint64_t pages, uint64_t epoch = 0) {
+    return tracker().InvalidateAhead(Page(end - pages), pages * page_size,
+                                     Libs::Graphics::AheadDirection::Down, epoch,
+                                     [](uint64_t, uint64_t) noexcept { return 0; }) /
+           page_size;
+  }
+  void Clean(uint64_t page, uint64_t pages) {
+    tracker().ForEachUploadRange(
+        Page(page), pages * page_size, false, [](uint64_t, uint64_t) noexcept {},
+        []() noexcept {});
+  }
+  bool CpuDirty(uint64_t page) {
+    return tracker().IsRegionCpuModified(Page(page), page_size);
+  }
+
+  TrackerHarness harness;
+  uint64_t page_size;
+  uint8_t *memory;
+  uint64_t address;
+  uint64_t size;
+};
+
+void TestAheadFollowsRun() {
+  AheadHarness h;
+  h.FaultEach(10, 24);
+  h.Clean(0, 64);
+  h.FaultEach(10, 14);
+  const auto ahead = h.Fault(14);
+  Check(ahead == Libs::Graphics::AHEAD_MIN_PAGES,
+        "a fault continuing a 4-page run did not offer a 4-page window");
+  ResetProtectionLog();
+  Check(h.Ahead(15, ahead) == ahead, "run-ahead did not mark its whole window");
+  Check(g_protection_log.size() == 1 && g_protection_log[0].address == h.Page(15) &&
+            g_protection_log[0].size == ahead * h.page_size &&
+            g_protection_log[0].mode == Common::VirtualMemory::Mode::ReadWrite,
+        "run-ahead did not unprotect its window in one call");
+  Check(h.CpuDirty(15) && h.CpuDirty(18) && IsWritable(h.memory + 18 * h.page_size) &&
+            !h.CpuDirty(19) && !IsWritable(h.memory + 19 * h.page_size),
+        "run-ahead marked the wrong pages");
+  // The run continues at the window's end: the run below is now 9 pages.
+  h.Clean(0, 64);
+  h.FaultEach(10, 19);
+  Check(h.Fault(19) == 4, "run-ahead window was not cut to the write history");
+}
+
+void TestAheadNeedsRun() {
+  AheadHarness h;
+  h.FaultEach(10, 24);
+  h.Clean(0, 64);
+  ResetProtectionLog();
+  Check(h.Fault(14) == 0, "a fault without a run below offered run-ahead");
+  Check(g_protection_log.size() == 1 && g_protection_log[0].address == h.Page(14) &&
+            g_protection_log[0].size == h.page_size,
+        "a fault without a run unprotected more than its page");
+  Check(!h.CpuDirty(15), "a fault without a run marked the next page");
+}
+
+void TestAheadStopsAtGpuDirty() {
+  AheadHarness h;
+  h.FaultEach(10, 24);
+  h.Clean(0, 64);
+  h.tracker().ForEachUploadRange(
+      h.Page(17), h.page_size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  h.FaultEach(10, 14);
+  Check(h.Fault(14) == 2, "run-ahead window passed a GPU-dirty page");
+  Check(h.Ahead(15, 4) == 2 && h.CpuDirty(16) &&
+            h.tracker().IsRegionGpuModified(h.Page(17), h.page_size) && !h.CpuDirty(17),
+        "run-ahead marked past a GPU-dirty page");
+  h.tracker().UnmarkRegionAsGpuModified(h.Page(17), h.page_size);
+}
+
+void TestAheadStopsAtHistoryGap() {
+  AheadHarness h;
+  h.FaultEach(10, 15);
+  h.FaultEach(16, 17);
+  h.FaultEach(18, 24);
+  h.Clean(0, 64);
+  // Page 15 has no history but is CPU-dirty already: passed over. Page 17 ends the prefix.
+  h.tracker().MarkRegionAsCpuModified(h.Page(15), h.page_size);
+  h.FaultEach(10, 14);
+  Check(h.Fault(14) == 2, "run-ahead did not pass a CPU-dirty page and stop at a history gap");
+  Check(h.Ahead(15, 3) == 2 && h.CpuDirty(16) && !h.CpuDirty(17),
+        "run-ahead marked a page outside the write history");
+  // A prefix of CPU-dirty pages only is empty.
+  h.Clean(0, 64);
+  h.tracker().MarkRegionAsCpuModified(h.Page(16), h.page_size);
+  Check(h.Ahead(16, 4) == 0 && !h.CpuDirty(17), "run-ahead marked a page that never faulted");
+}
+
+void TestAheadHistoryAges() {
+  AheadHarness h;
+  h.FaultEach(10, 24, 0);
+  h.Clean(0, 64);
+  h.FaultEach(10, 14, 1);
+  Check(h.Fault(14, 1) == 4, "write history did not last one epoch");
+  h.Clean(0, 64);
+  h.FaultEach(10, 14, 2);
+  Check(h.Fault(14, 2) == 0 && h.Ahead(15, 4, 2) == 0,
+        "write history outlived two epochs");
+  // A gap of more than one epoch clears both halves.
+  h.Clean(0, 64);
+  h.FaultEach(10, 24, 2);
+  h.Clean(0, 64);
+  h.FaultEach(10, 14, 4);
+  Check(h.Fault(14, 4) == 0, "write history survived an epoch gap");
+}
+
+// A fault that read an older epoch before waiting for the region lock keeps the history.
+void TestAheadHistoryStaleEpoch() {
+  AheadHarness h;
+  h.FaultEach(10, 24, 1);
+  h.Clean(0, 64);
+  h.FaultEach(10, 14, 1);
+  Check(h.Fault(14, 0) == 4, "a stale history epoch cleared the write history");
+  h.Clean(0, 64);
+  h.FaultEach(10, 14, 1);
+  Check(h.Fault(14, 1) == 4, "a stale history epoch moved the history back");
+}
+
+// The window grows with the run below the fault and stops at AHEAD_MAX_PAGES.
+void TestAheadWindowFollowsRunLength() {
+  AheadHarness h(128);
+  h.FaultEach(10, 128);
+  h.Clean(0, 128);
+  h.FaultEach(10, 19);
+  Check(h.Fault(19) == 9, "a 9-page run did not offer a 9-page window");
+  h.Clean(0, 128);
+  h.FaultEach(10, 42);
+  Check(h.Fault(42) == Libs::Graphics::AHEAD_MAX_PAGES,
+        "a 32-page run did not offer the largest window");
+  h.Clean(0, 128);
+  h.FaultEach(10, 50);
+  Check(h.Fault(50) == Libs::Graphics::AHEAD_MAX_PAGES,
+        "a 40-page run offered more than the largest window");
+}
+
+void TestAheadStaysInRegion() {
+  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = AllocateFixedGuestRange(region_size * 2, 0x10000);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto boundary = (address + region_size - 1) & ~(region_size - 1);
+  const auto fault = [&](uint64_t vaddr) {
+    return tracker.InvalidateFault(
+        vaddr, 0, [] { Check(false, "region-end fault requested a GPU flush"); },
+        [](uint64_t, uint64_t) noexcept { return 0; });
+  };
+  const auto clean = [&] {
+    tracker.ForEachUploadRange(
+        boundary - 16 * page_size, 32 * page_size, false, [](uint64_t, uint64_t) noexcept {},
+        []() noexcept {});
+  };
+  clean();
+  for (auto page = boundary - 16 * page_size; page < boundary + 16 * page_size;
+       page += page_size) {
+    (void)fault(page);
+  }
+  clean();
+  for (auto page = boundary - 6 * page_size; page < boundary - 2 * page_size;
+       page += page_size) {
+    (void)fault(page);
+  }
+  Check(fault(boundary - 2 * page_size).up_bytes == page_size,
+        "run-ahead window crossed the region end");
+  for (auto page = boundary - 2 * page_size; page < boundary - page_size; page += page_size) {
+    (void)fault(page);
+  }
+  Check(fault(boundary - page_size).up_bytes == 0, "run-ahead offered pages past the region end");
+  Check(!tracker.IsRegionCpuModified(boundary, page_size) &&
+            !IsWritable(memory + (boundary - address)),
+        "run-ahead touched the next region");
+  tracker.MarkRegionAsCpuModified(address, region_size * 2);
+  tracker.UntrackMemory(address, region_size * 2);
+  Release(memory);
+}
+
+// As TestInvalidationHoldsAcrossCpuDirty: an upload that takes the pending set waits for the
+// hold, so it finds the run-ahead pages CPU-dirty.
+void TestAheadHeldUntilWritable() {
+  AheadHarness h;
+  h.FaultEach(10, 24);
+  h.Clean(0, 64);
+  h.FaultEach(10, 14);
+  const auto ahead = h.Fault(14);
+  struct Hold {
+    AheadHarness *h;
+    uint64_t pages;
+    int *released;
+    ~Hold() {
+      Check(h->tracker().IsRegionCpuModified(h->Page(15), pages * h->page_size) &&
+                IsWritable(h->memory + 15 * h->page_size) &&
+                IsWritable(h->memory + (14 + pages) * h->page_size),
+            "run-ahead released its hold before the pages turned CPU-dirty");
+      (*released)++;
+    }
+  };
+  int calls = 0;
+  int released = 0;
+  const auto marked = h.tracker().InvalidateAhead(
+      h.Page(15), ahead * h.page_size, Libs::Graphics::AheadDirection::Up, 0,
+      [&](uint64_t vaddr, uint64_t size) {
+        calls++;
+        Check(vaddr == h.Page(15) && size == ahead * h.page_size,
+              "run-ahead hold did not cover the window");
+        Check(!h.CpuDirty(15) && !IsWritable(h.memory + 15 * h.page_size),
+              "run-ahead hold ran after the pages turned writable");
+        return Hold{&h, ahead, &released};
+      });
+  Check(marked == ahead * h.page_size && calls == 1 && released == 1,
+        "run-ahead hold did not run once");
+}
+
+void TestAheadRecheckUnderLock() {
+  AheadHarness h;
+  h.FaultEach(10, 24);
+  h.Clean(0, 64);
+  h.FaultEach(10, 14);
+  const auto ahead = h.Fault(14);
+  Check(ahead == 4, "recheck setup did not offer a window");
+  // The GPU writes page 16 between the candidate and the mark.
+  h.tracker().ForEachUploadRange(
+      h.Page(16), h.page_size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  Check(h.Ahead(15, ahead) == 1 && h.CpuDirty(15) && !h.CpuDirty(16) &&
+            h.tracker().IsRegionGpuModified(h.Page(16), h.page_size),
+        "run-ahead marked a page that turned GPU-dirty after its candidate");
+  h.tracker().UnmarkRegionAsGpuModified(h.Page(16), h.page_size);
+}
+
+// The texture cache's write watch on a page outlives run-ahead's buffer-side unwatch.
+void TestAheadKeepsImageWatch() {
+  AheadHarness h;
+  h.FaultEach(10, 24);
+  h.Clean(0, 64);
+  h.harness.page_manager.UpdatePageWatchers<true>(h.Page(16), h.page_size);
+  h.FaultEach(10, 14);
+  const auto ahead = h.Fault(14);
+  ResetProtectionLog();
+  Check(h.Ahead(15, ahead) == ahead, "image watch setup did not mark the window");
+  bool touched = false;
+  for (const auto &call : g_protection_log) {
+    touched |= call.address < h.Page(17) && h.Page(16) < call.address + call.size;
+  }
+  Check(!touched && Protection(h.memory + 16 * h.page_size) == PAGE_READONLY &&
+            IsWritable(h.memory + 15 * h.page_size) && IsWritable(h.memory + 17 * h.page_size),
+        "run-ahead unprotected a page an image still watches");
+  h.harness.page_manager.UpdatePageWatchers<false>(h.Page(16), h.page_size);
+}
+
+// Downward run-ahead: a run written from the top down opens the window below the fault.
+void TestAheadDownFollowsRun() {
+  AheadHarness h;
+  h.FaultEach(10, 24);
+  h.Clean(0, 64);
+  h.FaultEachDown(20, 24);
+  const auto [up, down] = h.FaultBoth(19);
+  Check(up == 0 && down == Libs::Graphics::AHEAD_MIN_PAGES,
+        "a fault continuing a 4-page run downwards did not offer a 4-page window below");
+  ResetProtectionLog();
+  Check(h.Below(19, down) == down, "downward run-ahead did not mark its whole window");
+  Check(g_protection_log.size() == 1 && g_protection_log[0].address == h.Page(15) &&
+            g_protection_log[0].size == down * h.page_size &&
+            g_protection_log[0].mode == Common::VirtualMemory::Mode::ReadWrite,
+        "downward run-ahead did not unprotect its window in one call");
+  Check(h.CpuDirty(15) && h.CpuDirty(18) && IsWritable(h.memory + 15 * h.page_size) &&
+            !h.CpuDirty(14) && !IsWritable(h.memory + 14 * h.page_size),
+        "downward run-ahead marked the wrong pages");
+  // The run continues below the window: the run above is now 9 pages.
+  h.Clean(0, 64);
+  h.FaultEachDown(15, 24);
+  Check(h.FaultDown(14) == 4, "downward run-ahead window was not cut to the write history");
+}
+
+void TestAheadDownNeedsRun() {
+  AheadHarness h;
+  h.FaultEach(10, 24);
+  h.Clean(0, 64);
+  ResetProtectionLog();
+  Check(h.FaultBoth(19) == std::pair<uint64_t, uint64_t>{0, 0},
+        "a fault without a run above offered run-ahead");
+  Check(g_protection_log.size() == 1 && g_protection_log[0].address == h.Page(19) &&
+            g_protection_log[0].size == h.page_size,
+        "a fault without a run unprotected more than its page");
+  Check(!h.CpuDirty(18), "a fault without a run marked the page below");
+}
+
+void TestAheadDownStopsAtGpuDirty() {
+  AheadHarness h;
+  h.FaultEach(10, 24);
+  h.Clean(0, 64);
+  h.tracker().ForEachUploadRange(
+      h.Page(16), h.page_size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  h.FaultEachDown(20, 24);
+  Check(h.FaultDown(19) == 2, "downward run-ahead window passed a GPU-dirty page");
+  Check(h.Below(19, 4) == 2 && h.CpuDirty(17) &&
+            h.tracker().IsRegionGpuModified(h.Page(16), h.page_size) && !h.CpuDirty(16),
+        "downward run-ahead marked past a GPU-dirty page");
+  h.tracker().UnmarkRegionAsGpuModified(h.Page(16), h.page_size);
+}
+
+void TestAheadDownStopsAtHistoryGap() {
+  AheadHarness h;
+  h.FaultEach(10, 16);
+  h.FaultEach(17, 18);
+  h.FaultEach(19, 24);
+  h.Clean(0, 64);
+  // Page 18 has no history but is CPU-dirty already: passed over. Page 16 ends the prefix.
+  h.tracker().MarkRegionAsCpuModified(h.Page(18), h.page_size);
+  h.FaultEachDown(20, 24);
+  Check(h.FaultDown(19) == 2,
+        "downward run-ahead did not pass a CPU-dirty page and stop at a history gap");
+  Check(h.Below(19, 3) == 2 && h.CpuDirty(17) && !h.CpuDirty(16),
+        "downward run-ahead marked a page outside the write history");
+  // A prefix of CPU-dirty pages only is empty.
+  h.Clean(0, 64);
+  h.tracker().MarkRegionAsCpuModified(h.Page(17), h.page_size);
+  Check(h.Below(18, 4) == 0 && !h.CpuDirty(16),
+        "downward run-ahead marked a page that never faulted");
+}
+
+void TestAheadDownHistoryAges() {
+  AheadHarness h;
+  h.FaultEach(10, 24, 0);
+  h.Clean(0, 64);
+  h.FaultEachDown(20, 24, 1);
+  Check(h.FaultDown(19, 1) == 4, "write history did not last one epoch downwards");
+  h.Clean(0, 64);
+  h.FaultEachDown(20, 24, 2);
+  Check(h.FaultDown(19, 2) == 0 && h.Below(19, 4, 2) == 0,
+        "write history outlived two epochs downwards");
+  h.Clean(0, 64);
+  h.FaultEach(10, 24, 2);
+  h.Clean(0, 64);
+  h.FaultEachDown(20, 24, 4);
+  Check(h.FaultDown(19, 4) == 0, "write history survived an epoch gap downwards");
+}
+
+// A fault between two CPU-dirty pages offers a window on each side.
+void TestAheadBothDirections() {
+  AheadHarness h;
+  h.FaultEach(10, 24);
+  h.Clean(0, 64);
+  (void)h.Fault(14);
+  (void)h.Fault(16);
+  Check(h.FaultBoth(15) == std::pair<uint64_t, uint64_t>{4, 4},
+        "a fault between two runs did not offer both windows");
+  ResetProtectionLog();
+  Check(h.Ahead(16, 4) == 4 && h.Below(15, 4) == 4, "a fault between two runs did not mark both");
+  Check(g_protection_log.size() == 2, "the two run-ahead windows did not take one call each");
+  Check(h.CpuDirty(11) && h.CpuDirty(19) && !h.CpuDirty(10) && !h.CpuDirty(20),
+        "the two run-ahead windows marked the wrong pages");
+}
+
+// The downward re-check under the lock walks down from the window's top page: a page turning
+// GPU-dirty inside the window ends the mark there, not a prefix from its bottom.
+void TestAheadDownRecheckUnderLock() {
+  AheadHarness h;
+  h.FaultEach(10, 24);
+  h.Clean(0, 64);
+  h.FaultEachDown(20, 24);
+  const auto down = h.FaultDown(19);
+  Check(down == 4, "downward recheck setup did not offer a window");
+  // The GPU writes page 17 between the candidate and the mark.
+  h.tracker().ForEachUploadRange(
+      h.Page(17), h.page_size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  Check(h.Below(19, down) == 1 && h.CpuDirty(18) && !h.CpuDirty(17) && !h.CpuDirty(16) &&
+            !h.CpuDirty(15) && h.tracker().IsRegionGpuModified(h.Page(17), h.page_size),
+        "downward run-ahead re-checked its window in the wrong direction");
+  h.tracker().UnmarkRegionAsGpuModified(h.Page(17), h.page_size);
+}
+
+// The downward window stops at the region's first page.
+void TestAheadDownStaysInRegion() {
+  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = AllocateFixedGuestRange(region_size * 2, 0x10000);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto boundary = (address + region_size - 1) & ~(region_size - 1);
+  const auto fault = [&](uint64_t vaddr) {
+    return tracker.InvalidateFault(
+        vaddr, 0, [] { Check(false, "region-start fault requested a GPU flush"); },
+        [](uint64_t, uint64_t) noexcept { return 0; });
+  };
+  const auto clean = [&] {
+    tracker.ForEachUploadRange(
+        boundary - 16 * page_size, 32 * page_size, false, [](uint64_t, uint64_t) noexcept {},
+        []() noexcept {});
+  };
+  clean();
+  for (auto page = boundary - 16 * page_size; page < boundary + 16 * page_size;
+       page += page_size) {
+    (void)fault(page);
+  }
+  clean();
+  for (auto page = boundary + 6 * page_size; page > boundary + 2 * page_size;
+       page -= page_size) {
+    (void)fault(page);
+  }
+  Check(fault(boundary + 2 * page_size).down_bytes == 2 * page_size,
+        "downward run-ahead window crossed the region start");
+  (void)fault(boundary + page_size);
+  Check(fault(boundary).down_bytes == 0, "downward run-ahead offered pages before the region");
+  Check(!tracker.IsRegionCpuModified(boundary - page_size, page_size) &&
+            !IsWritable(memory + (boundary - page_size - address)),
+        "downward run-ahead touched the previous region");
+  tracker.MarkRegionAsCpuModified(address, region_size * 2);
+  tracker.UntrackMemory(address, region_size * 2);
+  Release(memory);
+}
+
+// As TestAheadHeldUntilWritable, downwards: the hold covers the whole window even when the
+// re-check marks only its top part, and is released once that part is CPU-dirty.
+void TestAheadDownHeldUntilWritable() {
+  AheadHarness h;
+  h.FaultEach(10, 24);
+  h.Clean(0, 64);
+  h.FaultEachDown(20, 24);
+  const auto down = h.FaultDown(19);
+  Check(down == 4, "downward hold setup did not offer a window");
+  // The GPU writes page 16 between the candidate and the mark: only [17, 19) is marked.
+  h.tracker().ForEachUploadRange(
+      h.Page(16), h.page_size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  struct Hold {
+    AheadHarness *h;
+    int *released;
+    ~Hold() {
+      Check(h->tracker().IsRegionCpuModified(h->Page(17), 2 * h->page_size) &&
+                IsWritable(h->memory + 17 * h->page_size) &&
+                IsWritable(h->memory + 18 * h->page_size),
+            "downward run-ahead released its hold before the pages turned CPU-dirty");
+      (*released)++;
+    }
+  };
+  int calls = 0;
+  int released = 0;
+  const auto marked = h.tracker().InvalidateAhead(
+      h.Page(15), down * h.page_size, Libs::Graphics::AheadDirection::Down, 0,
+      [&](uint64_t vaddr, uint64_t size) {
+        calls++;
+        Check(vaddr == h.Page(15) && size == down * h.page_size,
+              "downward run-ahead hold did not cover the window");
+        Check(!h.CpuDirty(18) && !IsWritable(h.memory + 18 * h.page_size),
+              "downward run-ahead hold ran after the pages turned writable");
+        return Hold{&h, &released};
+      });
+  Check(marked == 2 * h.page_size && calls == 1 && released == 1,
+        "downward run-ahead hold did not run once");
+  Check(!h.CpuDirty(15) && !h.CpuDirty(16), "downward run-ahead marked below a GPU-dirty page");
+  h.tracker().UnmarkRegionAsGpuModified(h.Page(16), h.page_size);
+}
+
+// As TestAheadKeepsImageWatch, downwards.
+void TestAheadDownKeepsImageWatch() {
+  AheadHarness h;
+  h.FaultEach(10, 24);
+  h.Clean(0, 64);
+  h.harness.page_manager.UpdatePageWatchers<true>(h.Page(17), h.page_size);
+  h.FaultEachDown(20, 24);
+  const auto down = h.FaultDown(19);
+  ResetProtectionLog();
+  Check(h.Below(19, down) == down, "downward image watch setup did not mark the window");
+  bool touched = false;
+  for (const auto &call : g_protection_log) {
+    touched |= call.address < h.Page(18) && h.Page(17) < call.address + call.size;
+  }
+  Check(!touched && Protection(h.memory + 17 * h.page_size) == PAGE_READONLY &&
+            IsWritable(h.memory + 16 * h.page_size) && IsWritable(h.memory + 18 * h.page_size),
+        "downward run-ahead unprotected a page an image still watches");
+  h.harness.page_manager.UpdatePageWatchers<false>(h.Page(17), h.page_size);
+}
+
+void TestNonFaultInvalidationNoHistory() {
+  AheadHarness h;
+  for (uint64_t page = 10; page < 24; page++) {
+    h.tracker().InvalidateRegion(h.Page(page), h.page_size,
+                                 [] { Check(false, "clean invalidation requested a flush"); });
+  }
+  h.Clean(0, 64);
+  h.FaultEach(10, 14);
+  Check(h.Fault(14) == 0 && h.Ahead(15, 4) == 0,
+        "a non-fault invalidation made pages eligible for run-ahead");
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 void *g_fault_stack = nullptr;
 constexpr size_t FAULT_STACK_SIZE = 64 * 1024;
@@ -1716,6 +2325,8 @@ int main(int argc, char **argv) {
   TestCpuDirtyUpload();
   TestBdaSyncDirtiness();
   TestBdaSyncConcurrentDrain();
+  TestBdaSyncTakeWaitsForHolds();
+  TestLazyRelease();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestInvalidationHoldsAcrossCpuDirty();
@@ -1735,6 +2346,28 @@ int main(int argc, char **argv) {
   TestUnlockedModificationQueries();
   TestConcurrentHandBacksAreNeverMissed();
   TestFatalPaths();
+  TestAheadFollowsRun();
+  TestAheadNeedsRun();
+  TestAheadStopsAtGpuDirty();
+  TestAheadStopsAtHistoryGap();
+  TestAheadHistoryAges();
+  TestAheadHistoryStaleEpoch();
+  TestAheadWindowFollowsRunLength();
+  TestAheadStaysInRegion();
+  TestAheadHeldUntilWritable();
+  TestAheadRecheckUnderLock();
+  TestNonFaultInvalidationNoHistory();
+  TestAheadKeepsImageWatch();
+  TestAheadDownFollowsRun();
+  TestAheadDownNeedsRun();
+  TestAheadDownStopsAtGpuDirty();
+  TestAheadDownStopsAtHistoryGap();
+  TestAheadDownHistoryAges();
+  TestAheadBothDirections();
+  TestAheadDownRecheckUnderLock();
+  TestAheadDownStaysInRegion();
+  TestAheadDownHeldUntilWritable();
+  TestAheadDownKeepsImageWatch();
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
   TestFaultOnProtectedStack();
   // Last: it leaves its write-fault handler installed.

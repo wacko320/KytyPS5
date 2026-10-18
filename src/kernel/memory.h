@@ -145,6 +145,11 @@ struct GuestBackingView {
 };
 [[nodiscard]] bool     GetGuestBackingView(uint64_t vaddr, uint64_t size, GuestBackingView* out);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// GPU thread: reads back what the GPU wrote of the range, as a read fault would (a page at a
+// time, waiting for a download not yet published), then reads it from the backing store, so the
+// pages need not turn readable at their guest address. False (nothing read) off the GPU thread
+// or when the bytes are not settled after the readback.
+bool                   ReadGpuWrittenBacking(uint64_t vaddr, void* data, uint64_t size);
 // GPU thread (or no GPU): the backing store's view of a range no GPU write has made stale (no
 // GPU-dirty buffer bytes, no GPU-written image), or nullptr.
 [[nodiscard]] const uint8_t* TryViewGpuCleanBacking(uint64_t vaddr, uint64_t size);

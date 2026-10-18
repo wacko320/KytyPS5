@@ -931,15 +931,37 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
+bool ReadGpuWrittenBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread() ||
+	    !IsGpuAddressRange(vaddr, size)) {
+		return false;
+	}
+	auto& buffers = GetGpuResources().GetBufferCache();
+	// GPU-written bytes, and bytes a download has taken but not yet published to the backing
+	// store, are read back (which waits for the publish), a page at a time: a read of a page
+	// whose writer has completed is then taken from the buffer's mapping
+	// (BufferCache::TryReadDirect).
+	const auto settled = [&](uint64_t begin, uint64_t bytes) {
+		return !buffers.HasGpuDirtyBytes(begin, bytes) &&
+		       buffers.IsCleanForConcurrentRead(begin, bytes) &&
+		       !buffers.HasPendingGuestWrite(begin, bytes);
+	};
+	constexpr uint64_t page_size = 4096;
+	for (auto page = vaddr & ~(page_size - 1); page < vaddr + size; page += page_size) {
+		const auto begin = std::max(page, vaddr);
+		const auto end   = std::min(page + page_size, vaddr + size);
+		if (!settled(begin, end - begin)) {
+			const Common::FrameProfiler::ScopedCause cause(
+			    Common::FrameProfiler::ReadbackCause::FaultRead);
+			buffers.ReadMemory(begin, 1);
+		}
+	}
+	return settled(vaddr, size) && TryReadBacking(vaddr, data, size);
+}
+
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
-		if (!Graphics::GuestGpu::IsGpuThread()) {
-			return false;
-		}
-		auto& buffers = GetGpuResources().GetBufferCache();
-		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
-			buffers.ReadMemory(vaddr, size);
-		}
+		return ReadGpuWrittenBacking(vaddr, data, size);
 	}
 	return TryReadBacking(vaddr, data, size);
 }

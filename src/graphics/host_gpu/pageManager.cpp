@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -64,6 +65,9 @@ constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 	std::fflush(stderr);
 	std::_Exit(322);
 }
+
+// While set (PageManager::SetLazyRelease), removed watchers leave the pages' protection.
+thread_local bool t_lazy_release = false;
 
 class SpinGuard final {
 public:
@@ -147,6 +151,10 @@ struct PageManager::Impl {
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
 		std::array<PageState, REGION_PAGES> pages;
+		// Pages whose protection differs from what their watchers ask (a lazy release), and the
+		// protection they have meanwhile.
+		std::array<bool, REGION_PAGES>                        deferred {};
+		std::array<Common::VirtualMemory::Mode, REGION_PAGES> applied {};
 	};
 
 	Impl() {
@@ -225,6 +233,11 @@ struct PageManager::Impl {
 	void UpdateRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last,
 	                          const RegionBits* mask = nullptr) {
 		SpinGuard lock(region.lock);
+		// A lazy release only loosens: the pages keep their protection, noted with what it is.
+		if (!track && t_lazy_release) {
+			DeferRegionWatchers<is_read, masked>(region, base_addr, first, last, mask);
+			return;
+		}
 		auto      perms                 = region.pages[first].Perms();
 		uint64_t  range_begin           = 0;
 		uint64_t  range_bytes           = 0;
@@ -233,6 +246,8 @@ struct PageManager::Impl {
 		const auto release_pending = [&] {
 			if (range_bytes != 0) {
 				Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				std::fill_n(region.deferred.begin() + static_cast<std::ptrdiff_t>(range_begin),
+				            range_bytes / PAGE_SIZE, false);
 				range_bytes           = 0;
 				potential_range_bytes = 0;
 			}
@@ -259,8 +274,17 @@ struct PageManager::Impl {
 				continue;
 			}
 
-			const bool watcher_edge = (track && new_count == 1) || (!track && new_count == 0);
-			if (watcher_edge && old_perms != new_perms) {
+			// A page whose protection was left takes the one its watchers now ask, unless it
+			// has it already: a new watcher may need the faults at once.
+			bool protect = false;
+			if (region.deferred[page_index]) {
+				region.deferred[page_index] = false;
+				protect                     = region.applied[page_index] != new_perms;
+			} else {
+				const bool watcher_edge = (track && new_count == 1) || (!track && new_count == 0);
+				protect                 = watcher_edge && old_perms != new_perms;
+			}
+			if (protect) {
 				if (range_bytes == 0) {
 					range_begin           = page_index;
 					potential_range_bytes = PAGE_SIZE;
@@ -270,6 +294,49 @@ struct PageManager::Impl {
 		}
 
 		release_pending();
+	}
+
+	// A lazy release's UpdateRegionWatchers: watchers are removed without protecting, and each
+	// changed page notes the protection it keeps.
+	template <bool is_read, bool masked>
+	void DeferRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last,
+	                         const RegionBits* mask) {
+		for (size_t page_index = first; page_index < last; page_index++) {
+			if (masked && !mask->Get(page_index)) {
+				continue;
+			}
+			auto&      page      = region.pages[page_index];
+			const auto old_perms = page.Perms();
+			(void)page.AddDelta<-1, is_read>(base_addr + page_index * PAGE_SIZE);
+			const auto new_perms = page.Perms();
+			if (old_perms == new_perms) {
+				continue;
+			}
+			if (!region.deferred[page_index]) {
+				region.applied[page_index] = old_perms;
+			}
+			region.deferred[page_index] = region.applied[page_index] != new_perms;
+		}
+	}
+
+	bool ApplyDeferred(uint64_t vaddr) {
+		auto* region = FindRegion(vaddr);
+		if (region == nullptr) {
+			return false;
+		}
+		const auto region_base = Common::AlignDown(vaddr, REGION_SIZE);
+		const auto page_index  = static_cast<size_t>((vaddr - region_base) / PAGE_SIZE);
+		SpinGuard  lock(region->lock);
+		if (!region->deferred[page_index]) {
+			return false;
+		}
+		region->deferred[page_index] = false;
+		const auto perms             = region->pages[page_index].Perms();
+		if (perms == region->applied[page_index]) {
+			return false;
+		}
+		Protect(region_base + page_index * PAGE_SIZE, PAGE_SIZE, perms);
+		return true;
 	}
 
 	template <bool track, bool is_read>
@@ -348,6 +415,14 @@ bool PageManager::IsReadWatched(uint64_t vaddr) const noexcept {
 	}
 	const auto index = static_cast<size_t>((vaddr % REGION_SIZE) / PAGE_SIZE);
 	return region->pages[index].access_watchers != 0;
+}
+
+bool PageManager::SetLazyRelease(bool lazy) noexcept {
+	return std::exchange(t_lazy_release, lazy);
+}
+
+bool PageManager::ApplyDeferred(uint64_t vaddr) {
+	return m_impl->ApplyDeferred(vaddr);
 }
 
 bool PageManager::IsWriteWatched(uint64_t vaddr) const noexcept {

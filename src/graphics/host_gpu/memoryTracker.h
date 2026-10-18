@@ -41,6 +41,10 @@ public:
 	[[nodiscard]] bool     HasBdaSync() const noexcept {
 		return m_bda_sync_nonempty.load(std::memory_order_acquire);
 	}
+	// Counts the takes of a non-empty set.
+	[[nodiscard]] uint64_t BdaSyncGeneration() const noexcept {
+		return m_bda_sync_generation.load(std::memory_order_relaxed);
+	}
 	// Keeps TakeBdaSync from returning the set it was queued into until the holder drops it.
 	class BdaSyncHold {
 	public:
@@ -78,29 +82,64 @@ public:
 	template <typename Flush, typename CpuDirty>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush,
 	                      CpuDirty&& on_cpu_dirty) noexcept {
-		static_assert(std::is_invocable_v<Flush&>);
+		(void)Invalidate<false>(vaddr, size, 0, on_flush, on_cpu_dirty);
+	}
+	// The run-ahead candidates of a write fault, in bytes: up_bytes from the next page on,
+	// down_bytes ending at the faulting page.
+	struct AheadCandidates {
+		uint64_t up_bytes   = 0;
+		uint64_t down_bytes = 0;
+	};
+	// A guest write fault at vaddr: InvalidateRegion over its byte that also notes the page in the
+	// write history. Returns the pages run-ahead may make CPU-dirty (InvalidateAhead) on either
+	// side: when CPU-dirty pages run directly below the page, the window above it, and when they
+	// run directly above it, the window below it. Each is as long as its run, AHEAD_MIN_PAGES to
+	// AHEAD_MAX_PAGES, cut to its eligible prefix walking away from the page
+	// (RegionManager::AheadEligible); otherwise 0.
+	template <typename Flush, typename CpuDirty>
+	[[nodiscard]] AheadCandidates InvalidateFault(uint64_t vaddr, uint64_t history_epoch,
+	                                              Flush&& on_flush, CpuDirty&& on_cpu_dirty) noexcept {
+		return Invalidate<true>(vaddr, 1, history_epoch, on_flush, on_cpu_dirty);
+	}
+	// Run-ahead after InvalidateFault: makes the eligible prefix of [vaddr, vaddr + size), walked
+	// in direction (from its last page for Down) and checked again under the lock since the state
+	// may have moved, CPU-dirty and writable. It never flushes: the prefix ends before a GPU-dirty
+	// page. on_cpu_dirty is as for InvalidateRegion. The range is whole pages within one region.
+	// Returns the bytes made CPU-dirty, from vaddr on (Up) or ending at vaddr + size (Down).
+	template <typename CpuDirty>
+	uint64_t InvalidateAhead(uint64_t vaddr, uint64_t size, AheadDirection direction,
+	                         uint64_t history_epoch, CpuDirty&& on_cpu_dirty) noexcept {
 		static_assert(std::is_invocable_v<CpuDirty&, uint64_t, uint64_t>);
 		CheckNotInUploadCallback();
-
-		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			const bool should_flush = [&] {
-				[[maybe_unused]] const auto hold =
-				    on_cpu_dirty(manager->GetCpuAddr() + offset, bytes);
-				// Perform both the GPU modification check and CPU state change with the lock in
-				// case the GPU thread is racing to mark the page modified. If a flush is needed,
-				// on_flush performs the CPU state change.
-				std::scoped_lock lock(manager->lock);
-				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
-					return true;
-				}
-				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
-				return false;
-			}();
-			if (should_flush) {
-				on_flush();
-			}
-		});
-		QueueBdaSync(vaddr, size);
+		ValidateRange(vaddr, size);
+		if (size == 0 || vaddr % TRACKER_PAGE_SIZE != 0 || size % TRACKER_PAGE_SIZE != 0 ||
+		    vaddr / TRACKER_REGION_SIZE != (vaddr + size - 1) / TRACKER_REGION_SIZE) {
+			EXIT("invalid run-ahead range\n");
+		}
+		auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+		if (manager == nullptr) {
+			return 0;
+		}
+		const auto pages = size / TRACKER_PAGE_SIZE;
+		const bool down  = direction == AheadDirection::Down;
+		// Released after the lock, once the pages are CPU-dirty, as in InvalidateRegion. It notes
+		// the whole range pending even when the check below marks less: an upload of the pending
+		// set copies only CPU-dirty pages.
+		[[maybe_unused]] const auto hold = on_cpu_dirty(vaddr, size);
+		std::unique_lock            lock(manager->lock);
+		// A downward window is walked from its last page.
+		const auto top      = down ? vaddr + size - TRACKER_PAGE_SIZE : vaddr;
+		const auto eligible = manager->AheadEligible(top, pages, history_epoch, direction);
+		if (eligible == 0) {
+			return 0;
+		}
+		const auto bytes = eligible * TRACKER_PAGE_SIZE;
+		const auto first = down ? vaddr + size - bytes : vaddr;
+		manager->ChangeState<DirtySource::Cpu, true>(first, bytes);
+		lock.unlock();
+		// As InvalidateRegion: queued after the change.
+		QueueBdaSync(first, bytes);
+		return bytes;
 	}
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
@@ -226,6 +265,63 @@ private:
 	                                   const SyncEpochs& epochs) noexcept;
 	void NoteSynced(uint64_t vaddr, uint64_t size, bool is_written,
 	                const SyncEpochs& epochs) noexcept;
+
+	// InvalidateRegion; with note_history, InvalidateFault for a range within one page.
+	template <bool note_history, typename Flush, typename CpuDirty>
+	AheadCandidates Invalidate(uint64_t vaddr, uint64_t size, uint64_t history_epoch,
+	                           Flush& on_flush, CpuDirty& on_cpu_dirty) noexcept {
+		static_assert(std::is_invocable_v<Flush&>);
+		static_assert(std::is_invocable_v<CpuDirty&, uint64_t, uint64_t>);
+		CheckNotInUploadCallback();
+
+		AheadCandidates ahead;
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			const bool should_flush = [&] {
+				[[maybe_unused]] const auto hold =
+				    on_cpu_dirty(manager->GetCpuAddr() + offset, bytes);
+				// Perform both the GPU modification check and CPU state change with the lock in
+				// case the GPU thread is racing to mark the page modified. If a flush is needed,
+				// on_flush performs the CPU state change.
+				std::scoped_lock lock(manager->lock);
+				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
+					return true;
+				}
+				const auto address = manager->GetCpuAddr() + offset;
+				manager->ChangeState<DirtySource::Cpu, true>(address, bytes);
+				if constexpr (note_history) {
+					manager->NoteCpuWritten(address, history_epoch);
+					ahead = FindAheadCandidates(*manager, address, history_epoch);
+				}
+				return false;
+			}();
+			if (should_flush) {
+				on_flush();
+			}
+		});
+		QueueBdaSync(vaddr, size);
+		return ahead;
+	}
+	// Requires the region's lock. The run-ahead candidates around the page holding vaddr.
+	static AheadCandidates FindAheadCandidates(RegionManager& manager, uint64_t vaddr,
+	                                           uint64_t history_epoch) {
+		const auto      page = vaddr - vaddr % TRACKER_PAGE_SIZE;
+		AheadCandidates ahead;
+		const auto      below = manager.CpuDirtyRunBelow(vaddr, AHEAD_MAX_PAGES);
+		if (below != 0 && page + TRACKER_PAGE_SIZE != manager.GetCpuAddr() + TRACKER_REGION_SIZE) {
+			const auto window = std::clamp(below, AHEAD_MIN_PAGES, AHEAD_MAX_PAGES);
+			ahead.up_bytes    = manager.AheadEligible(page + TRACKER_PAGE_SIZE, window,
+			                                          history_epoch, AheadDirection::Up) *
+			                 TRACKER_PAGE_SIZE;
+		}
+		const auto above = manager.CpuDirtyRunAbove(vaddr, AHEAD_MAX_PAGES);
+		if (above != 0 && page != manager.GetCpuAddr()) {
+			const auto window = std::clamp(above, AHEAD_MIN_PAGES, AHEAD_MAX_PAGES);
+			ahead.down_bytes  = manager.AheadEligible(page - TRACKER_PAGE_SIZE, window,
+			                                          history_epoch, AheadDirection::Down) *
+			                   TRACKER_PAGE_SIZE;
+		}
+		return ahead;
+	}
 
 	void CheckNotInUploadCallback() const noexcept {
 		if (s_upload_owner == this) {

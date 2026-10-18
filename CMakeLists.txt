@@ -316,6 +316,23 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${dispatch_threads_shader_header}")
+foreach(shader_name IN ITEMS color_clear color_clear_store color_clear_fill)
+	set(shader_source "${gpu_tiler_shader_dir}/${shader_name}.comp")
+	set(shader_spv "${gpu_tiler_generated_dir}/${shader_name}.spv")
+	set(shader_header "${gpu_tiler_generated_dir}/${shader_name}_spv.h")
+	string(TOUPPER "${shader_name}_SPV" shader_symbol)
+	add_custom_command(
+		OUTPUT "${shader_header}"
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+		        -o "${shader_spv}" "${shader_source}"
+		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
+		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+		DEPENDS "${shader_source}"
+		VERBATIM
+	)
+	list(APPEND kyty_emulator_src "${shader_header}")
+endforeach()
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
@@ -735,6 +752,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --writeback-only)
 	add_test(NAME epoch_coherence
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --epoch-coherence-only)
+	add_test(NAME direct_readback
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --direct-readback-only)
+	add_test(NAME color_clear_gpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --color-clear-gpu-only)
 	add_test(NAME stream_buffer_ring
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
 	add_test(NAME gpu_command_lane

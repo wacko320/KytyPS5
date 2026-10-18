@@ -508,6 +508,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		supported_barycentric.pNext = supported_features2.pNext;
 		supported_features2.pNext   = &supported_barycentric;
 	}
+	const bool conditional_rendering_extension =
+	    HasExtension(device_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+	vk::PhysicalDeviceConditionalRenderingFeaturesEXT supported_conditional_rendering {};
+	if (conditional_rendering_extension) {
+		supported_conditional_rendering.pNext = supported_features2.pNext;
+		supported_features2.pNext             = &supported_conditional_rendering;
+	}
 	physical_device.getFeatures2(&supported_features2);
 	const bool barycentric_supported =
 	    barycentric_extension && supported_barycentric.fragmentShaderBarycentric == VK_TRUE;
@@ -516,6 +523,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		    "WARNING: Your GPU is not fully supported (fragmentShaderBarycentric is unavailable). "
 		    "Some games may render incorrectly or crash.\n");
 	}
+	graphics.conditional_rendering_enabled =
+	    conditional_rendering_extension && supported_conditional_rendering.conditionalRendering;
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
@@ -673,6 +682,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.maintenance8_enabled) {
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
+	}
+	vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering_features {};
+	if (graphics.conditional_rendering_enabled) {
+		conditional_rendering_features.conditionalRendering = VK_TRUE;
+		conditional_rendering_features.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext                    = &conditional_rendering_features;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1047,7 +1062,8 @@ void WindowContext::CreateVulkan() {
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
 		                             VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
-		                             VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME}) {
+		                             VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
+		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}

@@ -25,7 +25,9 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
+#include <string_view>
 #include <tuple>
 #include <utility>
 #include <vulkan/vulkan_format_traits.hpp>
@@ -115,6 +117,119 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 	return true;
 }
 
+[[nodiscard]] uint32_t FloatToHalf(float value) {
+	// Round to nearest even; overflow gives infinity.
+	uint32_t bits = 0;
+	std::memcpy(&bits, &value, sizeof(bits));
+	const uint32_t sign = (bits >> 16u) & 0x8000u;
+	bits &= 0x7fffffffu;
+	if (bits >= ((127u + 16u) << 23u)) {
+		return sign | (bits > 0x7f800000u ? 0x7e00u : 0x7c00u);
+	}
+	if (bits < (113u << 23u)) {
+		constexpr uint32_t DenormMagic = ((127u - 15u) + (23u - 10u) + 1u) << 23u;
+		float magic = 0.0f;
+		std::memcpy(&magic, &DenormMagic, sizeof(magic));
+		float denorm = 0.0f;
+		std::memcpy(&denorm, &bits, sizeof(denorm));
+		denorm += magic;
+		std::memcpy(&bits, &denorm, sizeof(bits));
+		return sign | (bits - DenormMagic);
+	}
+	const uint32_t odd = (bits >> 13u) & 1u;
+	bits += (static_cast<uint32_t>(15 - 127) << 23u) + 0xfffu + odd;
+	return sign | (bits >> 13u);
+}
+
+// The clear texel of a colour as guest memory holds it, repeated over two words (an 8-byte texel
+// alternates them). False for a format not packed here.
+[[nodiscard]] bool PackClearTexel(vk::Format format, const vk::ClearColorValue& color,
+                                  std::array<uint32_t, 2>& words) {
+	const auto& c     = color.float32;
+	const auto  unorm = [](float value, uint32_t max) {
+        return static_cast<uint64_t>(
+            std::lround(std::clamp(value, 0.0f, 1.0f) * static_cast<float>(max)));
+	};
+	uint64_t texel = 0;
+	uint32_t bytes = 0;
+	switch (format) {
+		case vk::Format::eR8Unorm:
+			texel = unorm(c[0], 0xff);
+			bytes = 1;
+			break;
+		case vk::Format::eR8G8Unorm:
+			texel = unorm(c[0], 0xff) | unorm(c[1], 0xff) << 8u;
+			bytes = 2;
+			break;
+		case vk::Format::eR8G8B8A8Unorm:
+			texel = unorm(c[0], 0xff) | unorm(c[1], 0xff) << 8u | unorm(c[2], 0xff) << 16u |
+			        unorm(c[3], 0xff) << 24u;
+			bytes = 4;
+			break;
+		case vk::Format::eB8G8R8A8Unorm:
+			texel = unorm(c[2], 0xff) | unorm(c[1], 0xff) << 8u | unorm(c[0], 0xff) << 16u |
+			        unorm(c[3], 0xff) << 24u;
+			bytes = 4;
+			break;
+		case vk::Format::eA2B10G10R10UnormPack32:
+			texel = unorm(c[0], 0x3ff) | unorm(c[1], 0x3ff) << 10u | unorm(c[2], 0x3ff) << 20u |
+			        unorm(c[3], 3) << 30u;
+			bytes = 4;
+			break;
+		case vk::Format::eA2R10G10B10UnormPack32:
+			texel = unorm(c[2], 0x3ff) | unorm(c[1], 0x3ff) << 10u | unorm(c[0], 0x3ff) << 20u |
+			        unorm(c[3], 3) << 30u;
+			bytes = 4;
+			break;
+		case vk::Format::eR16Unorm:
+			texel = unorm(c[0], 0xffff);
+			bytes = 2;
+			break;
+		case vk::Format::eR16G16Unorm:
+			texel = unorm(c[0], 0xffff) | unorm(c[1], 0xffff) << 16u;
+			bytes = 4;
+			break;
+		case vk::Format::eR16G16B16A16Unorm:
+			texel = unorm(c[0], 0xffff) | unorm(c[1], 0xffff) << 16u |
+			        unorm(c[2], 0xffff) << 32u | unorm(c[3], 0xffff) << 48u;
+			bytes = 8;
+			break;
+		case vk::Format::eR16Sfloat:
+			texel = FloatToHalf(c[0]);
+			bytes = 2;
+			break;
+		case vk::Format::eR16G16Sfloat:
+			texel = FloatToHalf(c[0]) | uint64_t {FloatToHalf(c[1])} << 16u;
+			bytes = 4;
+			break;
+		case vk::Format::eR16G16B16A16Sfloat:
+			texel = FloatToHalf(c[0]) | uint64_t {FloatToHalf(c[1])} << 16u |
+			        uint64_t {FloatToHalf(c[2])} << 32u | uint64_t {FloatToHalf(c[3])} << 48u;
+			bytes = 8;
+			break;
+		case vk::Format::eR32Sfloat:
+		case vk::Format::eR32G32Sfloat: {
+			std::array<uint32_t, 2> channels {};
+			std::memcpy(channels.data(), c.data(), sizeof(channels));
+			texel = channels[0] | (format == vk::Format::eR32G32Sfloat
+			                           ? uint64_t {channels[1]} << 32u
+			                           : uint64_t {channels[0]} << 32u);
+			words = {static_cast<uint32_t>(texel), static_cast<uint32_t>(texel >> 32u)};
+			return true;
+		}
+		default: return false;
+	}
+	switch (bytes) {
+		case 1: texel *= 0x0101010101010101ull; break;
+		case 2: texel *= 0x0001000100010001ull; break;
+		case 4: texel |= texel << 32u; break;
+		default: break;
+	}
+	words = {static_cast<uint32_t>(texel), static_cast<uint32_t>(texel >> 32u)};
+	return true;
+}
+
+
 } // namespace
 
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -122,7 +237,7 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
       m_blit_helper(graphics, scheduler),
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
-      m_buffer_cache(buffer_cache),
+      m_buffer_cache(buffer_cache), m_color_clear(graphics, scheduler),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
@@ -1095,10 +1210,12 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	    desc.info.metadata.kind != ImageMetadataKind::Cmask) {
 		return;
 	}
+	using Common::FrameProfiler::Counter;
+	Common::FrameProfiler::Add(Counter::ColorClearLookups);
 	const auto range = desc.info.metadata.range;
 	{
 		std::scoped_lock lock {m_lock};
-		auto& image = m_slot_images[id];
+		auto&            image = m_slot_images[id];
 		if (image.info.HasMetadata() != desc.info.HasMetadata()) {
 			MoveResolveEpoch(image.info.data);
 		}
@@ -1124,14 +1241,26 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
-	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
-	// so discovery runs before final draw uploads and never holds the texture lock across it.
-	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+	Common::FrameProfiler::Add(Counter::ColorClearChecks);
+	const auto slice_size = range.size / layers;
+	const auto span       = range.address + slice_size * first;
+	// Metadata the GPU wrote is checked on the GPU, after its writers, so nothing waits for it.
+	// The CPU checks metadata only the CPU wrote, which it reads without waiting.
+	if (m_buffer_cache.IsRegionGpuModified(span, slice_size * count)) {
+		Common::FrameProfiler::Add(Counter::ColorClearGpuModified);
+		if (MaterializeColorClearOnGpu(id, desc, slice_size, first, image_first, count)) {
+			return;
+		}
+		// No GPU route: finish the metadata writes before reading backing bytes. This can submit
+		// the scheduler, so discovery runs before final draw uploads and never holds the texture
+		// lock across it.
+		Common::FrameProfiler::Add(Counter::ColorClearNoGpuRoute);
+		Common::FrameProfiler::Add(Counter::ColorClearReadbacks);
+		m_color_clear_stats.readbacks.fetch_add(1, std::memory_order_relaxed);
 		const Common::FrameProfiler::ScopedCause cause(
 		    Common::FrameProfiler::ReadbackCause::Metadata);
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
-	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
@@ -1149,6 +1278,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
 			continue;
 		}
+		Common::FrameProfiler::Add(Counter::ColorClearCpuSlicesCleared);
+		m_color_clear_stats.cpu_slices_cleared.fetch_add(1, std::memory_order_relaxed);
 		{
 			std::scoped_lock lock {m_lock};
 			const auto& image = m_slot_images[id];
@@ -1170,6 +1301,301 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
 	}
+}
+
+TextureCache::ColorClearStats TextureCache::GetColorClearStats() const noexcept {
+	const auto& stats = m_color_clear_stats;
+	return {stats.gpu_checks.load(std::memory_order_relaxed),
+	        stats.gpu_unchanged.load(std::memory_order_relaxed),
+	        stats.storage_clears.load(std::memory_order_relaxed),
+	        stats.buffer_fills.load(std::memory_order_relaxed),
+	        stats.readbacks.load(std::memory_order_relaxed),
+	        stats.cpu_slices_cleared.load(std::memory_order_relaxed)};
+}
+
+bool TextureCache::ColorClearCandidates::operator==(
+    const ColorClearCandidates& other) const noexcept {
+	return count == other.count && codes == other.codes &&
+	       std::memcmp(colors.data(), other.colors.data(), sizeof(colors)) == 0;
+}
+
+bool TextureCache::DecodeColorClearCode(const ImageDesc& desc, uint8_t code,
+                                        vk::ClearColorValue& clear) {
+	return DecodeColorClear(desc, code, clear);
+}
+
+TextureCache::ColorClearCandidates TextureCache::FindColorClearCandidates(const ImageDesc& desc) {
+	// Every code DecodeColorClear can accept: the register-clear code (0 for CMask, 0x20 for
+	// DCC) and DCC's four constant codes.
+	constexpr std::array<uint8_t, 5> Codes {0x00, 0x20, 0x40, 0x80, 0xc0};
+	ColorClearCandidates             candidates;
+	for (const auto code: Codes) {
+		vk::ClearColorValue color {};
+		if (DecodeColorClear(desc, code, color)) {
+			candidates.codes[candidates.count]    = code;
+			candidates.colors[candidates.count++] = color;
+		}
+	}
+	return candidates;
+}
+
+bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
+                                              uint64_t slice_size, uint32_t first,
+                                              uint32_t image_first, uint32_t count) {
+	using Common::FrameProfiler::Counter;
+	const auto& view       = desc.view_info;
+	const auto  range      = desc.info.metadata.range;
+	const auto  span       = range.address + slice_size * first;
+	const auto  candidates = FindColorClearCandidates(desc);
+	if (candidates.count == 0) {
+		// No byte value is a clear for this desc: whatever the GPU wrote, nothing is cleared.
+		return true;
+	}
+	if (view.level_count != 1 || !ColorClearKernels::Fits(count, candidates.count)) {
+		return false;
+	}
+	// Skip when unchanged: after a check, a matched slice holds 0xff (no candidate) and every
+	// other slice no candidate throughout, so a check with the same candidates and slice size
+	// clears nothing, for any image, while nothing wrote the range and no CPU write waits for
+	// upload (an equal check had a GPU route). VideoOut metadata keeps its codes, so every lookup
+	// clears again, as on the CPU path.
+	const bool expand     = desc.type != BindingType::VideoOut;
+	const auto slice_bits = first + count > 64 ? uint64_t {0}
+	                        : count == 64      ? UINT64_MAX
+	                                           : ((uint64_t {1} << count) - 1) << first;
+	const auto find_record = [&]() -> ColorClearRecord* {
+		const auto found = m_color_clear_records.find(range.address);
+		if (found == m_color_clear_records.end()) {
+			return nullptr;
+		}
+		const auto record =
+		    std::find_if(found->second.begin(), found->second.end(), [&](const auto& entry) {
+			    return entry.size == range.size && entry.slice_size == slice_size &&
+			           entry.candidates == candidates;
+		    });
+		return record == found->second.end() ? nullptr : &*record;
+	};
+	std::optional<ColorClearRecord> recorded;
+	vk::ImageUsageFlags             image_usage;
+	vk::Extent2D                    extent;
+	bool                            gpu_owned    = false;
+	bool                            buffer_owned = false;
+	GuestRange                      data {};
+	vk::Format                      data_format = vk::Format::eUndefined;
+	{
+		std::scoped_lock lock {m_lock};
+		if (const auto* record = expand ? find_record() : nullptr) {
+			recorded = *record;
+		}
+		const auto& image = m_slot_images[id];
+		image_usage       = image.backing.usage;
+		extent            = {std::max(image.info.extent.width >> view.base_level, 1u),
+		                     std::max(image.info.extent.height >> view.base_level, 1u)};
+		gpu_owned = image.IsGpuModified() && !image.IsBufferModified() && !image.IsCpuDirty();
+		buffer_owned = !image.IsGpuModified() && image.IsBufferModified() && !image.IsCpuDirty();
+		data         = image.info.data;
+		data_format  = image.info.pixel_format;
+	}
+	if (recorded && slice_bits != 0 && (recorded->slices & slice_bits) == slice_bits &&
+	    recorded->generation == m_buffer_cache.WriteGeneration(range.address, range.size) &&
+	    !m_buffer_cache.IsRegionCpuModified(span, slice_size * count)) {
+		Common::FrameProfiler::Add(Counter::ColorClearGpuUnchanged);
+		m_color_clear_stats.gpu_unchanged.fetch_add(1, std::memory_order_relaxed);
+		return true;
+	}
+	// The predicated clear is vkCmdClearAttachments in a rendering instance on the slice (a
+	// transfer clear or loadOp = Clear is not predicated). Without conditional rendering, a
+	// storage clear dispatched with the check's group counts, for float colours; a 2D storage
+	// view of a volume slice would need VK_EXT_image_2d_view_of_3d, so volumes have none.
+	const auto features = m_graphics.GetFormatProperties(view.format).optimalTilingFeatures;
+	const bool conditional = m_graphics.conditional_rendering_enabled &&
+	                         (image_usage & vk::ImageUsageFlagBits::eColorAttachment) &&
+	                         (features & vk::FormatFeatureFlagBits::eColorAttachment);
+	const auto numeric      = std::string_view(vk::componentNumericFormat(view.format, 0));
+	const bool storage      = !conditional && desc.info.samples == 1 && !desc.info.IsVolume() &&
+	                          (image_usage & vk::ImageUsageFlagBits::eStorage) &&
+	                          (features & vk::FormatFeatureFlagBits::eStorageImage) &&
+	                          numeric != "UINT" && numeric != "SINT";
+	// Which slices clear is known only on the GPU, so the route takes images whose tracking a
+	// clear leaves as it is: GPU-written, with no guest data to take first (ClearImage's
+	// bookkeeping is then a no-op). Committing a guest-owned image as GPU-written when nothing
+	// cleared would make it the owner of memory others still write. The CPU check commits only
+	// where a code matched.
+	// An image whose guest memory the GPU wrote as a buffer, and that has not taken it yet, keeps
+	// that ownership either way: a matched slice is filled with its texel in the buffer, and the
+	// image takes it from there as it would any buffer write. Uniform bytes are the same texels
+	// in every tiling.
+	const auto layers     = desc.info.TransferLayers();
+	const auto data_slice = layers != 0 ? data.size / layers : 0;
+	std::array<std::array<uint32_t, 2>, ColorClearKernels::MaxCodes> patterns {};
+	bool fill = !gpu_owned && buffer_owned && expand && desc.info.samples == 1 &&
+	            !desc.info.IsVolume() && view.format == data_format && data.Valid() &&
+	            data.size % layers == 0 && data_slice % sizeof(uint32_t) == 0 &&
+	            image_first + count <= layers;
+	for (uint32_t k = 0; fill && k < candidates.count; k++) {
+		fill = PackClearTexel(data_format, candidates.colors[k], patterns[k]);
+	}
+	if (!gpu_owned && !fill) {
+		Common::FrameProfiler::Add(Counter::ColorClearGuestOwned);
+		return false;
+	}
+	if (!fill && !conditional && !storage) {
+		return false;
+	}
+	Common::FrameProfiler::Add(Counter::ColorClearGpuChecks);
+	Common::FrameProfiler::Add(Counter::ColorClearGpuSlices, count);
+	m_color_clear_stats.gpu_checks.fetch_add(1, std::memory_order_relaxed);
+	if (fill) {
+		Common::FrameProfiler::Add(Counter::ColorClearBufferFills);
+		m_color_clear_stats.buffer_fills.fetch_add(1, std::memory_order_relaxed);
+	} else if (storage) {
+		Common::FrameProfiler::Add(Counter::ColorClearStorageClears);
+		m_color_clear_stats.storage_clears.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	// The expansion writes the slices: they are bound as written, which uploads their CPU writes
+	// first, keeps later CPU reads faulting for the 0xff bytes, and is no guest write to image
+	// data over them (no image invalidation). The slices of an equal earlier check stand only if
+	// this binding's own write was the one note since: creating or joining its buffer, or an
+	// upload of CPU writes, may change slices outside the span.
+	// The filled data is bound as written too. Obtaining it can create or join buffers, so it is
+	// obtained once before the metadata and translated again after it.
+	const auto data_span = data.address + data_slice * image_first;
+	if (fill) {
+		(void)m_buffer_cache.ObtainBuffer(data_span, data_slice * count, true);
+	}
+	const auto notes      = m_buffer_cache.WriteNotes();
+	const auto generation = recorded ? m_buffer_cache.WriteGeneration(range.address, range.size)
+	                                 : uint64_t {0};
+	const auto [buffer, offset] = m_buffer_cache.ObtainBuffer(span, slice_size * count, expand);
+	const bool keep_slices = recorded && recorded->generation == generation &&
+	                         m_buffer_cache.WriteNotes() - notes == 1;
+	const auto [data_buffer, data_offset] =
+	    fill ? m_buffer_cache.ObtainBuffer(data_span, data_slice * count, true)
+	         : std::pair<Buffer*, uint64_t> {nullptr, 0};
+	{
+		std::scoped_lock lock {m_lock};
+		auto&            image   = m_slot_images[id];
+		auto&            command = m_scheduler.Current();
+		command.EndRendering();
+		const auto native = command.Handle();
+		const auto check  = m_color_clear.RecordCheck(
+		    native, buffer->Handle(), offset, slice_size, count,
+		    std::span(candidates.codes.data(), candidates.count),
+		    {(extent.width + ColorClearKernels::StoreGroupSize.width - 1) /
+		         ColorClearKernels::StoreGroupSize.width,
+		     (extent.height + ColorClearKernels::StoreGroupSize.height - 1) /
+		         ColorClearKernels::StoreGroupSize.height});
+		if (fill) {
+			for (uint32_t slice = 0; slice < count; slice++) {
+				for (uint32_t k = 0; k < candidates.count; k++) {
+					m_color_clear.RecordBufferFill(native, data_buffer->Handle(),
+					                               data_offset + data_slice * slice, data_slice,
+					                               patterns[k], check, slice, k);
+				}
+			}
+		} else {
+			ImageViewInfo slice_view {};
+			slice_view.format     = view.format;
+			slice_view.type       = vk::ImageViewType::e2D;
+			slice_view.base_level = view.base_level;
+			slice_view.usage      = conditional ? vk::ImageUsageFlagBits::eColorAttachment
+			                                    : vk::ImageUsageFlagBits::eStorage;
+			// Both routes write: the memory-write bit makes a barrier order a clear after the
+			// attachment writes of draws or an earlier clear even when the layout is unchanged.
+			if (conditional) {
+				image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+				              vk::AccessFlagBits2::eColorAttachmentWrite |
+				                  vk::AccessFlagBits2::eMemoryWrite,
+				              {}, native);
+			} else {
+				image.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite, {},
+				              native);
+			}
+			for (uint32_t slice = 0; slice < count; slice++) {
+				slice_view.base_layer = image_first + slice;
+				const auto image_view = image.FindView(slice_view);
+				if (!conditional) {
+					for (uint32_t k = 0; k < candidates.count; k++) {
+						std::array<float, 4> color {};
+						std::memcpy(color.data(), &candidates.colors[k], sizeof(color));
+						m_color_clear.RecordStoreClear(native, image_view, extent, color, check,
+						                               slice, k);
+					}
+					continue;
+				}
+				vk::RenderingAttachmentInfo attachment {};
+				attachment.imageView   = image_view;
+				attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+				attachment.loadOp      = vk::AttachmentLoadOp::eLoad;
+				attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+				vk::RenderingInfo rendering {};
+				rendering.renderArea.extent    = extent;
+				rendering.layerCount           = 1;
+				rendering.colorAttachmentCount = 1;
+				rendering.pColorAttachments    = &attachment;
+				native.beginRendering(&rendering);
+				for (uint32_t k = 0; k < candidates.count; k++) {
+					vk::ConditionalRenderingBeginInfoEXT predicate {};
+					predicate.buffer = check.results;
+					predicate.offset = check.RecordOffset(slice, k);
+					native.beginConditionalRenderingEXT(&predicate);
+					vk::ClearAttachment clear {};
+					clear.aspectMask        = vk::ImageAspectFlagBits::eColor;
+					clear.colorAttachment   = 0;
+					clear.clearValue.color  = candidates.colors[k];
+					const vk::ClearRect area {{{0, 0}, extent}, 0, 1};
+					native.clearAttachments(1, &clear, 1, &area);
+					native.endConditionalRenderingEXT();
+				}
+				native.endRendering();
+			}
+		}
+		if (expand) {
+			m_color_clear.RecordExpand(native, check, buffer->Handle(), offset, slice_size);
+		}
+	}
+	if (!expand) {
+		return true;
+	}
+	m_buffer_cache.CommitWrittenRanges();
+	if (slice_bits == 0) {
+		return true;
+	}
+	// The outcome stands from here, until a note moves the range's generation (the first read
+	// starts watching it).
+	const auto current = m_buffer_cache.WriteGeneration(range.address, range.size);
+	std::scoped_lock lock {m_lock};
+	auto*            record = find_record();
+	if (record == nullptr) {
+		auto found = m_color_clear_records.find(range.address);
+		if (found == m_color_clear_records.end()) {
+			if (m_color_clear_records.size() >= COLOR_CLEAR_ADDRESSES) {
+				const auto evicted = m_color_clear_records.begin();
+				m_buffer_cache.UnwatchWrites(evicted->first, 1);
+				m_color_clear_records.erase(evicted);
+			}
+			found = m_color_clear_records.try_emplace(range.address).first;
+		}
+		auto& records = found->second;
+		if (records.size() == COLOR_CLEAR_RECORDS) {
+			const auto size = records.front().size;
+			records.erase(records.begin());
+			if (size != range.size && std::none_of(records.begin(), records.end(),
+			                                       [size](const auto& entry) {
+				                                       return entry.size == size;
+			                                       })) {
+				m_buffer_cache.UnwatchRange(range.address, size);
+			}
+		}
+		records.push_back({.size = range.size, .slice_size = slice_size, .candidates = candidates});
+		record = &records.back();
+	} else if (!keep_slices) {
+		record->slices = 0;
+	}
+	record->generation = current;
+	record->slices |= slice_bits;
+	return true;
 }
 
 void TextureCache::RefreshImage(ImageId id) {
@@ -1736,6 +2162,21 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	InvalidateCpuAliases(address, size);
 }
 
+TextureCache::AheadImageFree TextureCache::InvalidateMemory(uint64_t address, uint64_t size,
+                                                            uint64_t up_address, uint64_t up_size,
+                                                            uint64_t down_address,
+                                                            uint64_t down_size) {
+	if (!GuestRange {address, size}.Valid() ||
+	    (up_size != 0 && !GuestRange {up_address, up_size}.Valid()) ||
+	    (down_size != 0 && !GuestRange {down_address, down_size}.Valid())) {
+		EXIT("TextureCache: invalid memory-invalidation range\n");
+	}
+	std::scoped_lock lock {m_lock};
+	InvalidateCpuAliases(address, size);
+	return {.up   = up_size == 0 || FindImagesInRegion(up_address, up_size, true).empty(),
+	        .down = down_size == 0 || FindImagesInRegion(down_address, down_size, true).empty()};
+}
+
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {
 	const auto&    info             = image.info;
 	const auto     layers           = info.resources.layers;
@@ -1862,6 +2303,8 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		return false;
 	}
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels);
+	NoteOpenWrite(image.info.data.address, copy_size);
+	NoteBufferWrite(image.info.data.address, copy_size);
 	return true;
 }
 
@@ -2014,6 +2457,10 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		EXIT("TextureCache: invalid unmap range\n");
 	}
 	std::scoped_lock lock {m_lock};
+	m_buffer_cache.UnwatchWrites(address, size);
+	std::erase_if(m_color_clear_records, [&](const auto& entry) {
+		return entry.first >= address && entry.first - address < size;
+	});
 	// HTILE belongs to guest memory, independently of native image replacements.
 	for (auto metadata = m_surface_metas.begin(); metadata != m_surface_metas.end();) {
 		const auto base = metadata->first;

@@ -460,6 +460,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	// Before the dispatch is recorded: a readback in between must not take it for unwritten.
+	if (program.has_address_writes) {
+		m_context.GetBufferCache().NoteUntrackedWrites();
+	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
@@ -574,6 +578,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                              vk::PipelineStageFlagBits::eTransfer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
+	// Before the dispatch is recorded: a readback in between must not take it for unwritten.
+	if (program.has_address_writes) {
+		m_context.GetBufferCache().NoteUntrackedWrites();
+	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);

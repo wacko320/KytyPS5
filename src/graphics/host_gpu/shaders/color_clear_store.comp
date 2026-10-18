@@ -1,0 +1,21 @@
+#version 450
+
+// Fast-clear fallback without conditional rendering (TextureCache::MaterializeColorClear): a
+// storage clear of one slice, dispatched indirectly with the group counts color_clear.comp's
+// finalize mode wrote (none when the slice does not match the code).
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform writeonly image2D target;
+
+layout(push_constant) uniform constants {
+    vec4  color;
+    uvec2 extent;
+} pc;
+
+void main() {
+    if (any(greaterThanEqual(gl_GlobalInvocationID.xy, pc.extent))) {
+        return;
+    }
+    imageStore(target, ivec2(gl_GlobalInvocationID.xy), pc.color);
+}

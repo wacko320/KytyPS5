@@ -37,6 +37,8 @@ struct GraphicContext {
 	bool                               maintenance8_enabled                  = false;
 	// Vulkan 1.2 hostQueryReset: timestamp pools are reset on the host, not in command buffers.
 	bool                               host_query_reset_enabled              = false;
+	// VK_EXT_conditional_rendering: fast clears the GPU decides on (TextureCache).
+	bool                               conditional_rendering_enabled         = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};

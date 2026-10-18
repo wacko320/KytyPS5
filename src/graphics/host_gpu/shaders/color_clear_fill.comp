@@ -1,0 +1,29 @@
+#version 450
+
+// Fast clear of an image whose guest memory the GPU wrote as a buffer
+// (TextureCache::MaterializeColorClear): the slice's bytes are filled with the clear texel,
+// dispatched indirectly with the group counts color_clear.comp's finalize mode wrote (none when
+// the slice does not match the code). The image takes them from the buffer as it does any other
+// buffer write.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(std430, binding = 0) writeonly buffer target {
+    uint words[];
+};
+
+layout(push_constant) uniform constants {
+    uint first_word;
+    uint word_count;
+    // The clear texel, repeated: words alternate for an 8-byte texel.
+    uvec2 pattern;
+} pc;
+
+void main() {
+    const uint threads = gl_NumWorkGroups.x * gl_NumWorkGroups.y * 64u;
+    const uint row     = gl_NumWorkGroups.x * 8u;
+    for (uint i = gl_GlobalInvocationID.y * row + gl_GlobalInvocationID.x; i < pc.word_count;
+         i += threads) {
+        words[pc.first_word + i] = (i & 1u) == 0u ? pc.pattern.x : pc.pattern.y;
+    }
+}

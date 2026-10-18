@@ -30,6 +30,13 @@ public:
 	[[nodiscard]] bool IsReadWatched(uint64_t vaddr) const noexcept;
 	// Whether a write to the page holding vaddr would fault for tracking. Unlocked hint.
 	[[nodiscard]] bool IsWriteWatched(uint64_t vaddr) const noexcept;
+	// Lazy release, for a hand-back of pages the GPU writes again soon: while set on this
+	// thread, removed watchers leave the pages' protection as it is, noted, so the next watcher
+	// to ask for it again needs no protection change. A fault on such a page applies what its
+	// watchers ask (ApplyDeferred) and the access is retried. Returns the previous setting.
+	static bool SetLazyRelease(bool lazy) noexcept;
+	// Any thread, from a fault: whether the page's protection was left and is now applied.
+	[[nodiscard]] bool ApplyDeferred(uint64_t vaddr);
 
 private:
 	struct Impl;

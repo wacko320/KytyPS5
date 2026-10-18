@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/frameProfiler.h"
 #include "common/logging/log.h"
@@ -74,6 +75,11 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	// A page handed back lazily keeps its protection until an access needs the one its watchers
+	// ask: the access is retried.
+	if (m_page_manager.ApplyDeferred(fault_vaddr)) {
+		return true;
+	}
 	if (Common::FrameProfiler::Active()) {
 		using Common::FrameProfiler::Counter;
 		Common::FrameProfiler::Add(access == PageFaultAccess::Write ? Counter::GuestWriteFaultsRender
@@ -81,8 +87,35 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		                           Common::FrameProfiler::CurrentRole());
 	}
 	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		// A write that continues a run of CPU-dirty pages also makes the next pages writable, so
+		// the run faults once per window: those above it for a run below, those below it for a
+		// run above. Pages under an image stay with the texture path.
+		auto       ahead = m_buffer_cache.InvalidateFault(fault_vaddr);
+		const auto page  = Common::AlignDown(fault_vaddr, TRACKER_PAGE_SIZE);
+		const auto next  = page + TRACKER_PAGE_SIZE;
+		const auto first = page - ahead.down_bytes;
+		// A window below can start on guest address 0, which is no valid guest range.
+		if (!GuestRange {first, ahead.down_bytes}.Valid()) {
+			ahead.down_bytes = 0;
+		}
+		const auto image_free = m_texture_cache.InvalidateMemory(
+		    fault_vaddr, fault_size, next, ahead.up_bytes, first, ahead.down_bytes);
+		const auto mark = [&](uint64_t vaddr, uint64_t size, AheadDirection direction,
+		                      Common::FrameProfiler::Counter pages) {
+			const auto marked = m_buffer_cache.InvalidateAhead(vaddr, size, direction);
+			if (marked != 0 && Common::FrameProfiler::Active()) {
+				Common::FrameProfiler::Add(pages, marked / TRACKER_PAGE_SIZE);
+				Common::FrameProfiler::Add(Common::FrameProfiler::Counter::RunAheadMarks);
+			}
+		};
+		if (ahead.up_bytes != 0 && image_free.up && IsMapped(next, ahead.up_bytes)) {
+			mark(next, ahead.up_bytes, AheadDirection::Up,
+			     Common::FrameProfiler::Counter::RunAheadUpPages);
+		}
+		if (ahead.down_bytes != 0 && image_free.down && IsMapped(first, ahead.down_bytes)) {
+			mark(first, ahead.down_bytes, AheadDirection::Down,
+			     Common::FrameProfiler::Counter::RunAheadDownPages);
+		}
 	} else {
 		const Common::FrameProfiler::ScopedCause cause(
 		    Common::FrameProfiler::ReadbackCause::FaultRead);

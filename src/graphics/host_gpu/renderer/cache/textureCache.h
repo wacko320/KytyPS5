@@ -7,6 +7,7 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/renderer/cache/colorClearKernels.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -84,6 +85,16 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
+	// Whether no image overlaps each of the two run-ahead windows (true for an empty one).
+	struct AheadImageFree {
+		bool up   = true;
+		bool down = true;
+	};
+	// InvalidateMemory, under the same lock answering whether no image overlaps the pages of
+	// [up_address, up_address + up_size) and of [down_address, down_address + down_size).
+	[[nodiscard]] AheadImageFree InvalidateMemory(uint64_t address, uint64_t size,
+	                                              uint64_t up_address, uint64_t up_size,
+	                                              uint64_t down_address, uint64_t down_size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 
@@ -105,6 +116,18 @@ public:
 	}
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
+
+	// Routes MaterializeColorClear took, since start (always on; the frame profiler counts the
+	// same per frame).
+	struct ColorClearStats {
+		uint64_t gpu_checks         = 0; // checks recorded on the GPU
+		uint64_t gpu_unchanged      = 0; // GPU-modified metadata no write changed: nothing recorded
+		uint64_t storage_clears     = 0; // GPU checks cleared through storage (no predication)
+		uint64_t buffer_fills       = 0; // GPU checks cleared into the guest memory's buffer
+		uint64_t readbacks          = 0; // GPU-modified metadata read back for a CPU check
+		uint64_t cpu_slices_cleared = 0; // slices a CPU check cleared
+	};
+	[[nodiscard]] ColorClearStats GetColorClearStats() const noexcept;
 
 private:
 	struct MetaDataInfo {
@@ -170,6 +193,25 @@ private:
 	void                        MoveResolveEpoch(GuestRange range);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
+	// The clear codes DecodeColorClear accepts for the desc, with their colours: a GPU check
+	// needs to test only these.
+	struct ColorClearCandidates {
+		uint32_t                                                     count = 0;
+		std::array<uint8_t, ColorClearKernels::MaxCodes>             codes {};
+		std::array<vk::ClearColorValue, ColorClearKernels::MaxCodes> colors {};
+
+		[[nodiscard]] bool operator==(const ColorClearCandidates& other) const noexcept;
+	};
+	[[nodiscard]] static ColorClearCandidates FindColorClearCandidates(const ImageDesc& desc);
+	[[nodiscard]] static bool DecodeColorClearCode(const ImageDesc& desc, uint8_t code,
+	                                               vk::ClearColorValue& clear);
+	// MaterializeColorClear for GPU-modified metadata: records the check, the predicated clears
+	// (or buffer fills) and the expansion, or nothing when no write changed the slices since an
+	// equal check. False when the device or the image has no GPU route, or the image is
+	// guest-owned (the caller reads the metadata back).
+	[[nodiscard]] bool MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
+	                                              uint64_t slice_size, uint32_t first,
+	                                              uint32_t image_first, uint32_t count);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] bool          CanDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
@@ -203,6 +245,29 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	ColorClearKernels                                 m_color_clear;
+	// GPU checks of colour metadata whose outcome stands while no write moves the range's
+	// generation (BufferCache::WriteGeneration): per metadata address, the last few checks by
+	// slice size and candidates, with the slices they checked (bit per slice; slices from 64 on
+	// are always checked again). A range is watched while it has a record. Guarded by m_lock.
+	struct ColorClearRecord {
+		uint64_t             size       = 0;
+		uint64_t             slice_size = 0;
+		uint64_t             generation = 0;
+		uint64_t             slices     = 0;
+		ColorClearCandidates candidates;
+	};
+	static constexpr size_t COLOR_CLEAR_RECORDS   = 4;
+	static constexpr size_t COLOR_CLEAR_ADDRESSES = 1024;
+	std::unordered_map<uint64_t, std::vector<ColorClearRecord>> m_color_clear_records;
+	struct {
+		std::atomic<uint64_t> gpu_checks {0};
+		std::atomic<uint64_t> gpu_unchanged {0};
+		std::atomic<uint64_t> storage_clears {0};
+		std::atomic<uint64_t> buffer_fills {0};
+		std::atomic<uint64_t> readbacks {0};
+		std::atomic<uint64_t> cpu_slices_cleared {0};
+	} m_color_clear_stats;
 	uint64_t                                          m_total_used_memory  = 0;
 	std::atomic<uint64_t>                             m_image_bytes {0};
 	std::atomic<uint64_t>                             m_image_peak_bytes {0};

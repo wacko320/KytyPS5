@@ -174,6 +174,35 @@ static_assert(BlitHelper::ColorToMsDepthLayout ==
               vk::ImageLayout::eDepthStencilAttachmentOptimal);
 
 struct BufferCacheTestAccess {
+  // GPU-thread readbacks read from a buffer's host mapping so far (TryReadDirect).
+  static uint64_t DirectReadbacks(const BufferCache &cache) {
+    return cache.m_direct_readbacks.load(std::memory_order_relaxed);
+  }
+
+  // Drops the completed writers' ticks now, as every 64 submits do (the open command buffer's
+  // writes take its tick first if it was submitted).
+  static void PruneWriteTicks(BufferCache &cache) {
+    (void)cache.OpenWrites();
+    cache.PruneWriteTicks();
+  }
+
+  // Whether buffers created from now on are host-readable (as without the device capability).
+  static void SetHostReadableBuffers(BufferCache &cache, bool readable) {
+    cache.m_host_readable_buffers = readable;
+  }
+
+  // Why a GPU-thread readback of the range would not read directly. Only for a read expected
+  // not to: a blocked TryReadDirect changes nothing, a copied one takes the bytes.
+  using DirectReadback = BufferCache::DirectReadback;
+  static DirectReadback ProbeDirectReadback(BufferCache &cache, uint64_t address, uint64_t size) {
+    auto &buffer = cache.m_slot_buffers[cache.FindBuffer(address, size)];
+    uint64_t copied = 0;
+    return cache.TryReadDirect(buffer, address, size, copied);
+  }
+  static bool IsCpuDirty(BufferCache &cache, uint64_t address, uint64_t size) {
+    return cache.m_memory_tracker.IsRegionCpuModified(address, size);
+  }
+
   static_assert(std::same_as<decltype(BufferCache::m_slot_buffers),
                              Common::SlotVector<Buffer>>);
 
@@ -282,6 +311,15 @@ struct TextureCacheTestAccess {
                          const vk::ClearValue &clear) {
     auto lock = Lock(cache);
     cache.ClearImage(command, id, cache.GetImage(id).backing.format, range, clear);
+  }
+
+  static auto ColorClearCandidates(const TextureCache::ImageDesc &desc) {
+    return TextureCache::FindColorClearCandidates(desc);
+  }
+
+  static bool DecodeColorClear(const TextureCache::ImageDesc &desc, uint8_t code,
+                               vk::ClearColorValue &clear) {
+    return TextureCache::DecodeColorClearCode(desc, code, clear);
   }
 
   static void ConfigureGarbageCollection(TextureCache &cache,
@@ -11321,6 +11359,24 @@ public:
     return code;
   }
 
+  // global_store_dword of s2 to the address in s[0:1].
+  static const std::vector<u32> &EpochBdaStoreShader() {
+    static const std::vector<u32> code = [] {
+      std::vector<u32> result;
+      result.push_back(EncodeVop1(0x01u, 20, 0)); // v_mov_b32 v20, s0
+      result.push_back(EncodeVop1(0x01u, 21, 1)); // v_mov_b32 v21, s1
+      result.push_back(EncodeVop1(0x01u, 30, 2)); // v_mov_b32 v30, s2
+      result.push_back(EncodeFlat0(0x1cu, 2));
+      result.push_back(EncodeFlat1(0, 0x7d, 30, 20));
+      AppendEnd(&result);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(result.data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<uint32_t>(result.size() * sizeof(u32))});
+      return result;
+    }();
+    return code;
+  }
+
   // A raw buffer: bounds mode 3 checks offsets against the byte size (mode 0 with a zero
   // stride makes every read out of bounds).
   static ShaderBufferResource EpochDwordBuffer(uint64_t address, uint32_t bytes) {
@@ -11647,20 +11703,7 @@ public:
     constexpr u32 gpu_value = 0x6b0d1e77u;
     const auto output = [](uint32_t index) { return base + 0x80000 + index * 0x10u; };
     const auto &copy = EpochCopyShader();
-    // global_store_dword of s2 to the address in s[0:1].
-    static const std::vector<u32> bda_store = [] {
-      std::vector<u32> code;
-      code.push_back(EncodeVop1(0x01u, 20, 0)); // v_mov_b32 v20, s0
-      code.push_back(EncodeVop1(0x01u, 21, 1)); // v_mov_b32 v21, s1
-      code.push_back(EncodeVop1(0x01u, 30, 2)); // v_mov_b32 v30, s2
-      code.push_back(EncodeFlat0(0x1cu, 2));
-      code.push_back(EncodeFlat1(0, 0x7d, 30, 20));
-      AppendEnd(&code);
-      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
-                        {.type = Prospero::ShaderBinaryType::kCs,
-                         .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
-      return code;
-    }();
+    const auto &bda_store = EpochBdaStoreShader();
 
     RunEpochFixture(
         name, base, size,
@@ -11695,6 +11738,381 @@ public:
                       Hex(gpu_value));
           Require(name, "CPU write", cpu_bytes == cpu_new,
                   "the CPU's dword read back as " + Hex(cpu_bytes));
+        });
+  }
+
+  // Run-ahead fixture: dword values at page(i) + 0x100 for pages just above a cached buffer's
+  // first tracker page, so the page below the first is clean and its write starts no run.
+  struct RunAheadPages {
+    uintptr_t base;
+    static constexpr uint64_t PageSize = 0x1000;
+    [[nodiscard]] uint64_t Page(uint32_t index) const { return base + 0x11000u + index * PageSize; }
+    [[nodiscard]] uint64_t Dword(uint32_t index) const { return Page(index) + 0x100u; }
+    [[nodiscard]] uint64_t Output(uint32_t index) const { return base + 0x80000u + index * 0x10u; }
+    static u32 Value(uint32_t round, uint32_t index) {
+      return 0x0a4e0000u + round * 0x100u + index;
+    }
+    // Reads every page; the first copy binds the whole 64 KiB around them, so one cached buffer
+    // covers them all.
+    [[nodiscard]] std::vector<u32> ReadAll(uint32_t round, uint32_t pages) const {
+      std::vector<u32> commands;
+      AppendEpochCopy(commands, base + 0x10000u, 0x10000u, Output(63));
+      for (uint32_t i = 0; i < pages; i++) {
+        AppendEpochCopy(commands, Dword(i), sizeof(u32), Output(round * pages + i));
+      }
+      return commands;
+    }
+    // A guest thread writes pages [first, last) in order; its writes fault through the
+    // production route, once the upload helper has protected what the last acquire cleaned.
+    void Write(BufferCache &cache, uint32_t round, uint32_t first, uint32_t last) const {
+      std::thread([&] {
+        for (auto i = first; i < last; i++) {
+          *reinterpret_cast<volatile u32 *>(Dword(i)) = Value(round, i);
+        }
+      }).join();
+    }
+    // As Write, from page last - 1 down to first.
+    void WriteDown(BufferCache &cache, uint32_t round, uint32_t first, uint32_t last) const {
+      std::thread([&] {
+        for (auto i = last; i > first; i--) {
+          *reinterpret_cast<volatile u32 *>(Dword(i - 1)) = Value(round, i - 1);
+        }
+      }).join();
+    }
+  };
+
+  // A CPU writing pages in order faults on the second, which continues a run, and the next
+  // pages turn writable before it writes them (run-ahead). Those writes never fault, yet the
+  // next acquire uploads them.
+  void CheckEpochRunAhead() {
+    constexpr const char *name = "EpochRunAhead";
+    constexpr RunAheadPages pages{0x000000020a000000ull};
+    constexpr uint64_t size = 0x100000;
+    constexpr uint32_t count = 9;
+    const auto &copy = EpochCopyShader();
+
+    RunEpochFixture(
+        name, pages.base, size,
+        [&] {
+          for (uint32_t i = 0; i < count; i++) {
+            *reinterpret_cast<u32 *>(pages.Dword(i)) = RunAheadPages::Value(0, i);
+          }
+        },
+        [&](RenderContext &context, CommandProcessor &processor) {
+          auto &cache = context.GetBufferCache();
+          RunEpochSlice(name, processor, copy, 8, pages.ReadAll(0, count));
+          // The first round faults page by page and builds the write history.
+          pages.Write(cache, 1, 0, count);
+          RunEpochSlice(name, processor, copy, 8, pages.ReadAll(1, count));
+          Require(name, "fixture",
+                  !BufferCacheTestAccess::IsCpuDirty(cache, pages.Page(0),
+                                                     count * RunAheadPages::PageSize),
+                  "the acquire did not leave the pages clean");
+          pages.Write(cache, 2, 0, 2);
+          bool ahead = true;
+          for (uint32_t i = 2; i < 6; i++) {
+            ahead &= BufferCacheTestAccess::IsCpuDirty(cache, pages.Page(i),
+                                                       RunAheadPages::PageSize);
+          }
+          Require(name, "run-ahead",
+                  ahead && !BufferCacheTestAccess::IsCpuDirty(cache, pages.Page(6),
+                                                              RunAheadPages::PageSize),
+                  "the fault continuing a run did not make the next 4 pages writable");
+          pages.Write(cache, 2, 2, count);
+          RunEpochSlice(name, processor, copy, 8, pages.ReadAll(2, count));
+          for (uint32_t round = 0; round < 3; round++) {
+            for (uint32_t i = 0; i < count; i++) {
+              const auto actual = ReadEpochDword(name, context, pages.Output(round * count + i));
+              Require(name, "page contents", actual == RunAheadPages::Value(round, i),
+                      "round " + std::to_string(round) + " page " + std::to_string(i) +
+                          " read " + Hex(actual) + ", expected " +
+                          Hex(RunAheadPages::Value(round, i)));
+            }
+          }
+        });
+  }
+
+  // An image over the run-ahead window: run-ahead is refused, so the CPU's write into the
+  // image's page faults and invalidates the image.
+  void CheckEpochRunAheadImage() {
+    constexpr const char *name = "EpochRunAheadImage";
+    constexpr RunAheadPages pages{0x000000020a200000ull};
+    constexpr uint64_t size = 0x100000;
+    constexpr uint32_t count = 6;
+    constexpr uint32_t image_page = 3;
+    const auto &copy = EpochCopyShader();
+
+    RunEpochFixture(
+        name, pages.base, size,
+        [&] {
+          for (uint32_t i = 0; i < count; i++) {
+            *reinterpret_cast<u32 *>(pages.Dword(i)) = RunAheadPages::Value(0, i);
+          }
+        },
+        [&](RenderContext &context, CommandProcessor &processor) {
+          auto &cache = context.GetBufferCache();
+          auto &texture_cache = context.GetTextureCache();
+          RunEpochSlice(name, processor, copy, 8, pages.ReadAll(0, count));
+          pages.Write(cache, 1, 0, count);
+          RunEpochSlice(name, processor, copy, 8, pages.ReadAll(1, count));
+          ImageDesc desc{};
+          desc.type = BindingType::Texture;
+          desc.info.data = {pages.Page(image_page), RunAheadPages::PageSize};
+          desc.info.pixel_format = vk::Format::eR32Uint;
+          desc.info.guest_format = Prospero::BufferFormat::k32UInt;
+          desc.info.type = Prospero::ImageType::kColor2D;
+          desc.info.extent = {1024, 1, 1};
+          desc.info.resources = {1, 1};
+          desc.info.pitch = 1024;
+          desc.info.bytes_per_block = sizeof(u32);
+          desc.info.samples = 1;
+          desc.info.tile_mode = Prospero::TileMode::kLinear;
+          desc.info.mip_layout[0] = {0, RunAheadPages::PageSize, 1024, 1};
+          desc.view_info.format = desc.info.pixel_format;
+          desc.view_info.type = vk::ImageViewType::e2D;
+          desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+          desc.view_info.layer_count = 1;
+          desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+          const auto image = texture_cache.FindImage(desc);
+          (void)texture_cache.FindTexture(image, desc);
+          Require(name, "image fixture", image && texture_cache.GetImage(image).IsTracked(),
+                  "the image over the window was not tracked");
+          pages.Write(cache, 2, 0, 2);
+          Require(name, "run-ahead refused",
+                  !BufferCacheTestAccess::IsCpuDirty(cache, pages.Page(2),
+                                                     RunAheadPages::PageSize),
+                  "run-ahead took a window an image overlaps");
+          pages.Write(cache, 2, 2, count);
+          Require(name, "image invalidated", !texture_cache.GetImage(image).IsTracked(),
+                  "the CPU write into the image's page did not reach the texture cache");
+          RunEpochSlice(name, processor, copy, 8, pages.ReadAll(2, count));
+          for (uint32_t i = 0; i < count; i++) {
+            const auto actual = ReadEpochDword(name, context, pages.Output(2 * count + i));
+            Require(name, "page contents", actual == RunAheadPages::Value(2, i),
+                    "page " + std::to_string(i) + " read " + Hex(actual));
+          }
+        });
+  }
+
+  // A BDA store (not tracked) to a page the CPU has not written: run-ahead from a run ending
+  // just below it must not make it CPU-dirty, or the next acquire uploads the guest's stale
+  // bytes over the store. The write history keeps it out.
+  void CheckEpochRunAheadBdaStores() {
+    constexpr const char *name = "EpochRunAheadBdaStores";
+    constexpr RunAheadPages pages{0x000000020a400000ull};
+    constexpr uint64_t size = 0x100000;
+    constexpr uint32_t written = 4;
+    constexpr u32 stale = 0x57a1e000u;
+    constexpr u32 gpu_value = 0x6b0d1e99u;
+    const uint64_t gpu_dword = pages.Page(written) + 0x200u;
+    const auto &copy = EpochCopyShader();
+    const auto &bda_store = EpochBdaStoreShader();
+
+    RunEpochFixture(
+        name, pages.base, size,
+        [&] {
+          for (uint32_t i = 0; i < written; i++) {
+            *reinterpret_cast<u32 *>(pages.Dword(i)) = RunAheadPages::Value(0, i);
+          }
+          *reinterpret_cast<u32 *>(gpu_dword) = stale;
+        },
+        [&](RenderContext &context, CommandProcessor &processor) {
+          auto &cache = context.GetBufferCache();
+          RunEpochSlice(name, processor, copy, 8, pages.ReadAll(0, written));
+          pages.Write(cache, 1, 0, written);
+          RunEpochSlice(name, processor, copy, 8, pages.ReadAll(1, written));
+          RunEpochSlice(name, processor, bda_store, 3,
+                        {KYTY_PM4(5, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+                         static_cast<u32>(gpu_dword), static_cast<u32>(gpu_dword >> 32u),
+                         gpu_value, KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u,
+                         1u, 0x41u});
+          pages.Write(cache, 2, 0, written);
+          const bool history_kept =
+              BufferCacheTestAccess::IsCpuDirty(cache, pages.Page(written - 1),
+                                                RunAheadPages::PageSize) &&
+              !BufferCacheTestAccess::IsCpuDirty(cache, pages.Page(written),
+                                                 RunAheadPages::PageSize);
+          std::vector<u32> read_after;
+          AppendEpochCopy(read_after, gpu_dword, sizeof(u32), pages.Output(0));
+          AppendEpochCopy(read_after, pages.Dword(written - 1), sizeof(u32), pages.Output(1));
+          RunEpochSlice(name, processor, copy, 8, read_after);
+          const auto shader_bytes = ReadEpochDword(name, context, pages.Output(0));
+          const auto cpu_bytes = ReadEpochDword(name, context, pages.Output(1));
+          Require(name, "BDA store kept", shader_bytes == gpu_value,
+                  "the BDA store's dword read back as " + Hex(shader_bytes));
+          Require(name, "CPU write", cpu_bytes == RunAheadPages::Value(2, written - 1),
+                  "the CPU's dword read back as " + Hex(cpu_bytes));
+          Require(name, "run-ahead", history_kept,
+                  "run-ahead took a page outside the write history");
+        });
+  }
+
+  // CheckEpochRunAhead for a CPU writing pages from the top down: the fault on the second page
+  // continues a run above it, and the pages below it turn writable before it writes them.
+  void CheckEpochRunAheadDescending() {
+    constexpr const char *name = "EpochRunAheadDescending";
+    constexpr RunAheadPages pages{0x000000020c000000ull};
+    constexpr uint64_t size = 0x100000;
+    constexpr uint32_t count = 9;
+    const auto &copy = EpochCopyShader();
+
+    RunEpochFixture(
+        name, pages.base, size,
+        [&] {
+          for (uint32_t i = 0; i < count; i++) {
+            *reinterpret_cast<u32 *>(pages.Dword(i)) = RunAheadPages::Value(0, i);
+          }
+        },
+        [&](RenderContext &context, CommandProcessor &processor) {
+          auto &cache = context.GetBufferCache();
+          RunEpochSlice(name, processor, copy, 8, pages.ReadAll(0, count));
+          // The first round faults page by page and builds the write history.
+          pages.WriteDown(cache, 1, 0, count);
+          RunEpochSlice(name, processor, copy, 8, pages.ReadAll(1, count));
+          Require(name, "fixture",
+                  !BufferCacheTestAccess::IsCpuDirty(cache, pages.Page(0),
+                                                     count * RunAheadPages::PageSize),
+                  "the acquire did not leave the pages clean");
+          pages.WriteDown(cache, 2, count - 2, count);
+          bool ahead = true;
+          for (uint32_t i = count - 6; i < count - 2; i++) {
+            ahead &= BufferCacheTestAccess::IsCpuDirty(cache, pages.Page(i),
+                                                       RunAheadPages::PageSize);
+          }
+          Require(name, "run-ahead",
+                  ahead && !BufferCacheTestAccess::IsCpuDirty(cache, pages.Page(count - 7),
+                                                              RunAheadPages::PageSize),
+                  "the fault continuing a run downwards did not make the 4 pages below writable");
+          pages.WriteDown(cache, 2, 0, count - 2);
+          // The window below the last fault stops at the history's first page.
+          Require(name, "history",
+                  !BufferCacheTestAccess::IsCpuDirty(cache, pages.Page(0) - RunAheadPages::PageSize,
+                                                     RunAheadPages::PageSize),
+                  "downward run-ahead took a page outside the write history");
+          RunEpochSlice(name, processor, copy, 8, pages.ReadAll(2, count));
+          for (uint32_t round = 0; round < 3; round++) {
+            for (uint32_t i = 0; i < count; i++) {
+              const auto actual = ReadEpochDword(name, context, pages.Output(round * count + i));
+              Require(name, "page contents", actual == RunAheadPages::Value(round, i),
+                      "round " + std::to_string(round) + " page " + std::to_string(i) +
+                          " read " + Hex(actual) + ", expected " +
+                          Hex(RunAheadPages::Value(round, i)));
+            }
+          }
+        });
+  }
+
+  // CheckEpochRunAheadImage below a descending run: the window below the fault is refused, so
+  // the CPU's write into the image's page faults and invalidates the image.
+  void CheckEpochRunAheadImageDescending() {
+    constexpr const char *name = "EpochRunAheadImageDescending";
+    constexpr RunAheadPages pages{0x000000020c200000ull};
+    constexpr uint64_t size = 0x100000;
+    constexpr uint32_t count = 6;
+    constexpr uint32_t image_page = 2;
+    const auto &copy = EpochCopyShader();
+
+    RunEpochFixture(
+        name, pages.base, size,
+        [&] {
+          for (uint32_t i = 0; i < count; i++) {
+            *reinterpret_cast<u32 *>(pages.Dword(i)) = RunAheadPages::Value(0, i);
+          }
+        },
+        [&](RenderContext &context, CommandProcessor &processor) {
+          auto &cache = context.GetBufferCache();
+          auto &texture_cache = context.GetTextureCache();
+          RunEpochSlice(name, processor, copy, 8, pages.ReadAll(0, count));
+          pages.WriteDown(cache, 1, 0, count);
+          RunEpochSlice(name, processor, copy, 8, pages.ReadAll(1, count));
+          ImageDesc desc{};
+          desc.type = BindingType::Texture;
+          desc.info.data = {pages.Page(image_page), RunAheadPages::PageSize};
+          desc.info.pixel_format = vk::Format::eR32Uint;
+          desc.info.guest_format = Prospero::BufferFormat::k32UInt;
+          desc.info.type = Prospero::ImageType::kColor2D;
+          desc.info.extent = {1024, 1, 1};
+          desc.info.resources = {1, 1};
+          desc.info.pitch = 1024;
+          desc.info.bytes_per_block = sizeof(u32);
+          desc.info.samples = 1;
+          desc.info.tile_mode = Prospero::TileMode::kLinear;
+          desc.info.mip_layout[0] = {0, RunAheadPages::PageSize, 1024, 1};
+          desc.view_info.format = desc.info.pixel_format;
+          desc.view_info.type = vk::ImageViewType::e2D;
+          desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+          desc.view_info.layer_count = 1;
+          desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+          const auto image = texture_cache.FindImage(desc);
+          (void)texture_cache.FindTexture(image, desc);
+          Require(name, "image fixture", image && texture_cache.GetImage(image).IsTracked(),
+                  "the image below the window was not tracked");
+          pages.WriteDown(cache, 2, count - 2, count);
+          Require(name, "run-ahead refused",
+                  !BufferCacheTestAccess::IsCpuDirty(cache, pages.Page(count - 3),
+                                                     RunAheadPages::PageSize),
+                  "downward run-ahead took a window an image overlaps");
+          pages.WriteDown(cache, 2, 0, count - 2);
+          Require(name, "image invalidated", !texture_cache.GetImage(image).IsTracked(),
+                  "the CPU write into the image's page did not reach the texture cache");
+          RunEpochSlice(name, processor, copy, 8, pages.ReadAll(2, count));
+          for (uint32_t i = 0; i < count; i++) {
+            const auto actual = ReadEpochDword(name, context, pages.Output(2 * count + i));
+            Require(name, "page contents", actual == RunAheadPages::Value(2, i),
+                    "page " + std::to_string(i) + " read " + Hex(actual));
+          }
+        });
+  }
+
+  // CheckEpochRunAheadBdaStores below a descending run: the BDA store's page, which the CPU has
+  // not written, lies just below the run, and the write history keeps the window off it.
+  void CheckEpochRunAheadBdaStoresDescending() {
+    constexpr const char *name = "EpochRunAheadBdaStoresDescending";
+    constexpr RunAheadPages pages{0x000000020c400000ull};
+    constexpr uint64_t size = 0x100000;
+    constexpr uint32_t first = 1;
+    constexpr uint32_t last = 5;
+    constexpr u32 stale = 0x57a1e000u;
+    constexpr u32 gpu_value = 0x6b0d1e9au;
+    const uint64_t gpu_dword = pages.Page(0) + 0x200u;
+    const auto &copy = EpochCopyShader();
+    const auto &bda_store = EpochBdaStoreShader();
+
+    RunEpochFixture(
+        name, pages.base, size,
+        [&] {
+          for (uint32_t i = first; i < last; i++) {
+            *reinterpret_cast<u32 *>(pages.Dword(i)) = RunAheadPages::Value(0, i);
+          }
+          *reinterpret_cast<u32 *>(gpu_dword) = stale;
+        },
+        [&](RenderContext &context, CommandProcessor &processor) {
+          auto &cache = context.GetBufferCache();
+          RunEpochSlice(name, processor, copy, 8, pages.ReadAll(0, last));
+          pages.WriteDown(cache, 1, first, last);
+          RunEpochSlice(name, processor, copy, 8, pages.ReadAll(1, last));
+          RunEpochSlice(name, processor, bda_store, 3,
+                        {KYTY_PM4(5, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+                         static_cast<u32>(gpu_dword), static_cast<u32>(gpu_dword >> 32u),
+                         gpu_value, KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u,
+                         1u, 0x41u});
+          pages.WriteDown(cache, 2, first, last);
+          const bool history_kept =
+              BufferCacheTestAccess::IsCpuDirty(cache, pages.Page(first),
+                                                RunAheadPages::PageSize) &&
+              !BufferCacheTestAccess::IsCpuDirty(cache, pages.Page(0), RunAheadPages::PageSize);
+          std::vector<u32> read_after;
+          AppendEpochCopy(read_after, gpu_dword, sizeof(u32), pages.Output(0));
+          AppendEpochCopy(read_after, pages.Dword(first), sizeof(u32), pages.Output(1));
+          RunEpochSlice(name, processor, copy, 8, read_after);
+          const auto shader_bytes = ReadEpochDword(name, context, pages.Output(0));
+          const auto cpu_bytes = ReadEpochDword(name, context, pages.Output(1));
+          Require(name, "BDA store kept", shader_bytes == gpu_value,
+                  "the BDA store's dword read back as " + Hex(shader_bytes));
+          Require(name, "CPU write", cpu_bytes == RunAheadPages::Value(2, first),
+                  "the CPU's dword read back as " + Hex(cpu_bytes));
+          Require(name, "run-ahead", history_kept,
+                  "downward run-ahead took a page outside the write history");
         });
   }
 
@@ -12227,6 +12645,418 @@ public:
     Require(name, "second handed back", second_handed_back,
             "the second read returned with its page still GPU-owned");
   }
+
+  enum class DirectReadbackCase {
+    // A submitted dispatch wrote the dword and has completed: the GPU thread's read copies it
+    // from the buffer's mapping, with no submit, and hands the page back.
+    Completed,
+    // The writer is in the open command buffer: the download drains it.
+    OpenWriter,
+    // The writer is submitted but held behind a host event: the download waits for it.
+    InFlight,
+    // As Completed, then the open command buffer stores through a guest pointer (untracked) to
+    // the dword: the download, which returns that store.
+    Untracked,
+    // As Completed, with a download noted on the page publishing after the open command
+    // buffer: the download path.
+    PendingPublish,
+    // As Completed, with guest bytes beside the dword the GPU never wrote (they differ from the
+    // buffer's): only the GPU-dirty bytes are copied, and a CPU write there after the readback
+    // reaches the next dispatch.
+    PartialPage,
+    // As Completed, with a second dword on the page written by a dispatch held behind a host
+    // event: the download, which waits for it.
+    MixedTicks,
+    // The last writer is a CP DMA copy (CopyBuffer) into the GPU-owned page: read directly.
+    CopyBuffer,
+    // The last writer is a CP DMA fill (FillBuffer) into the GPU-owned page: read directly.
+    FillBuffer,
+    // A wider dispatch joined the written buffer into a new one (a GPU copy of its bytes): read
+    // directly from the new buffer.
+    Joined,
+    // The buffer was made without a host mapping (no capability): the download.
+    NoMapping,
+    // A read over two whole pages: the download.
+    Large,
+    // As Completed, then a write binding over the dword whose command a stream-buffer wrap
+    // separates from it (the binding's command buffer submitted and completed, the command not
+    // recorded yet): the download.
+    WrapBeforeRecord,
+    // As Completed, then an untracked store to the dword in a command buffer submitted but held
+    // behind a host event: the download, which waits for the store.
+    UntrackedInFlight,
+    // As InFlight, with the completed writers' ticks pruned after the writer was submitted: the
+    // writer's tick must survive the prune.
+    PrunedInFlight,
+    // As Untracked, with the store an indirect dispatch (IT_DISPATCH_INDIRECT): the download.
+    UntrackedIndirect,
+  };
+
+  // GPU-thread readbacks of bytes whose last writer has completed, read from the buffer's
+  // host-visible device memory (BufferCache::TryReadDirect) instead of a GPU copy and a wait.
+  // Every case must return the GPU's bytes and hand the page back; only the direct ones may do
+  // it without a submit.
+  void CheckDirectReadback(DirectReadbackCase variant) {
+    using Case = DirectReadbackCase;
+    const char *name = [variant] {
+      switch (variant) {
+      case Case::Completed:
+        return "DirectReadbackCompleted";
+      case Case::OpenWriter:
+        return "DirectReadbackOpenWriter";
+      case Case::InFlight:
+        return "DirectReadbackInFlight";
+      case Case::Untracked:
+        return "DirectReadbackUntracked";
+      case Case::PendingPublish:
+        return "DirectReadbackPendingPublish";
+      case Case::PartialPage:
+        return "DirectReadbackPartialPage";
+      case Case::MixedTicks:
+        return "DirectReadbackMixedTicks";
+      case Case::CopyBuffer:
+        return "DirectReadbackCopyBuffer";
+      case Case::FillBuffer:
+        return "DirectReadbackFillBuffer";
+      case Case::Joined:
+        return "DirectReadbackJoined";
+      case Case::NoMapping:
+        return "DirectReadbackNoMapping";
+      case Case::Large:
+        return "DirectReadbackLarge";
+      case Case::WrapBeforeRecord:
+        return "DirectReadbackWrapBeforeRecord";
+      case Case::UntrackedInFlight:
+        return "DirectReadbackUntrackedInFlight";
+      case Case::PrunedInFlight:
+        return "DirectReadbackPrunedInFlight";
+      case Case::UntrackedIndirect:
+        return "DirectReadbackUntrackedIndirect";
+      }
+      return "DirectReadback";
+    }();
+    const uintptr_t base = 0x0000000210000000ull + static_cast<uint64_t>(variant) * 0x200000ull;
+    constexpr uint64_t size = 0x100000;
+    const uint64_t first = base + 0x10100;
+    // On the first dword's tracker page.
+    const uint64_t beside = base + 0x10140;
+    // CopyBuffer's source, which only the CPU wrote.
+    const uint64_t source = base + 0x30100;
+    // UntrackedIndirect's dispatch arguments (one group), which only the CPU wrote.
+    const uint64_t arguments = base + 0x60000;
+    const uint64_t output = base + 0x80000;
+    constexpr u32 first_value = 0xd1ec0001u;
+    constexpr u32 beside_value = 0xd1ec0002u;
+    constexpr u32 untracked_value = 0xd1ec0003u;
+    constexpr u32 source_value = 0xd1ec0004u;
+    constexpr u32 fill_value = 0xd1ec0005u;
+    constexpr u32 guest_value = 0xd1ec0006u;
+    constexpr u32 cpu_value = 0xd1ec0007u;
+    static const std::vector<u32> writer = [] {
+      std::vector<u32> code;
+      code.push_back(EncodeVop1(0x01u, 1, 4)); // v_mov_b32 v1, s4
+      code.push_back(EncodeMubuf0(0x1cu, 0, false, false)); // buffer_store_dword v1, off, s[0:3]
+      code.push_back(EncodeMubuf1(1, 0, 0));
+      AppendEnd(&code);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+      return code;
+    }();
+    const auto &copy = EpochCopyShader();
+    const auto &bda_store = EpochBdaStoreShader();
+    const auto write = [](std::vector<u32> &commands, uint64_t address, u32 word) {
+      const auto out = EpochDwordBuffer(address, sizeof(u32));
+      commands.insert(commands.end(),
+                      {KYTY_PM4(7, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+                       out.fields[0], out.fields[1], out.fields[2], out.fields[3], word,
+                       KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u, 0x41u});
+    };
+    const auto read = [](uint64_t address) {
+      u32 word = 0;
+      (void)LibKernel::Memory::TryReadBacking(address, &word, sizeof(word));
+      return word;
+    };
+    EnsureRuntimeContext();
+    const bool readable = Libs::Graphics::Buffer::HostReadableSupported(m_runtime_context);
+    const bool expect_direct =
+        readable && (variant == Case::Completed || variant == Case::PartialPage ||
+                     variant == Case::CopyBuffer || variant == Case::FillBuffer ||
+                     variant == Case::Joined);
+    const bool gated = variant == Case::InFlight || variant == Case::MixedTicks ||
+                       variant == Case::UntrackedInFlight || variant == Case::PrunedInFlight;
+    const bool held_writer = variant == Case::InFlight || variant == Case::PrunedInFlight;
+    using Outcome = BufferCacheTestAccess::DirectReadback;
+    const auto expected_outcome = [&] {
+      if (variant == Case::Large) {
+        return Outcome::Size;
+      }
+      if (!readable || variant == Case::NoMapping) {
+        return Outcome::Unmapped;
+      }
+      switch (variant) {
+      case Case::Untracked:
+      case Case::UntrackedInFlight:
+      case Case::UntrackedIndirect:
+        return Outcome::Untracked;
+      case Case::PendingPublish:
+        return Outcome::Pending;
+      default:
+        return Outcome::Writer;
+      }
+    }();
+
+    vk::Event gate{};
+    const vk::EventCreateInfo gate_info{};
+    RequireVk(name, "event", m_device.createEvent(&gate_info, nullptr, &gate), "createEvent");
+    std::mutex gate_mutex;
+    bool gate_set = false;
+    const auto release = [&] {
+      std::lock_guard lock(gate_mutex);
+      if (!gate_set) {
+        gate_set = true;
+        (void)m_device.setEvent(gate);
+      }
+    };
+    if (!gated) {
+      release();
+    }
+    std::promise<void> released;
+    // The GPU wait is bounded: the gate opens after the timeout whatever the test does.
+    std::thread watchdog([&release, done = released.get_future()] {
+      if (done.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+        release();
+      }
+    });
+    std::thread opener;
+
+    RunEpochFixture(
+        name, base, size,
+        [&] {
+          std::memcpy(reinterpret_cast<void *>(source), &source_value, sizeof(u32));
+          constexpr std::array<u32, 3> groups{1u, 1u, 1u};
+          std::memcpy(reinterpret_cast<void *>(arguments), groups.data(), sizeof(groups));
+        },
+        [&](RenderContext &context, CommandProcessor &processor) {
+          auto &cache = context.GetBufferCache();
+          auto &scheduler = context.GetCommandScheduler();
+          if (variant == Case::NoMapping) {
+            BufferCacheTestAccess::SetHostReadableBuffers(cache, false);
+          }
+          // One cached buffer over the pages, created and submitted before the writes.
+          std::vector<u32> read_all;
+          AppendEpochCopy(read_all, base, 0x40000, output);
+          RunEpochSlice(name, processor, copy, 8, read_all);
+          FinishWithCompletions(scheduler);
+          const auto mapped = [&] {
+            return !cache.GetBuffer(BufferCacheTestAccess::PageOwner(cache, first))
+                        .Mapped()
+                        .empty();
+          };
+          Require(name, "host mapping", mapped() == (readable && variant != Case::NoMapping),
+                  std::string("the buffer ") + (mapped() ? "has" : "has no") + " host mapping");
+
+          if (held_writer) {
+            // The writer waits for the gate.
+            auto &command = scheduler.Current();
+            command.EndRendering();
+            command.Handle().waitEvents(1, &gate, vk::PipelineStageFlagBits::eHost,
+                                        vk::PipelineStageFlagBits::eAllCommands, 0, nullptr, 0,
+                                        nullptr, 0, nullptr);
+          }
+          std::vector<u32> commands;
+          write(commands, first, first_value);
+          RunEpochSlice(name, processor, writer, 5, commands);
+          if (variant != Case::OpenWriter) {
+            scheduler.Flush();
+          }
+          if (variant != Case::OpenWriter && !held_writer) {
+            scheduler.Wait(scheduler.CurrentTick() - 1);
+          }
+          switch (variant) {
+          case Case::Untracked:
+            RunEpochSlice(name, processor, bda_store, 3,
+                          {KYTY_PM4(5, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+                           static_cast<u32>(first), static_cast<u32>(first >> 32u),
+                           untracked_value, KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO),
+                           1u, 1u, 1u, 0x41u});
+            break;
+          case Case::UntrackedIndirect:
+            RunEpochSlice(name, processor, bda_store, 3,
+                          {KYTY_PM4(5, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+                           static_cast<u32>(first), static_cast<u32>(first >> 32u),
+                           untracked_value, KYTY_PM4(4, Pm4::IT_DISPATCH_INDIRECT, Pm4::R_ZERO),
+                           static_cast<u32>(arguments), static_cast<u32>(arguments >> 32u),
+                           0x41u});
+            break;
+          case Case::PendingPublish: {
+            // As a download is noted and published, at the open command buffer's tick.
+            const auto page = Common::AlignDown(first, BufferCache::CACHING_PAGESIZE);
+            cache.NotePendingGuestWrite(page, BufferCache::CACHING_PAGESIZE);
+            scheduler.DeferPriorityOperation([&cache, page] {
+              cache.DonePendingGuestWrite(page, BufferCache::CACHING_PAGESIZE);
+            });
+            break;
+          }
+          case Case::PartialPage:
+            // Guest bytes the GPU does not own; the buffer holds zero there.
+            LibKernel::Memory::WriteBacking(beside, &guest_value, sizeof(u32));
+            break;
+          case Case::MixedTicks: {
+            auto &command = scheduler.Current();
+            command.EndRendering();
+            command.Handle().waitEvents(1, &gate, vk::PipelineStageFlagBits::eHost,
+                                        vk::PipelineStageFlagBits::eAllCommands, 0, nullptr, 0,
+                                        nullptr, 0, nullptr);
+            commands.clear();
+            write(commands, beside, beside_value);
+            RunEpochSlice(name, processor, writer, 5, commands);
+            scheduler.Flush();
+            break;
+          }
+          case Case::CopyBuffer:
+            cache.CopyBuffer(first, source, sizeof(u32), false, false);
+            break;
+          case Case::FillBuffer:
+            cache.FillBuffer(first, sizeof(u32), fill_value, false);
+            break;
+          case Case::Joined:
+            // Wider than the buffer holding the pages: a new buffer takes the old one's bytes.
+            commands.clear();
+            AppendEpochCopy(commands, base, 0x50000, base + 0xa0000);
+            RunEpochSlice(name, processor, copy, 8, commands);
+            break;
+          case Case::WrapBeforeRecord: {
+            // The binding, then a wrap that submits its command buffer before the command is
+            // recorded.
+            (void)cache.ObtainBuffer(first, sizeof(u32), true, false);
+            scheduler.Flush();
+            scheduler.Wait(scheduler.CurrentTick() - 1);
+            break;
+          }
+          case Case::UntrackedInFlight: {
+            auto &command = scheduler.Current();
+            command.EndRendering();
+            command.Handle().waitEvents(1, &gate, vk::PipelineStageFlagBits::eHost,
+                                        vk::PipelineStageFlagBits::eAllCommands, 0, nullptr, 0,
+                                        nullptr, 0, nullptr);
+            RunEpochSlice(name, processor, bda_store, 3,
+                          {KYTY_PM4(5, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+                           static_cast<u32>(first), static_cast<u32>(first >> 32u),
+                           untracked_value, KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO),
+                           1u, 1u, 1u, 0x41u});
+            scheduler.Flush();
+            break;
+          }
+          case Case::PrunedInFlight:
+            // As the prune interval (BufferCache::FollowOpenTick) does, while the writer is held.
+            BufferCacheTestAccess::PruneWriteTicks(cache);
+            break;
+          default:
+            break;
+          }
+          if (variant == Case::CopyBuffer || variant == Case::FillBuffer ||
+              variant == Case::Joined) {
+            scheduler.Flush();
+            scheduler.Wait(scheduler.CurrentTick() - 1);
+            Require(name, "joined mapping", variant != Case::Joined || mapped(),
+                    "the joined buffer has no host mapping");
+          }
+          Require(name, "fixture",
+                  cache.HasGpuDirtyBytes(first, sizeof(u32)) &&
+                      cache.IsRegionGpuModified(first, sizeof(u32)),
+                  "the write did not leave the page GPU-owned");
+          if (!expect_direct) {
+            const auto outcome = BufferCacheTestAccess::ProbeDirectReadback(
+                cache, variant == Case::Large ? Common::AlignDown(first, TRACKER_PAGE_SIZE) : first,
+                variant == Case::Large ? 2 * TRACKER_PAGE_SIZE : sizeof(u32));
+            Require(name, "blocked by", outcome == expected_outcome,
+                    "the direct read was refused for reason " +
+                        std::to_string(static_cast<int>(outcome)) + ", expected " +
+                        std::to_string(static_cast<int>(expected_outcome)));
+          }
+          if (gated) {
+            Require(name, "in flight", !scheduler.IsFree(scheduler.CurrentTick() - 1),
+                    "the held dispatch completed before the read");
+            opener = std::thread([&release] {
+              std::this_thread::sleep_for(std::chrono::milliseconds(300));
+              release();
+            });
+          }
+
+          const auto tick = scheduler.CurrentTick();
+          const auto direct_before = BufferCacheTestAccess::DirectReadbacks(cache);
+          if (variant == Case::Large) {
+            cache.ReadMemory(Common::AlignDown(first, TRACKER_PAGE_SIZE),
+                             2 * TRACKER_PAGE_SIZE);
+          } else {
+            cache.ReadMemory(first, sizeof(u32));
+          }
+          const auto direct = BufferCacheTestAccess::DirectReadbacks(cache) - direct_before;
+          const bool submitted = scheduler.CurrentTick() != tick;
+          const auto expected = variant == Case::Untracked ||
+                                        variant == Case::UntrackedInFlight ||
+                                        variant == Case::UntrackedIndirect
+                                    ? untracked_value
+                                : variant == Case::CopyBuffer ? source_value
+                                : variant == Case::FillBuffer ? fill_value
+                                                              : first_value;
+          Require(name, "value", read(first) == expected,
+                  "the read returned " + Hex(read(first)) + ", expected " + Hex(expected));
+          Require(name, "handed back",
+                  !cache.IsRegionGpuModified(first, sizeof(u32)) &&
+                      !cache.HasGpuDirtyBytes(first, sizeof(u32)),
+                  "the read returned with its page still GPU-owned");
+          // A read only a writer's (or the untracked stores') tick blocks waits for that tick and
+          // reads the mapping; a write still to be recorded has no tick to wait for.
+          const bool waits_then_direct =
+              !expect_direct && variant != Case::WrapBeforeRecord &&
+              (expected_outcome == Outcome::Writer || expected_outcome == Outcome::Untracked);
+          Require(name, "path",
+                  waits_then_direct ? direct == 1u
+                                    : direct == (expect_direct ? 1u : 0u) &&
+                                          submitted != expect_direct,
+                  std::string(expect_direct || waits_then_direct ? "expected a direct read"
+                                                                 : "expected the download") +
+                      ": direct reads " + std::to_string(direct) + ", command buffer " +
+                      (submitted ? "submitted" : "still open"));
+          if (variant == Case::WrapBeforeRecord) {
+            // The command the binding was for, recorded now.
+            cache.CommitWrittenRanges();
+          }
+          if (variant == Case::MixedTicks) {
+            Require(name, "held dword", read(beside) == beside_value,
+                    "the held dispatch's dword read " + Hex(read(beside)));
+          }
+          if (variant == Case::PartialPage) {
+            Require(name, "guest bytes kept", read(beside) == guest_value,
+                    "the bytes beside the GPU's read " + Hex(read(beside)) + ", expected " +
+                        Hex(guest_value));
+            // A CPU write there now reaches the next dispatch.
+            cache.InvalidateMemory(beside, sizeof(u32));
+            LibKernel::Memory::WriteBacking(beside, &cpu_value, sizeof(u32));
+            commands.clear();
+            AppendEpochCopy(commands, beside, sizeof(u32), output);
+            RunEpochSlice(name, processor, copy, 8, commands);
+            FinishWithCompletions(scheduler);
+            cache.ReadMemory(output, sizeof(u32));
+            Require(name, "CPU write after", read(output) == cpu_value,
+                    "the dispatch after the CPU write read " + Hex(read(output)) +
+                        ", expected " + Hex(cpu_value));
+          }
+        });
+    release();
+    released.set_value();
+    watchdog.join();
+    if (opener.joinable()) {
+      opener.join();
+    }
+    m_device.destroyEvent(gate, nullptr);
+    if (!readable) {
+      std::printf("[gpu]     %-32s no host-readable device memory: download only\n", name);
+    }
+  }
+
 
 
   // A cached buffer over two pages outlives the unmap of the second, whose backing goes with it
@@ -13887,6 +14717,578 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
                                                                allocation_size) == 0,
             "texture allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  static void CheckColorClearCandidateParity() {
+    constexpr const char *name = "ColorClearCandidateParity";
+    constexpr std::array formats{
+        vk::Format::eR8Unorm, vk::Format::eR8G8Unorm, vk::Format::eR8G8B8A8Unorm,
+        vk::Format::eR8G8B8A8Srgb, vk::Format::eB8G8R8A8Unorm, vk::Format::eB8G8R8A8Srgb,
+        vk::Format::eA2B10G10R10UnormPack32, vk::Format::eA2R10G10B10UnormPack32,
+        vk::Format::eR5G6B5UnormPack16, vk::Format::eA1R5G5B5UnormPack16,
+        vk::Format::eR4G4B4A4UnormPack16, vk::Format::eR16Unorm, vk::Format::eR16G16Unorm,
+        vk::Format::eR16G16B16A16Unorm, vk::Format::eR16Sfloat, vk::Format::eR16G16Sfloat,
+        vk::Format::eR16G16B16A16Sfloat, vk::Format::eR32Sfloat, vk::Format::eR32G32Sfloat,
+        vk::Format::eR32G32B32A32Sfloat, vk::Format::eB10G11R11UfloatPack32,
+        vk::Format::eR8G8B8A8Uint, vk::Format::eR32Uint, vk::Format::eR16G16B16A16Sint};
+    uint32_t descs = 0;
+    uint32_t accepted = 0;
+    for (const auto format : formats) {
+      for (const auto kind : {ImageMetadataKind::Dcc, ImageMetadataKind::Cmask}) {
+        for (const auto type : {BindingType::Texture, BindingType::RenderTarget}) {
+          for (const bool register_valid : {false, true}) {
+            for (const bool alpha_msb : {false, true}) {
+              ImageDesc desc{};
+              desc.type = type;
+              desc.info.metadata.kind = kind;
+              desc.info.metadata.clear_register_valid = register_valid;
+              desc.info.metadata.clear_word = 0x3f8000ffu;
+              desc.info.metadata.dcc_alpha_msb = alpha_msb;
+              desc.view_info.format = format;
+              const auto candidates = TextureCacheTestAccess::ColorClearCandidates(desc);
+              Require(name, "candidate count", candidates.count <= 5,
+                      "more candidate codes than DecodeColorClear has");
+              descs++;
+              for (uint32_t code = 0; code < 256; code++) {
+                vk::ClearColorValue decoded{};
+                const bool accepts = TextureCacheTestAccess::DecodeColorClear(
+                    desc, static_cast<uint8_t>(code), decoded);
+                const auto found = std::find(candidates.codes.begin(),
+                                             candidates.codes.begin() + candidates.count, code);
+                const bool listed = found != candidates.codes.begin() + candidates.count;
+                Require(name, "candidate set", accepts == listed,
+                        "code " + Hex(code) + " of format " + vk::to_string(format) +
+                            (accepts ? " decodes but is not a candidate"
+                                     : " is a candidate but does not decode"));
+                if (listed) {
+                  const auto &color = candidates.colors[found - candidates.codes.begin()];
+                  Require(name, "candidate colour",
+                          std::memcmp(&color, &decoded, sizeof(color)) == 0,
+                          "code " + Hex(code) + " of format " + vk::to_string(format) +
+                              " has a candidate colour DecodeColorClear does not give");
+                  accepted++;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    std::printf("[host]    %-32s ok (%u descs, %u accepted codes)\n", name, descs, accepted);
+  }
+
+  // Fast clears of GPU-written DCC metadata are decided on the GPU: a check kernel predicates the
+  // clears (conditional rendering, or without it indirect storage clears) and the expansion of
+  // matched slices to 0xff, so the CPU never reads the metadata back. The metadata comes from a
+  // hand-written fill kernel (BUFFER_STORE_DWORD over a raw V#) or a DMA fill into pages the GPU
+  // owns already.
+  void CheckGpuColorClear(bool conditional_rendering) {
+    const char *name = conditional_rendering ? "GpuColorClear" : "GpuColorClearStorage";
+    if (conditional_rendering && !m_conditional_rendering) {
+      std::printf("[gpu]     %-32s skipped (no conditional rendering)\n", name);
+      return;
+    }
+    const uintptr_t base = conditional_rendering ? 0x000000020e000000ull : 0x000000020e800000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t metadata_base = 0x100000;
+    constexpr uint64_t slice_bytes = 0x1000;
+    EnsureRuntimeContext();
+    // s[0:3] the metadata's V#, s4 the fill dword, s5 the workgroup: each lane stores one dword.
+    static const std::vector<u32> fill = [] {
+      std::vector<u32> code;
+      code.push_back(EncodeVop2(0x1au, 2, InlineU32(2), 0));  // v_lshlrev_b32 v2, 2, v0
+      code.push_back(EncodeSop2(0x1eu, 6, 5, InlineU32(8)));  // s_lshl_b32 s6, s5, 8
+      code.push_back(EncodeVop1(0x01u, 1, 4));                // v_mov_b32 v1, s4
+      code.push_back(EncodeMubuf0(0x1cu));                    // buffer_store_dword v1, v2, s[0:3], s6 offen
+      code.push_back(EncodeMubuf1(1, 0, 2, 6));
+      AppendEnd(&code);
+      return code;
+    }();
+    ShaderMapUserData(reinterpret_cast<uint64_t>(fill.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<uint32_t>(fill.size() * sizeof(u32))});
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                0x10000, 0, &direct_offset) == 0,
+            "fast-clear allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset, 0x10000) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fast-clear mapping failed");
+    std::memset(mapped, 0x5a, metadata_base);
+    std::memset(reinterpret_cast<uint8_t *>(mapped) + metadata_base, 0x11,
+                allocation_size - metadata_base);
+
+    const bool saved_conditional = m_runtime_context.conditional_rendering_enabled;
+    m_runtime_context.conditional_rendering_enabled = conditional_rendering;
+    {
+      RenderContext context(m_runtime_context);
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      context.GetGpu().SendCommandSync([&] {
+        auto &scheduler = context.GetCommandScheduler();
+        scheduler.Begin(registers, user_config, shaders);
+        auto &cache = context.GetTextureCache();
+        auto &buffers = context.GetBufferCache();
+        auto &executor = context.GetRenderExecutor();
+        context.MapMemory(base, allocation_size);
+
+        const auto fill_metadata = [&](uint64_t address, uint64_t bytes, uint8_t code) {
+          const auto vsharp = EpochDwordBuffer(address, static_cast<uint32_t>(bytes));
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(fill.data()),
+                               .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
+                               .wave_size = 64, .user_sgpr = 5, .tgid_x_en = true});
+          for (u32 i = 0; i < 4; i++) {
+            shaders.SetCsUserSgpr(i, vsharp.fields[i], HW::UserSgprType::Unknown);
+          }
+          shaders.SetCsUserSgpr(4, code * 0x01010101u, HW::UserSgprType::Unknown);
+          executor.DispatchDirect(0, scheduler.Current(), static_cast<u32>(bytes / 256), 1, 1,
+                                  0x41u, false);
+        };
+        const auto read_metadata = [&](uint64_t address, uint64_t bytes) {
+          buffers.ReadMemory(address, bytes, false);
+          std::vector<uint8_t> values(bytes);
+          Require(name, "metadata readback",
+                  LibKernel::Memory::TryReadBacking(address, values.data(), values.size()),
+                  "metadata could not be read back");
+          return values;
+        };
+        const auto uniform = [](const std::vector<uint8_t> &bytes, size_t first, size_t count,
+                                uint8_t value) {
+          return std::all_of(bytes.begin() + first, bytes.begin() + first + count,
+                             [value](uint8_t byte) { return byte == value; });
+        };
+        const auto make_desc = [&](uint64_t offset, vk::Format format,
+                                   Prospero::BufferFormat guest_format, uint32_t layers,
+                                   bool volume, uint64_t metadata_offset) {
+          ImageDesc desc{};
+          desc.type = BindingType::Texture;
+          const vk::Extent3D extent = volume ? vk::Extent3D{16, 16, 4} : vk::Extent3D{64, 64, 1};
+          const uint64_t size =
+              uint64_t{extent.width} * extent.height * extent.depth * 4u * layers;
+          desc.info.data = {base + offset, size};
+          desc.info.pixel_format = format;
+          desc.info.guest_format = guest_format;
+          desc.info.type = volume ? Prospero::ImageType::kColor3D : Prospero::ImageType::kColor2D;
+          desc.info.extent = extent;
+          desc.info.resources = {1, layers};
+          desc.info.pitch = extent.width;
+          desc.info.bytes_per_block = 4;
+          desc.info.samples = 1;
+          desc.info.tile_mode = Prospero::TileMode::kLinear;
+          desc.info.mip_layout[0] = {0, size, extent.width, extent.height};
+          desc.info.metadata.kind = ImageMetadataKind::Dcc;
+          desc.info.metadata.range = {base + metadata_base + metadata_offset,
+                                      slice_bytes * (volume ? extent.depth : layers)};
+          desc.view_info.format = format;
+          desc.view_info.type = volume       ? vk::ImageViewType::e3D
+                                : layers > 1 ? vk::ImageViewType::e2DArray
+                                             : vk::ImageViewType::e2D;
+          desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+          desc.view_info.layer_count = layers;
+          desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+          return desc;
+        };
+        const auto texel = [&](ImageId id, uint32_t layer, int32_t z = 0) {
+          return ReadCachedTexel(name, context, id, {5, 7, z}, {1, 1, 1}, layer).at(0);
+        };
+        const auto paint = [&](ImageId id, uint32_t layers) {
+          vk::ClearValue clear{};
+          clear.color.float32 = std::array{1.0f, 0.0f, 1.0f, 0.0f};
+          TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), id,
+                                             {vk::ImageAspectFlagBits::eColor, 0, 1, 0, layers},
+                                             clear);
+        };
+        constexpr u32 painted = 0x00ff00ffu; // (1, 0, 1, 0) in R8G8B8A8Unorm
+        const auto stats = [&] { return cache.GetColorClearStats(); };
+        // The GPU route takes GPU-written images (MaterializeColorClearOnGpu): each image is
+        // created while its metadata holds the CPU's 0x11 bytes (no clear) and painted first.
+        const auto gpu_owned = [&](ImageDesc desc, uint32_t layers) {
+          const auto id = cache.FindImage(desc);
+          paint(id, layers);
+          return id;
+        };
+
+        // A uniform clear code from the fill kernel clears the image to its colour and the
+        // metadata reads 0xff afterwards; nothing was read back for it.
+        auto plain = make_desc(0x00000, vk::Format::eR8G8B8A8Unorm,
+                               Prospero::BufferFormat::k8_8_8_8UNorm, 1, false, 0x00000);
+        const auto plain_id = gpu_owned(plain, 1);
+        fill_metadata(plain.info.metadata.range.address, slice_bytes, 0xc0);
+        auto before = stats();
+        (void)cache.FindImage(plain);
+        auto after = stats();
+        Require(name, "uniform code clears", texel(plain_id, 0) == 0xffffffffu,
+                "a uniform 0xc0 slice did not clear to opaque white: " +
+                    Hex(texel(plain_id, 0)));
+        Require(name, "uniform code route",
+                after.gpu_checks == before.gpu_checks + 1 &&
+                    after.readbacks == before.readbacks &&
+                    after.storage_clears == before.storage_clears + (conditional_rendering ? 0 : 1),
+                "GPU-written metadata was not checked on the GPU");
+        Require(name, "uniform code expands metadata",
+                uniform(read_metadata(plain.info.metadata.range.address, slice_bytes), 0,
+                        slice_bytes, 0xff),
+                "a consumed clear left its code in the metadata");
+
+        // A second lookup with no new write records nothing, and keeps later rendering.
+        paint(plain_id, 1);
+        fill_metadata(plain.info.metadata.range.address, slice_bytes, 0xc0);
+        (void)cache.FindImage(plain);
+        paint(plain_id, 1);
+        before = stats();
+        (void)cache.FindImage(plain);
+        after = stats();
+        Require(name, "unchanged metadata records nothing",
+                after.gpu_checks == before.gpu_checks &&
+                    after.gpu_unchanged == before.gpu_unchanged + 1,
+                "a lookup of unchanged GPU-modified metadata recorded another check");
+        Require(name, "unchanged metadata keeps rendering", texel(plain_id, 0) == painted,
+                "a lookup of unchanged metadata cleared rendering again");
+
+        // A GPU write after a skipped lookup is checked again.
+        fill_metadata(plain.info.metadata.range.address, slice_bytes, 0xc0);
+        before = stats();
+        (void)cache.FindImage(plain);
+        after = stats();
+        Require(name, "new write is checked again",
+                after.gpu_checks == before.gpu_checks + 1 && texel(plain_id, 0) == 0xffffffffu,
+                "a GPU write after an unchanged lookup was not checked again");
+        paint(plain_id, 1);
+
+        // One non-uniform byte: no clear, the metadata stays as written, and the image's
+        // tracking changes only by being GPU-written (possibly cleared).
+        fill_metadata(plain.info.metadata.range.address, slice_bytes, 0x40);
+        buffers.FillBuffer(plain.info.metadata.range.address + 0x800, 4, 0x40404041u, false);
+        before = stats();
+        (void)cache.FindImage(plain);
+        after = stats();
+        {
+          const auto &image = cache.GetImage(plain_id);
+          Require(name, "predicated-off clear keeps tracking",
+                  after.gpu_checks == before.gpu_checks + 1 &&
+                      after.readbacks == before.readbacks && image.IsGpuModified() &&
+                      !image.IsBufferModified() && !image.IsCpuDirty(),
+                  "a predicated-off clear changed the image's tracking");
+        }
+        Require(name, "non-uniform byte keeps the image", texel(plain_id, 0) == painted,
+                "a slice with one other byte was cleared: " + Hex(texel(plain_id, 0)));
+        {
+          const auto bytes = read_metadata(plain.info.metadata.range.address, slice_bytes);
+          Require(name, "non-uniform byte keeps the metadata",
+                  uniform(bytes, 0, 0x800, 0x40) && bytes[0x800] == 0x41 &&
+                      uniform(bytes, 0x801, slice_bytes - 0x801, 0x40),
+                  "a slice that was not cleared changed its metadata");
+        }
+
+        // An image the guest owns takes the CPU check: a check that clears nothing leaves its
+        // ownership, which the GPU could only do by committing it as written either way.
+        auto fresh = make_desc(0x08000, vk::Format::eR8G8B8A8Unorm,
+                               Prospero::BufferFormat::k8_8_8_8UNorm, 1, false, 0x08000);
+        fill_metadata(fresh.info.metadata.range.address, slice_bytes, 0x80);
+        buffers.FillBuffer(fresh.info.metadata.range.address, 4, 0x80808000u, false);
+        before = stats();
+        const auto fresh_id = cache.FindImage(fresh);
+        after = stats();
+        {
+          const auto &image = cache.GetImage(fresh_id);
+          Require(name, "guest-owned image route",
+                  after.gpu_checks == before.gpu_checks &&
+                      after.readbacks == before.readbacks + 1 && !image.IsGpuModified() &&
+                      (image.IsBufferModified() || image.IsCpuDirty()),
+                  "a guest-owned image was checked on the GPU or lost its ownership");
+        }
+
+        // An image whose guest memory the GPU wrote as a buffer is checked on the GPU and keeps
+        // that ownership: a matched slice is filled into the buffer, which the image then takes.
+        auto written = make_desc(0xc0000, vk::Format::eR8G8B8A8Unorm,
+                                 Prospero::BufferFormat::k8_8_8_8UNorm, 1, false, 0xc0000);
+        const auto written_meta = written.info.metadata.range.address;
+        const auto written_data = written.info.data.address;
+        const auto written_bytes = written.info.data.size;
+        const auto written_id = cache.FindImage(written);
+        cache.UpdateImage(written_id);
+        const auto buffer_written = [&](const char *check) {
+          const auto &image = cache.GetImage(written_id);
+          Require(name, check,
+                  !image.IsGpuModified() && image.IsBufferModified() && !image.IsCpuDirty(),
+                  "the image does not hold buffer-written guest memory");
+        };
+        fill_metadata(written_data, written_bytes, 0x22);
+        buffer_written("buffer-written image setup");
+        fill_metadata(written_meta, slice_bytes, 0xc0);
+        before = stats();
+        (void)cache.FindImage(written);
+        after = stats();
+        Require(name, "buffer-written image route",
+                after.gpu_checks == before.gpu_checks + 1 &&
+                    after.buffer_fills == before.buffer_fills + 1 &&
+                    after.readbacks == before.readbacks,
+                "a buffer-written image was not checked on the GPU");
+        buffer_written("buffer-written image keeps its ownership");
+        cache.UpdateImage(written_id);
+        Require(name, "buffer-written image clears", texel(written_id, 0) == 0xffffffffu,
+                "a uniform 0xc0 slice did not clear the buffer-written image: " +
+                    Hex(texel(written_id, 0)));
+        Require(name, "buffer-written memory clears",
+                uniform(read_metadata(written_data, written_bytes), 0, written_bytes, 0xff),
+                "the guest memory of a cleared buffer-written image does not hold the clear");
+        Require(name, "buffer-written metadata expands",
+                uniform(read_metadata(written_meta, slice_bytes), 0, slice_bytes, 0xff),
+                "a consumed clear left its code in the metadata");
+
+        // A slice with one other byte leaves the GPU's data, in the image and in guest memory.
+        fill_metadata(written_data, written_bytes, 0x22);
+        fill_metadata(written_meta, slice_bytes, 0xc0);
+        buffers.FillBuffer(written_meta + 0x800, 4, 0xc0c0c0c1u, false);
+        before = stats();
+        (void)cache.FindImage(written);
+        after = stats();
+        Require(name, "buffer-written non-uniform route",
+                after.gpu_checks == before.gpu_checks + 1 && after.readbacks == before.readbacks,
+                "a buffer-written image was not checked on the GPU");
+        buffer_written("buffer-written non-uniform keeps its ownership");
+        cache.UpdateImage(written_id);
+        Require(name, "buffer-written non-uniform keeps the image",
+                texel(written_id, 0) == 0x22222222u,
+                "a slice with one other byte cleared the buffer-written image: " +
+                    Hex(texel(written_id, 0)));
+        Require(name, "buffer-written non-uniform keeps memory",
+                uniform(read_metadata(written_data, written_bytes), 0, written_bytes, 0x22),
+                "a slice that was not cleared changed the guest memory");
+
+        // Mixed slices of an array: each slice takes its own code's colour or none.
+        auto array = make_desc(0x10000, vk::Format::eR8G8B8A8Unorm,
+                               Prospero::BufferFormat::k8_8_8_8UNorm, 3, false, 0x10000);
+        const auto array_meta = array.info.metadata.range.address;
+        const auto array_id = gpu_owned(array, 3);
+        fill_metadata(array_meta, slice_bytes, 0x40);
+        fill_metadata(array_meta + slice_bytes, slice_bytes, 0x80);
+        buffers.FillBuffer(array_meta + slice_bytes + 0x100, 4, 0, false);
+        fill_metadata(array_meta + 2 * slice_bytes, slice_bytes, 0x80);
+        before = stats();
+        (void)cache.FindImage(array);
+        after = stats();
+        Require(name, "mixed slices",
+                after.gpu_checks == before.gpu_checks + 1 && texel(array_id, 0) == 0xff000000u &&
+                    texel(array_id, 1) == painted &&
+                    texel(array_id, 2) == 0x00ffffffu,
+                "array slices did not each take their own code: " + Hex(texel(array_id, 0)) +
+                    " " + Hex(texel(array_id, 1)) + " " + Hex(texel(array_id, 2)));
+        {
+          const auto bytes = read_metadata(array_meta, 3 * slice_bytes);
+          Require(name, "mixed slice metadata",
+                  uniform(bytes, 0, slice_bytes, 0xff) &&
+                      uniform(bytes, slice_bytes, 0x100, 0x80) && bytes[slice_bytes + 0x100] == 0 &&
+                      uniform(bytes, 2 * slice_bytes, slice_bytes, 0xff),
+                  "only the cleared slices may expand their metadata");
+        }
+
+        // A volume image: one metadata slice per depth slice, cleared through 2D slice views.
+        auto volume = make_desc(0x20000, vk::Format::eR8G8B8A8Unorm,
+                                Prospero::BufferFormat::k8_8_8_8UNorm, 1, true, 0x20000);
+        const auto volume_meta = volume.info.metadata.range.address;
+        // Painted first: the metadata (0x11 bytes the CPU wrote) clears nothing yet. Painting
+        // also hides a pre-existing issue, seen here and not yet explained (follow-up): after
+        // UpdateImage only depth slice 0 of this linear volume holds the guest's texels, although
+        // TextureBuildImageCopies emits a region per depth slice.
+        const auto volume_id = cache.FindImage(volume);
+        paint(volume_id, 4);
+        fill_metadata(volume_meta, 4 * slice_bytes, 0xc0);
+        buffers.FillBuffer(volume_meta + 2 * slice_bytes + 0x10, 4, 0x01c0c0c0u, false);
+        before = stats();
+        (void)cache.FindImage(volume);
+        after = stats();
+        // Storage clears have no 2D view of a volume slice: without conditional rendering the
+        // metadata is read back for the CPU check.
+        Require(name, "volume route",
+                after.gpu_checks == before.gpu_checks + (conditional_rendering ? 1 : 0) &&
+                    after.readbacks == before.readbacks + (conditional_rendering ? 0 : 1),
+                "a volume image took the wrong route");
+        Require(name, "volume slices",
+                texel(volume_id, 0, 0) == 0xffffffffu && texel(volume_id, 0, 1) == 0xffffffffu &&
+                    texel(volume_id, 0, 2) == painted && texel(volume_id, 0, 3) == 0xffffffffu,
+                "volume depth slices did not clear independently: " +
+                    Hex(texel(volume_id, 0, 0)) + " " + Hex(texel(volume_id, 0, 1)) + " " +
+                    Hex(texel(volume_id, 0, 2)) + " " + Hex(texel(volume_id, 0, 3)));
+
+        // An aliased format: the R16G16 UNORM image cleared through an SFLOAT view.
+        auto aliased = make_desc(0x30000, vk::Format::eR16G16Unorm,
+                                 Prospero::BufferFormat::k16_16UNorm, 1, false, 0x30000);
+        aliased.view_info.format = vk::Format::eR16G16Sfloat;
+        const auto aliased_id = gpu_owned(aliased, 1);
+        fill_metadata(aliased.info.metadata.range.address, slice_bytes, 0xc0);
+        before = stats();
+        (void)cache.FindImage(aliased);
+        after = stats();
+        Require(name, "aliased format",
+                after.gpu_checks == before.gpu_checks + 1 &&
+                    cache.GetImage(aliased_id).backing.format == vk::Format::eR16G16Unorm &&
+                    texel(aliased_id, 0) == 0x3c003c00u,
+                "an aliased view did not clear with its own encoding: " +
+                    Hex(texel(aliased_id, 0)));
+
+        // VideoOut clears but keeps its metadata.
+        auto video = make_desc(0x40000, vk::Format::eR8G8B8A8Srgb,
+                               Prospero::BufferFormat::k8_8_8_8Srgb, 1, false, 0x40000);
+        video.type = BindingType::VideoOut;
+        const auto video_id = gpu_owned(video, 1);
+        fill_metadata(video.info.metadata.range.address, slice_bytes, 0xc0);
+        before = stats();
+        (void)cache.FindImage(video);
+        after = stats();
+        // sRGB has no storage-image support: the storage fallback reads the metadata back.
+        Require(name, "video-out clear",
+                after.gpu_checks == before.gpu_checks + (conditional_rendering ? 1 : 0) &&
+                    texel(video_id, 0) == 0xffffffffu,
+                "a video-out image was not cleared");
+        Require(name, "video-out keeps metadata",
+                uniform(read_metadata(video.info.metadata.range.address, slice_bytes), 0,
+                        slice_bytes, 0xc0),
+                "video-out metadata was expanded");
+
+        // CPU-written metadata takes the CPU path.
+        auto cpu = make_desc(0x48000, vk::Format::eR8G8B8A8Unorm,
+                             Prospero::BufferFormat::k8_8_8_8UNorm, 1, false, 0x48000);
+        WriteMetadata(context, cpu.info.metadata.range.address, slice_bytes, 0x40404040u);
+        before = stats();
+        const auto cpu_id = cache.FindImage(cpu);
+        after = stats();
+        Require(name, "CPU metadata route",
+                after.gpu_checks == before.gpu_checks && after.readbacks == before.readbacks &&
+                    after.cpu_slices_cleared == before.cpu_slices_cleared + 1 &&
+                    texel(cpu_id, 0) == 0xff000000u,
+                "CPU-written metadata did not take the CPU check");
+
+        // Lookups of some slices: an unchecked slice is checked, checked slices stand, and a
+        // CPU write waiting for upload into a checked slice is checked again. The slices are
+        // as large as a readback's window, so the write's readback leaves the other GPU-modified.
+        constexpr uint64_t window_slice = 0x80000;
+        auto pair = make_desc(0x50000, vk::Format::eR8G8B8A8Unorm,
+                              Prospero::BufferFormat::k8_8_8_8UNorm, 2, false, 0x200000);
+        pair.info.metadata.range.size = 2 * window_slice;
+        const auto pair_meta = pair.info.metadata.range.address;
+        const auto pair_id = gpu_owned(pair, 2);
+        fill_metadata(pair_meta, 2 * window_slice, 0x11);
+        const auto lookup = [&](ImageDesc desc, uint32_t first_layer, uint32_t layers) {
+          desc.view_info.base_layer = first_layer;
+          desc.view_info.layer_count = layers;
+          return cache.FindImage(desc);
+        };
+        before = stats();
+        (void)lookup(pair, 0, 1);
+        (void)lookup(pair, 1, 1);
+        after = stats();
+        Require(name, "unchecked slices are checked",
+                after.gpu_checks == before.gpu_checks + 2 &&
+                    after.gpu_unchanged == before.gpu_unchanged,
+                "a lookup of slices no check covered was skipped");
+        before = stats();
+        (void)lookup(pair, 0, 2);
+        (void)lookup(pair, 1, 1);
+        after = stats();
+        Require(name, "checked slices stand",
+                after.gpu_checks == before.gpu_checks &&
+                    after.gpu_unchanged == before.gpu_unchanged + 2,
+                "a lookup of checked slices recorded another check");
+        WriteMetadata(context, pair_meta + window_slice, window_slice, 0x40404040u);
+        Require(name, "pending CPU write setup",
+                buffers.IsRegionGpuModified(pair_meta, window_slice) &&
+                    buffers.IsRegionCpuModified(pair_meta + window_slice, window_slice),
+                "the CPU write did not stay pending beside GPU-modified metadata");
+        before = stats();
+        (void)lookup(pair, 0, 2);
+        after = stats();
+        Require(name, "pending CPU write is checked",
+                after.gpu_checks == before.gpu_checks + 1 && after.readbacks == before.readbacks &&
+                    texel(pair_id, 1) == 0xff000000u && texel(pair_id, 0) == painted,
+                "a CPU write waiting for upload into checked metadata was skipped: " +
+                    Hex(texel(pair_id, 0)) + " " + Hex(texel(pair_id, 1)));
+
+        // One metadata range read with two slice sizes: a check of one 8 KiB slice says nothing
+        // about its 4 KiB halves.
+        auto wide = make_desc(0x60000, vk::Format::eR8G8B8A8Unorm,
+                              Prospero::BufferFormat::k8_8_8_8UNorm, 1, false, 0xb0000);
+        wide.info.metadata.range.size = 2 * slice_bytes;
+        auto split = make_desc(0x70000, vk::Format::eR8G8B8A8Unorm,
+                               Prospero::BufferFormat::k8_8_8_8UNorm, 2, false, 0xb0000);
+        const auto wide_id = gpu_owned(wide, 1);
+        const auto split_id = gpu_owned(split, 2);
+        fill_metadata(wide.info.metadata.range.address, slice_bytes, 0x40);
+        fill_metadata(wide.info.metadata.range.address + slice_bytes, slice_bytes, 0x80);
+        before = stats();
+        (void)cache.FindImage(wide);
+        (void)lookup(split, 0, 1);
+        (void)lookup(split, 1, 1);
+        after = stats();
+        Require(name, "slice geometry",
+                after.gpu_checks == before.gpu_checks + 3 && texel(wide_id, 0) == painted &&
+                    texel(split_id, 0) == 0xff000000u && texel(split_id, 1) == 0x00ffffffu,
+                "a check of other slice sizes skipped a clear: " + Hex(texel(wide_id, 0)) + " " +
+                    Hex(texel(split_id, 0)) + " " + Hex(texel(split_id, 1)));
+
+        // A lookup whose binding joins the metadata's buffers uploads a CPU write into a slice
+        // an earlier check covered: that slice is checked again.
+        constexpr uint64_t big_slice = 0x8000;
+        auto joined = make_desc(0x80000, vk::Format::eR8G8B8A8Unorm,
+                                Prospero::BufferFormat::k8_8_8_8UNorm, 4, false, 0x80000);
+        joined.info.metadata.range.size = 4 * big_slice;
+        const auto joined_meta = joined.info.metadata.range.address;
+        const auto joined_id = gpu_owned(joined, 4);
+        fill_metadata(joined_meta, 2 * big_slice, 0x11);
+        fill_metadata(joined_meta + 2 * big_slice, 2 * big_slice, 0x11);
+        (void)lookup(joined, 0, 2);
+        WriteMetadata(context, joined_meta, big_slice, 0x40404040u);
+        (void)lookup(joined, 1, 3);
+        before = stats();
+        (void)lookup(joined, 0, 2);
+        after = stats();
+        Require(name, "join uploads are checked",
+                after.gpu_checks == before.gpu_checks + 1 && texel(joined_id, 0) == 0xff000000u,
+                "a CPU write a join uploaded into checked metadata was skipped: " +
+                    Hex(texel(joined_id, 0)));
+
+        // An MSAA image the guest owns takes the CPU check too (it is not initialised from guest
+        // memory, so the GPU route could not take its contents either).
+        auto msaa = make_desc(0x90000, vk::Format::eR8G8B8A8Unorm,
+                              Prospero::BufferFormat::k8_8_8_8UNorm, 1, false, 0xa0000);
+        msaa.info.samples = 2;
+        fill_metadata(msaa.info.metadata.range.address, slice_bytes, 0x40);
+        buffers.FillBuffer(msaa.info.metadata.range.address + 0x10, 4, 0x40404041u, false);
+        before = stats();
+        const auto msaa_id = cache.FindImage(msaa);
+        after = stats();
+        {
+          const auto &image = cache.GetImage(msaa_id);
+          Require(name, "MSAA keeps guest ownership",
+                  after.gpu_checks == before.gpu_checks &&
+                      after.readbacks == before.readbacks + 1 &&
+                      (image.IsBufferModified() || image.IsCpuDirty()),
+                  "an MSAA lookup that cleared nothing dropped the guest's ownership");
+        }
+
+        RenderExecutorTestAccess::ResetBindings(executor);
+        context.UnmapMemory(base, allocation_size);
+        scheduler.Finish();
+      });
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    m_runtime_context.conditional_rendering_enabled = saved_conditional;
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "fast-clear mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) ==
+                0,
+            "fast-clear allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -22136,6 +23538,8 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  // VK_EXT_conditional_rendering, which production uses for fast clears it decides on the GPU.
+  bool m_conditional_rendering = false;
   bool m_compute_subgroup_size_control = false;
   u32 m_min_subgroup_size = 0;
   u32 m_max_subgroup_size = 0;
@@ -22176,6 +23580,7 @@ private:
     m_runtime_context.maintenance8_enabled = true;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
+    m_runtime_context.conditional_rendering_enabled = m_conditional_rendering;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -22329,9 +23734,27 @@ private:
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     available_features2.pNext = &available_robustness2;
+    uint32_t extension_count = 0;
+    (void)m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count,
+                                                               nullptr);
+    std::vector<vk::ExtensionProperties> extensions(extension_count);
+    (void)m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count,
+                                                               extensions.data());
+    const bool conditional_rendering_extension =
+        std::any_of(extensions.begin(), extensions.end(), [](const auto &extension) {
+          return std::strcmp(extension.extensionName, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME) ==
+                 0;
+        });
+    vk::PhysicalDeviceConditionalRenderingFeaturesEXT available_conditional_rendering{};
+    if (conditional_rendering_extension) {
+      available_conditional_rendering.pNext = available_features2.pNext;
+      available_features2.pNext = &available_conditional_rendering;
+    }
     m_physical_device.getFeatures2(&available_features2);
     Require("VulkanHarness", "dispatch", available_robustness2.nullDescriptor == true,
             "null descriptors are not supported");
+    m_conditional_rendering = conditional_rendering_extension &&
+                              available_conditional_rendering.conditionalRendering == VK_TRUE;
     // Production requires the guest wave size for compute pipelines; without it the driver may
     // run two guest wave32s in one host subgroup, which the emitter does not expect for compute.
     vk::PhysicalDeviceSubgroupSizeControlProperties size_control{};
@@ -22498,6 +23921,14 @@ private:
       device_extensions.push_back(
           VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
+    }
+    // Production predicates fast clears on GPU-written metadata (TextureCache).
+    vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering_features{};
+    if (m_conditional_rendering) {
+      device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+      conditional_rendering_features.conditionalRendering = true;
+      conditional_rendering_features.pNext = const_cast<void *>(device_info.pNext);
+      device_info.pNext = &conditional_rendering_features;
     }
     device_info.enabledExtensionCount =
         static_cast<uint32_t>(device_extensions.size());
@@ -52133,6 +53564,25 @@ int main(int argc, char **argv) {
     vulkan.BenchmarkWritableBindings();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--color-clear-gpu-only") == 0) {
+    VulkanHarness::CheckColorClearCandidateParity();
+    VulkanHarness vulkan;
+    vulkan.CheckGpuColorClear(true);
+    vulkan.CheckGpuColorClear(false);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--direct-readback-only") == 0) {
+    VulkanHarness vulkan;
+    using Case = VulkanHarness::DirectReadbackCase;
+    for (const auto variant :
+         {Case::Completed, Case::OpenWriter, Case::InFlight, Case::Untracked,
+          Case::PendingPublish, Case::PartialPage, Case::MixedTicks, Case::CopyBuffer,
+          Case::FillBuffer, Case::Joined, Case::NoMapping, Case::Large, Case::WrapBeforeRecord,
+          Case::UntrackedInFlight, Case::PrunedInFlight, Case::UntrackedIndirect}) {
+      vulkan.CheckDirectReadback(variant);
+    }
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--writeback-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckWritebackAfterSplitSubmit(false);
@@ -52158,6 +53608,12 @@ int main(int argc, char **argv) {
     vulkan.CheckEpochJoinTranslation();
     vulkan.CheckEpochRemap();
     vulkan.CheckEpochBdaStoresKept();
+    vulkan.CheckEpochRunAhead();
+    vulkan.CheckEpochRunAheadImage();
+    vulkan.CheckEpochRunAheadBdaStores();
+    vulkan.CheckEpochRunAheadDescending();
+    vulkan.CheckEpochRunAheadImageDescending();
+    vulkan.CheckEpochRunAheadBdaStoresDescending();
     vulkan.CheckPartialUnmapSync();
     return 0;
   }
@@ -52850,12 +54306,36 @@ int main(int argc, char **argv) {
   vulkan.CheckReadbackInFlightSibling(VulkanHarness::InFlightSiblingCase::WrapGated);
   vulkan.CheckReadbackInFlightSibling(VulkanHarness::InFlightSiblingCase::Unsubmitted);
   vulkan.CheckGpuOrderedWriteData();
+  VulkanHarness::CheckColorClearCandidateParity();
+  vulkan.CheckGpuColorClear(true);
+  vulkan.CheckGpuColorClear(false);
+  for (const auto variant :
+       {VulkanHarness::DirectReadbackCase::Completed, VulkanHarness::DirectReadbackCase::OpenWriter,
+        VulkanHarness::DirectReadbackCase::InFlight, VulkanHarness::DirectReadbackCase::Untracked,
+        VulkanHarness::DirectReadbackCase::PendingPublish,
+        VulkanHarness::DirectReadbackCase::PartialPage,
+        VulkanHarness::DirectReadbackCase::MixedTicks,
+        VulkanHarness::DirectReadbackCase::CopyBuffer,
+        VulkanHarness::DirectReadbackCase::FillBuffer, VulkanHarness::DirectReadbackCase::Joined,
+        VulkanHarness::DirectReadbackCase::NoMapping, VulkanHarness::DirectReadbackCase::Large,
+        VulkanHarness::DirectReadbackCase::WrapBeforeRecord,
+        VulkanHarness::DirectReadbackCase::UntrackedInFlight,
+        VulkanHarness::DirectReadbackCase::PrunedInFlight,
+        VulkanHarness::DirectReadbackCase::UntrackedIndirect}) {
+    vulkan.CheckDirectReadback(variant);
+  }
   CheckGpuThreadGuestWritesRouted();
   vulkan.CheckEpochGpuThreadWrites();
   vulkan.CheckEpochWaitAcquire();
   vulkan.CheckEpochJoinTranslation();
   vulkan.CheckEpochRemap();
   vulkan.CheckEpochBdaStoresKept();
+  vulkan.CheckEpochRunAhead();
+  vulkan.CheckEpochRunAheadImage();
+  vulkan.CheckEpochRunAheadBdaStores();
+  vulkan.CheckEpochRunAheadDescending();
+  vulkan.CheckEpochRunAheadImageDescending();
+  vulkan.CheckEpochRunAheadBdaStoresDescending();
   if (skipped_device_checks) {
     std::printf(
         "ShaderRecompilerComputeTests: device rasterization checks skipped, this "

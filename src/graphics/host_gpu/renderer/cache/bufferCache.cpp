@@ -15,6 +15,10 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 #include <algorithm>
 #include <cinttypes>
 #include <cstring>
@@ -89,6 +93,67 @@ std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandSched
 	auto* buffer = temporary.get();
 	scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
 	return {buffer, 0};
+}
+
+// Host mappings of device memory are write-combined (uncached for reads): a plain memcpy is about
+// 40 times slower than streaming loads of whole lines. Both pointers and the size are multiples
+// of DeviceReadAlignment.
+constexpr uint64_t DeviceReadAlignment = 32;
+
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__GNUC__) || defined(__clang__)
+#define KYTY_DEVICE_READ_TARGET(features) __attribute__((target(features)))
+#else
+#define KYTY_DEVICE_READ_TARGET(features)
+#endif
+
+KYTY_DEVICE_READ_TARGET("avx2")
+void ReadDeviceMemoryAvx2(uint8_t* destination, const uint8_t* source, uint64_t size) {
+	auto*       to   = reinterpret_cast<__m256i*>(destination);
+	const auto* from = reinterpret_cast<const __m256i*>(source);
+	for (uint64_t i = 0; i < size / sizeof(__m256i); i++) {
+		_mm256_store_si256(to + i, _mm256_stream_load_si256(from + i));
+	}
+}
+
+KYTY_DEVICE_READ_TARGET("sse4.1")
+void ReadDeviceMemorySse41(uint8_t* destination, const uint8_t* source, uint64_t size) {
+	auto*       to   = reinterpret_cast<__m128i*>(destination);
+	const auto* from = reinterpret_cast<const __m128i*>(source);
+	for (uint64_t i = 0; i < size / sizeof(__m128i); i++) {
+		_mm_store_si128(to + i, _mm_stream_load_si128(const_cast<__m128i*>(from + i)));
+	}
+}
+
+#undef KYTY_DEVICE_READ_TARGET
+#endif
+
+// Streaming loads are not ordered with the earlier load that saw the writer complete: one fence
+// before the reads that depend on it.
+void FenceDeviceReads() {
+#if defined(__x86_64__) || defined(_M_X64)
+	_mm_mfence();
+#else
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
+}
+
+void ReadDeviceMemory(uint8_t* destination, const uint8_t* source, uint64_t size) {
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__GNUC__) || defined(__clang__)
+	static const bool avx2  = __builtin_cpu_supports("avx2");
+	static const bool sse41 = __builtin_cpu_supports("sse4.1");
+	if (avx2) {
+		ReadDeviceMemoryAvx2(destination, source, size);
+		return;
+	}
+	if (sse41) {
+		ReadDeviceMemorySse41(destination, source, size);
+		return;
+	}
+#endif
+#endif
+	std::memcpy(destination, source, size);
 }
 
 } // namespace
@@ -248,7 +313,6 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (copies.empty()) {
 		return false;
 	}
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
 	// Not held while recording: a staging wrap there can submit, and the submit records
 	// write-backs.
 	if (writeback_lock.owns_lock()) {
@@ -260,6 +324,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 
 void BufferCache::RecordDownload(Buffer& buffer, std::vector<vk::BufferCopy>&& copies,
                                  uint64_t total_size, bool async) {
+	// Here, not in DownloadBufferMemory: the end-of-submit write-backs record downloads too.
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
 	const auto buffer_address = buffer.CpuAddress();
 	const auto noted_tick     = m_scheduler.CurrentTick();
 	auto [mapped, offset]     = m_download_buffer.Map(total_size, 64);
@@ -365,6 +431,11 @@ void BufferCache::NoteWrittenRange(uint64_t vaddr, uint64_t size) {
 void BufferCache::CommitWrittenRanges() {
 	if (m_written_pending.empty()) {
 		return;
+	}
+	// Recorded now, in the command buffer open at this tick (a wrap since the binding submitted
+	// the one it was noted in).
+	for (const auto [vaddr, size]: m_written_pending) {
+		NoteOpenWrite(vaddr, size);
 	}
 	if (m_writeback_hot_pages.empty()) {
 		m_written_pending.clear();
@@ -622,6 +693,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
 	m_scheduler.SetPreSubmitHook([this] { RecordWritebacks(); });
+	m_host_readable_buffers = Buffer::HostReadableSupported(graphics);
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
@@ -672,6 +744,26 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	    [this](uint64_t address, uint64_t bytes) { return HoldCpuWritten(address, bytes); });
 }
 
+MemoryTracker::AheadCandidates BufferCache::InvalidateFault(uint64_t vaddr) {
+	if (!GuestRange {vaddr, 1}.Valid()) {
+		EXIT("BufferCache: invalid write-fault address\n");
+	}
+	// As InvalidateMemory.
+	return m_memory_tracker.InvalidateFault(
+	    vaddr, m_epoch.Generation() >> WRITE_HISTORY_SHIFT,
+	    [this, vaddr] {
+		    const FrameProfiler::ScopedCause cause(FrameProfiler::ReadbackCause::FaultWrite);
+		    ReadMemory(vaddr, 1, true);
+	    },
+	    [this](uint64_t address, uint64_t bytes) { return HoldCpuWritten(address, bytes); });
+}
+
+uint64_t BufferCache::InvalidateAhead(uint64_t vaddr, uint64_t size, AheadDirection direction) {
+	return m_memory_tracker.InvalidateAhead(
+	    vaddr, size, direction, m_epoch.Generation() >> WRITE_HISTORY_SHIFT,
+	    [this](uint64_t address, uint64_t bytes) { return HoldCpuWritten(address, bytes); });
+}
+
 CoherenceEpoch::Hold BufferCache::HoldCpuWritten(uint64_t vaddr, uint64_t size) {
 	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
@@ -710,6 +802,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			const auto ticks = FrameProfiler::Ticks() - t0;
 			FrameProfiler::Add(Counter::ReadMemoryCallsRender, role);
 			FrameProfiler::Add(Counter::ReadMemoryTimeRender, role, ticks);
+			if (color_metadata) {
+				FrameProfiler::Add(Counter::ColorMetadataReadbacksRender, role);
+				FrameProfiler::Add(Counter::ColorMetadataReadbackTimeRender, role, ticks);
+			}
 			if (role == FrameProfiler::Role::Gpu) {
 				const auto phase = FrameProfiler::t_phase;
 				const auto where =
@@ -721,7 +817,32 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				        : Counter::GpuReadbackCommandTime;
 				FrameProfiler::Add(where, ticks);
 			}
+			if (direct != Counter::Count) {
+				FrameProfiler::Add(direct);
+				if (direct == Counter::ReadbackDirect) {
+					FrameProfiler::Add(Counter::ReadbackDirectTime, ticks);
+					FrameProfiler::Add(Counter::ReadbackDirectBytes, direct_bytes);
+				} else {
+					// The whole download's time (unmaps and invalidations included, as Size): what
+					// was not eligible, not time lost to the check.
+					FrameProfiler::Add(Counter::ReadbackDirectBlockedTime, ticks);
+				}
+			}
 			FrameProfiler::NoteReadback(address, waited, ticks);
+		}
+		void NoteDirect(DirectReadback outcome, uint64_t bytes) {
+			using FrameProfiler::Counter;
+			switch (outcome) {
+				case DirectReadback::Copied: direct = Counter::ReadbackDirect; break;
+				case DirectReadback::Unmapped: direct = Counter::ReadbackDirectBlockedUnmapped; break;
+				case DirectReadback::Writer: direct = Counter::ReadbackDirectBlockedWriter; break;
+				case DirectReadback::Untracked:
+					direct = Counter::ReadbackDirectBlockedUntracked;
+					break;
+				case DirectReadback::Pending: direct = Counter::ReadbackDirectBlockedPending; break;
+				case DirectReadback::Size: direct = Counter::ReadbackDirectBlockedSize; break;
+			}
+			direct_bytes = bytes;
 		}
 		ProfiledReadMemory(const ProfiledReadMemory&)            = delete;
 		ProfiledReadMemory& operator=(const ProfiledReadMemory&) = delete;
@@ -729,7 +850,17 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const uint64_t                           t0;
 		const uint64_t                           address;
 		std::vector<FrameProfiler::AddressRange> waited;
-	} const profile(vaddr, size);
+		// The direct readback's outcome (TryReadDirect), when it got that far.
+		FrameProfiler::Counter                   direct       = FrameProfiler::Counter::Count;
+		uint64_t                                 direct_bytes = 0;
+		bool                                     color_metadata = false;
+	} profile(vaddr, size);
+	// The texture cache watches the DCC/CMask metadata its GPU fast-clear checks recorded
+	// (TextureCache::MaterializeColorClear): a readback of it by anyone else is a reader the
+	// check left the metadata GPU-dirty for. Metadata never checked on the GPU is not counted.
+	profile.color_metadata = profile.t0 != 0 &&
+	                         FrameProfiler::t_readback_cause != FrameProfiler::ReadbackCause::Metadata &&
+	                         OverlapsWatchedWrites(vaddr, size);
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
@@ -748,7 +879,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		ReadMemoryFromGuestThread(vaddr, size, is_write);
 		return;
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, &profile] {
 		ApplyResolvedWritebacks();
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
@@ -770,24 +901,198 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			}
 			m_memory_tracker.UnmarkRegionAsGpuModified(fault_page, CACHING_PAGESIZE);
 		} else {
-			// The page cost a readback: from now on, writable bindings over it are copied back
-			// at the end of their submit.
-			m_writeback_hot_pages[vaddr >> WritebackPageBits] = m_scheduler.CurrentTick();
-			bool ready = DownloadBufferMemory<false>(buffer, vaddr, size);
-			// Pages whose GPU-dirty bytes a guest thread's download took wait for its publish.
-			if (const auto pending = ready ? 0 : PendingWriteTick(vaddr, size); pending != 0) {
-				m_scheduler.Wait(pending, WaitSite::ReadbackPendingPublish);
-				m_scheduler.WaitPriorityOperations(pending, WaitSite::ReadbackPendingPublish);
-				ready = true;
+			uint64_t direct_bytes  = 0;
+			uint64_t blocking_tick = 0;
+			auto     direct = TryReadDirect(buffer, vaddr, size, direct_bytes, &blocking_tick);
+			if (blocking_tick != 0) {
+				// Only the writer (or the untracked stores) blocks the direct read: wait for that
+				// tick alone (submitting the open command buffer when the writer is in it), not
+				// for a download behind everything recorded since.
+				profile.NoteDirect(direct, 0);
+				m_scheduler.Wait(blocking_tick, WaitSite::ReadbackGpuThread);
+				direct = TryReadDirect(m_slot_buffers[FindBuffer(vaddr, size)], vaddr, size,
+				                       direct_bytes);
 			}
-			if (ready) {
-				m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+			profile.NoteDirect(direct, direct_bytes);
+			if (direct != DirectReadback::Copied) {
+				// Only pages a direct read could not take cost a readback: from now on, writable
+				// bindings over them are copied back at the end of their submit.
+				m_writeback_hot_pages[vaddr >> WritebackPageBits] = m_scheduler.CurrentTick();
+				bool ready = DownloadBufferMemory<false>(buffer, vaddr, size);
+				// Pages whose GPU-dirty bytes a guest thread's download took wait for its
+				// publish.
+				if (const auto pending = ready ? 0 : PendingWriteTick(vaddr, size); pending != 0) {
+					m_scheduler.Wait(pending, WaitSite::ReadbackPendingPublish);
+					m_scheduler.WaitPriorityOperations(pending, WaitSite::ReadbackPendingPublish);
+					ready = true;
+				}
+				if (ready) {
+					m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+				}
 			}
 		}
 		if (is_write) {
 			MarkCpuWritten(vaddr, size);
 		}
 	});
+}
+
+BufferCache::DirectReadback BufferCache::TryReadDirect(Buffer& buffer, uint64_t vaddr,
+                                                      uint64_t size, uint64_t& copied,
+                                                      uint64_t* blocking_tick) {
+	// Uncached reads under load cost about 2.5 us per KiB (a GPU copy round trip about 60 us).
+	// Larger requests keep the download (an unmap reads back its whole range).
+	if (size > TRACKER_PAGE_SIZE) {
+		return DirectReadback::Size;
+	}
+	const auto mapped = buffer.Mapped();
+	if (mapped.empty() || reinterpret_cast<uintptr_t>(mapped.data()) % DeviceReadAlignment != 0 ||
+	    buffer.Size() % DeviceReadAlignment != 0) {
+		return DirectReadback::Unmapped;
+	}
+	const auto buffer_begin = buffer.CpuAddress();
+	const auto begin = std::max(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE), buffer_begin);
+	const auto end   = std::min(Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE),
+	                            buffer_begin + buffer.Size());
+	// Stores through GPU-selected V#s and addresses may have written any byte.
+	if (!m_scheduler.IsFree(m_untracked_write_tick)) {
+		if (blocking_tick != nullptr) {
+			*blocking_tick = m_untracked_write_tick;
+		}
+		return DirectReadback::Untracked;
+	}
+	// A download or write-back has yet to publish into the pages.
+	if (HasPendingGuestWrite(begin, end - begin)) {
+		return DirectReadback::Pending;
+	}
+	// As for a download (DownloadBufferMemory): a fault thread handing written-back pages back
+	// either did before the scan, which then skips them, or waits until the pages are back.
+	std::unique_lock writeback_lock(m_writeback_mutex, std::defer_lock);
+	if (m_writeback_page_count.load(std::memory_order_acquire) != 0) {
+		writeback_lock.lock();
+	}
+	// The GPU-dirty bytes of the GPU-owned pages, by page run.
+	std::vector<std::pair<uint64_t, uint64_t>> pages;
+	std::vector<std::pair<uint64_t, uint64_t>> dirty;
+	uint64_t                                   bytes = 0;
+	m_memory_tracker.ForEachDownloadRange<false>(
+	    begin, end - begin, [&](uint64_t address, uint64_t length) noexcept {
+		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, length,
+		                                           "direct readback");
+		    pages.emplace_back(address, length);
+		    m_gpu_modified_ranges.ForEachInRange(address, length, [&](uint64_t first, uint64_t last) {
+			    dirty.emplace_back(first, last);
+			    bytes += last - first;
+		    });
+	    });
+	// Each byte's last writer has completed: not the open command buffer, not a command still to
+	// be recorded for a binding, and its tick (m_write_ticks) done.
+	const auto& open   = OpenWrites();
+	uint64_t    writer = 0;
+	for (const auto [first, last]: dirty) {
+		if (std::any_of(m_written_pending.begin(), m_written_pending.end(), [&](const auto& range) {
+			    return range.first < last && first < range.first + range.second;
+		    })) {
+			return DirectReadback::Writer;
+		}
+		if (open.Intersects(first, last - first)) {
+			if (blocking_tick != nullptr) {
+				*blocking_tick = m_scheduler.CurrentTick();
+			}
+			return DirectReadback::Writer;
+		}
+		writer = std::max(writer, m_write_ticks.Max(first, last));
+	}
+	if (!m_scheduler.IsFree(writer)) {
+		if (blocking_tick != nullptr) {
+			*blocking_tick = writer;
+		}
+		return DirectReadback::Writer;
+	}
+	// The completed command buffers ended with a host barrier (NoteOpenWrite), so the mapping
+	// holds their bytes.
+	FenceDeviceReads();
+	for (const auto [first, last]: dirty) {
+		const auto from = Common::AlignDown(buffer.Offset(first), DeviceReadAlignment);
+		const auto to   = Common::AlignUp(buffer.Offset(last), DeviceReadAlignment);
+		if (m_direct_staging.size() < to - from + DeviceReadAlignment) {
+			m_direct_staging.resize(to - from + DeviceReadAlignment);
+		}
+		auto* staging = reinterpret_cast<uint8_t*>(Common::AlignUp(
+		    reinterpret_cast<uintptr_t>(m_direct_staging.data()), DeviceReadAlignment));
+		ReadDeviceMemory(staging, mapped.data() + from, to - from);
+		Libs::LibKernel::Memory::WriteBacking(first, staging + (buffer.Offset(first) - from),
+		                                      last - first);
+	}
+	{
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		for (const auto [address, length]: pages) {
+			m_gpu_modified_ranges.Subtract(address, length);
+		}
+	}
+	// The request's pages now hold no GPU-dirty byte. They are handed back lazily: the GPU
+	// writes them again soon, and the GPU thread reads them from the backing store.
+	const bool lazy = PageManager::SetLazyRelease(true);
+	m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
+	(void)PageManager::SetLazyRelease(lazy);
+	m_direct_readbacks.fetch_add(1, std::memory_order_relaxed);
+	copied = bytes;
+	return DirectReadback::Copied;
+}
+
+void BufferCache::MergeOpenWrites() {
+	for (; m_open_merged < m_open_writes.size(); m_open_merged++) {
+		const auto [vaddr, size] = m_open_writes[m_open_merged];
+		m_open_written.Add(vaddr, size);
+	}
+}
+
+void BufferCache::FollowOpenTick() {
+	// The log belongs to a submitted command buffer: its ranges take its tick, and the open
+	// command buffer starts its own.
+	const auto tick = m_scheduler.CurrentTick();
+	if (tick == m_open_tick) {
+		return;
+	}
+	MergeOpenWrites();
+	m_open_written.ForEach([&](uint64_t begin, uint64_t end) {
+		m_write_ticks.Assign(begin, end, m_open_tick);
+	});
+	m_open_writes.clear();
+	m_open_written.Clear();
+	m_open_merged = 0;
+	m_open_tick   = tick;
+	constexpr uint64_t PruneInterval = 64;
+	if (tick >= m_write_ticks_pruned + PruneInterval) {
+		PruneWriteTicks();
+	}
+}
+
+void BufferCache::PruneWriteTicks() {
+	// Completed ticks read as no writer: their ranges are dropped, so that the map holds about
+	// the writes in flight.
+	m_write_ticks_pruned = m_scheduler.CurrentTick();
+	m_write_ticks.EraseUpTo(m_scheduler.GetMasterSemaphore().KnownGpuTick());
+}
+
+void BufferCache::NoteOpenWrite(uint64_t vaddr, uint64_t size) {
+	if (size == 0) {
+		return;
+	}
+	FollowOpenTick();
+	m_open_writes.emplace_back(vaddr, size);
+	m_scheduler.RequestHostBarrier();
+}
+
+const RangeSet& BufferCache::OpenWrites() {
+	FollowOpenTick();
+	MergeOpenWrites();
+	return m_open_written;
+}
+
+void BufferCache::NoteUntrackedWrites() {
+	m_untracked_write_tick = m_scheduler.CurrentTick();
+	m_scheduler.RequestHostBarrier();
 }
 
 void BufferCache::ReadMemoryFromGuestThread(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -984,9 +1289,13 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		                   overlap.end - overlap.begin);
 	}
 
-	const auto id = m_slot_buffers.insert(
-	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
-	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
+	constexpr auto flags = AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress;
+	const auto     id =
+	    m_host_readable_buffers
+	        ? m_slot_buffers.insert(Buffer::HostReadable {}, m_graphics, m_scheduler,
+	                                overlap.begin, flags, overlap.end - overlap.begin)
+	        : m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal,
+	                                overlap.begin, flags, overlap.end - overlap.begin);
 	const auto& buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
@@ -996,6 +1305,9 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
 	Register(id);
+	// The joins copied the old buffers' GPU-dirty bytes.
+	NoteOpenWrite(overlap.begin, overlap.end - overlap.begin);
+	NoteBufferWrite(overlap.begin, overlap.end - overlap.begin);
 	// Reads within an epoch only translate (TranslateRead), and pages never protected do not
 	// fault to mark themselves pending: the new range takes what the CPU wrote now, in one batch.
 	RangeSet created;
@@ -1058,6 +1370,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
 		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
 		                  copies.data());
+		for (const auto& copy: copies) {
+			NoteBufferWrite(buffer.CpuAddress() + copy.dstOffset, copy.size);
+		}
 		auto after          = before;
 		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
@@ -1118,6 +1433,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written && !m_gpu_modified_ranges.Contains(vaddr, size)) {
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		m_gpu_modified_ranges.Add(vaddr, size);
+	}
+	if (is_written) {
+		NoteOpenWrite(vaddr, size);
+		NoteBufferWrite(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -1278,6 +1597,85 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
 }
 
+uint64_t BufferCache::WriteGeneration(uint64_t vaddr, uint64_t size) {
+	std::unique_lock lock(m_write_watch_mutex);
+	const auto [watch, inserted] = m_write_watches.try_emplace({vaddr, vaddr + size}, 0);
+	if (inserted) {
+		watch->second         = ++m_write_generation;
+		m_write_watch_largest = std::max(m_write_watch_largest, size);
+		m_write_watches_any.store(true, std::memory_order_relaxed);
+	}
+	return watch->second;
+}
+
+void BufferCache::UnwatchWrites(uint64_t vaddr, uint64_t size) {
+	std::unique_lock lock(m_write_watch_mutex);
+	const auto       first = m_write_watches.lower_bound({vaddr, 0});
+	const auto       last  = m_write_watches.lower_bound({vaddr + size, 0});
+	if (first != last) {
+		m_write_watches.erase(first, last);
+		RecomputeLargestWatch();
+	}
+}
+
+void BufferCache::UnwatchRange(uint64_t vaddr, uint64_t size) {
+	std::unique_lock lock(m_write_watch_mutex);
+	if (m_write_watches.erase({vaddr, vaddr + size}) != 0) {
+		RecomputeLargestWatch();
+	}
+}
+
+void BufferCache::RecomputeLargestWatch() {
+	m_write_watch_largest = 0;
+	for (const auto& [range, generation]: m_write_watches) {
+		m_write_watch_largest = std::max(m_write_watch_largest, range.second - range.first);
+	}
+	m_write_watches_any.store(!m_write_watches.empty(), std::memory_order_relaxed);
+}
+
+uint64_t BufferCache::WriteNotes() const {
+	std::shared_lock lock(m_write_watch_mutex);
+	return m_write_notes;
+}
+
+bool BufferCache::OverlapsWatchedWrites(uint64_t vaddr, uint64_t size) const {
+	if (!m_write_watches_any.load(std::memory_order_relaxed)) {
+		return false;
+	}
+	std::shared_lock lock(m_write_watch_mutex);
+	const auto       end = vaddr + size;
+	const auto       from =
+	    vaddr > m_write_watch_largest ? vaddr - m_write_watch_largest : uint64_t {0};
+	for (auto it = m_write_watches.lower_bound({from, 0});
+	     it != m_write_watches.end() && it->first.first < end; ++it) {
+		if (it->first.second > vaddr) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void BufferCache::NoteBufferWrite(uint64_t vaddr, uint64_t size) {
+	if (!m_write_watches_any.load(std::memory_order_relaxed)) {
+		return;
+	}
+	std::unique_lock lock(m_write_watch_mutex);
+	const auto       end  = vaddr + size;
+	const auto       from = vaddr > m_write_watch_largest ? vaddr - m_write_watch_largest : uint64_t {0};
+	bool             moved = false;
+	for (auto it = m_write_watches.lower_bound({from, 0});
+	     it != m_write_watches.end() && it->first.first < end; ++it) {
+		if (it->first.second > vaddr) {
+			if (!moved) {
+				++m_write_generation;
+				++m_write_notes;
+				moved = true;
+			}
+			it->second = m_write_generation;
+		}
+	}
+}
+
 bool BufferCache::TryWriteGpuOrdered(uint64_t vaddr, const void* data, uint64_t size) {
 	// The guest's copy of a GPU-dirty page is stale and the CPU cannot read it without a
 	// readback, which then returns these bytes too. A page that is not GPU-dirty is read
@@ -1292,6 +1690,7 @@ bool BufferCache::TryWriteGpuOrdered(uint64_t vaddr, const void* data, uint64_t 
 	auto&      buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	WriteDataBuffer(buffer, vaddr, data, size);
+	NoteBufferWrite(vaddr, size);
 	// Write-through: with no older download or write-back left to publish into these pages
 	// (both register pending guest writes), guest memory takes the bytes too and they stop being
 	// GPU-dirty. Reads of them (often the GPU thread's own resource evaluation, right after) are
@@ -1359,6 +1758,7 @@ void BufferCache::WriteThrough(uint64_t vaddr, const uint8_t* bytes, uint64_t si
 			WriteDataBuffer(buffer, start, bytes + (start - vaddr), finish - start);
 		}
 	}
+	NoteBufferWrite(vaddr, size);
 }
 
 bool BufferCache::IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const {
@@ -1586,6 +1986,8 @@ void BufferCache::UploadCpuPending(const RangeSet& pending) {
 		return;
 	}
 
+	// The epoch upload does not go through UploadCopies, which counts the other uploads.
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
 	// One staging reservation: a wrap waiting on this submit then happens before any copy is
 	// recorded, never between a copy and the data it reads.
 	const uint64_t copy_t0         = profile_t0 != 0 ? FrameProfiler::Ticks() : 0;
@@ -1634,6 +2036,9 @@ void BufferCache::UploadCpuPending(const RangeSet& pending) {
 	for (const auto& upload: uploads) {
 		native.copyBuffer(source, upload.buffer->Handle(), static_cast<uint32_t>(upload.count),
 		                  copies.data() + upload.first);
+		for (size_t i = upload.first; i < upload.first + upload.count; i++) {
+			NoteBufferWrite(upload.buffer->CpuAddress() + copies[i].dstOffset, copies[i].size);
+		}
 	}
 	vk::MemoryBarrier after {};
 	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;

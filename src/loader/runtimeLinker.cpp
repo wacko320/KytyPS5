@@ -675,6 +675,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		    Loader::X64InstructionEmulator::TryEmulateLoad(
 		        info->native_context, info->access_violation_vaddr,
 		        &Libs::LibKernel::Memory::TryReadCleanFaultingBytes)) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {

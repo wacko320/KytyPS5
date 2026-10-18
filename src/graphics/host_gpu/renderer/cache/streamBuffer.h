@@ -39,8 +39,19 @@ class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	// Device-local memory the host can map and read too (resizable BAR), mapped for the buffer's
+	// lifetime: Mapped() is the whole buffer, its GPU writes readable once a host barrier and the
+	// work's completion make them visible. Without such memory (HostReadableSupported), or when
+	// the allocation fails, plain device-local memory with no mapping.
+	struct HostReadable {};
+	Buffer(HostReadable, GraphicContext& graphics, CommandScheduler& scheduler,
+	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
+
+	// Whether the device has host-visible, coherent device-local memory in a heap as large as its
+	// largest device-local heap: then buffers may live there without crowding out anything.
+	[[nodiscard]] static bool HostReadableSupported(const GraphicContext& graphics);
 
 	[[nodiscard]] vk::Buffer         Handle() const noexcept { return m_buffer; }
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
@@ -78,6 +89,7 @@ protected:
 	[[nodiscard]] CommandScheduler& Scheduler() const noexcept { return *m_scheduler; }
 
 private:
+	[[nodiscard]] vk::Result Allocate(vk::BufferUsageFlags flags, bool host_readable = false);
 	[[nodiscard]] vk::BufferMemoryBarrier Barrier(uint64_t offset, uint64_t size,
 	                                              vk::AccessFlags source,
 	                                              vk::AccessFlags destination) const;

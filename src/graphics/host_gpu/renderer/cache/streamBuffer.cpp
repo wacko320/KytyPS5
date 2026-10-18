@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include <algorithm>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -59,21 +60,75 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
                uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
       m_size(size) {
+	const auto result = Allocate(flags);
+	if (result != vk::Result::eSuccess) {
+		graphics.LogMemoryBudget();
+	}
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+}
+
+Buffer::Buffer(HostReadable, GraphicContext& graphics, CommandScheduler& scheduler,
+               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal),
+      m_cpu_address(cpu_address), m_size(size) {
+	// Checked here too (BufferCache keeps the answer) so that any caller gets the fallback; it
+	// only walks the memory types.
+	if (HostReadableSupported(graphics) && Allocate(flags, true) == vk::Result::eSuccess) {
+		return;
+	}
+	const auto result = Allocate(flags);
+	if (result != vk::Result::eSuccess) {
+		graphics.LogMemoryBudget();
+	}
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+}
+
+bool Buffer::HostReadableSupported(const GraphicContext& graphics) {
+	const auto&    memory   = graphics.physical_device_memory_properties;
+	constexpr auto readable = vk::MemoryPropertyFlagBits::eDeviceLocal |
+	                          vk::MemoryPropertyFlagBits::eHostVisible |
+	                          vk::MemoryPropertyFlagBits::eHostCoherent;
+	vk::DeviceSize largest  = 0;
+	vk::DeviceSize visible  = 0;
+	for (uint32_t i = 0; i < memory.memoryTypeCount; i++) {
+		const auto& type = memory.memoryTypes[i];
+		const auto  heap = memory.memoryHeaps[type.heapIndex].size;
+		if (type.propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal) {
+			largest = std::max(largest, heap);
+		}
+		if ((type.propertyFlags & readable) == readable) {
+			visible = std::max(visible, heap);
+		}
+	}
+	return visible != 0 && visible >= largest;
+}
+
+vk::Result Buffer::Allocate(vk::BufferUsageFlags flags, bool host_readable) {
 	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(graphics.allocator == nullptr || size == 0);
+	auto& graphics = *m_graphics;
+	EXIT_IF(graphics.allocator == nullptr || m_size == 0);
 
 	vk::BufferCreateInfo buffer_info {};
-	buffer_info.size        = size;
+	buffer_info.size        = m_size;
 	buffer_info.usage       = flags;
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
-	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | AllocationFlags(usage);
-	allocation_info.usage = AllocationUsage(usage);
-	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
+	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | AllocationFlags(m_usage);
+	allocation_info.usage = AllocationUsage(m_usage);
+	allocation_info.preferredFlags = m_usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
 	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	if (host_readable) {
+		// Only the device-local types: an automatic usage with host access would prefer the
+		// host's cached memory.
+		allocation_info.flags |= VMA_ALLOCATION_CREATE_MAPPED_BIT;
+		allocation_info.usage         = VMA_MEMORY_USAGE_UNKNOWN;
+		allocation_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+		                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+		                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	}
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
@@ -81,9 +136,8 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
 	    &native_buffer, &m_allocation, &allocation_result));
 	if (result != vk::Result::eSuccess) {
-		graphics.LogMemoryBudget();
+		return result;
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_buffer = native_buffer;
 	if (with_bda) {
@@ -98,8 +152,9 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	m_coherent = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
 	if (allocation_result.pMappedData != nullptr) {
 		m_mapped = {static_cast<uint8_t*>(allocation_result.pMappedData),
-		            static_cast<size_t>(size)};
+		            static_cast<size_t>(m_size)};
 	}
+	return vk::Result::eSuccess;
 }
 
 Buffer::~Buffer() {

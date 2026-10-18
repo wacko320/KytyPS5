@@ -6,6 +6,8 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -99,6 +101,19 @@ private:
 };
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
+
+// Run-ahead: a write fault that continues a run of CPU-dirty pages also makes the next pages
+// CPU-dirty and writable, as many as the run is long within these bounds, so a run the CPU keeps
+// writing faults once per window instead of once per page. A run is followed either way: one
+// written upwards opens the window above the fault, one written downwards (pages filled from the
+// top) the window below it.
+constexpr size_t AHEAD_MIN_PAGES = 4;
+constexpr size_t AHEAD_MAX_PAGES = 32;
+// A write-history epoch spans 2^WRITE_HISTORY_SHIFT pending-set uploads (CoherenceEpoch); a page
+// stays eligible for run-ahead for one to two of them after its last write fault.
+constexpr uint32_t WRITE_HISTORY_SHIFT = 12;
+// The way a run-ahead window extends from its fault, and its eligible prefix is walked.
+enum class AheadDirection : uint8_t { Up, Down };
 
 // Counts the transitions that can make a finished synchronization incomplete. While both still
 // hold the values read before a range was synchronized, synchronizing it again changes nothing:
@@ -213,9 +228,78 @@ public:
 		}
 	}
 
+	// Requires the lock. Notes a write fault on the page holding vaddr in the write history.
+	void NoteCpuWritten(uint64_t vaddr, uint64_t history_epoch) {
+		RotateHistory(history_epoch);
+		m_written[0].Set(GetPageRange(vaddr, 1).first);
+	}
+	// Requires the lock. The number of CPU-dirty pages directly below the page holding vaddr,
+	// within the region, counting at most cap.
+	[[nodiscard]] size_t CpuDirtyRunBelow(uint64_t vaddr, size_t cap) const {
+		auto   page = GetPageRange(vaddr, 1).first;
+		size_t run  = 0;
+		while (run < cap && page != 0 && m_cpu_dirty.Get(page - 1)) {
+			page--;
+			run++;
+		}
+		return run;
+	}
+	// Requires the lock. As CpuDirtyRunBelow, the run directly above the page.
+	[[nodiscard]] size_t CpuDirtyRunAbove(uint64_t vaddr, size_t cap) const {
+		auto   page = GetPageRange(vaddr, 1).first;
+		size_t run  = 0;
+		while (run < cap && page + 1 < TRACKER_REGION_PAGES && m_cpu_dirty.Get(page + 1)) {
+			page++;
+			run++;
+		}
+		return run;
+	}
+	// Requires the lock. How many pages from the one holding vaddr on (at most max_pages, within
+	// the region, walking up or down) run-ahead may make CPU-dirty: the prefix ends before a
+	// GPU-dirty page and before a clean page outside the write history, and passes over CPU-dirty
+	// pages. It ends after its last clean page, so a prefix of CPU-dirty pages only is empty.
+	[[nodiscard]] size_t AheadEligible(uint64_t vaddr, size_t max_pages, uint64_t history_epoch,
+	                                   AheadDirection direction) {
+		RotateHistory(history_epoch);
+		const auto first = GetPageRange(vaddr, 1).first;
+		const bool down  = direction == AheadDirection::Down;
+		const auto count = std::min(max_pages, down ? first + 1 : TRACKER_REGION_PAGES - first);
+		size_t     eligible = 0;
+		for (size_t index = 0; index < count; index++) {
+			const auto page = down ? first - index : first + index;
+			if (m_gpu_dirty.Get(page)) {
+				break;
+			}
+			if (m_cpu_dirty.Get(page)) {
+				continue;
+			}
+			if (!m_written[0].Get(page) && !m_written[1].Get(page)) {
+				break;
+			}
+			eligible = index + 1;
+		}
+		return eligible;
+	}
+
 	TrackingSpinLock lock;
 
 private:
+	// The history is two epochs of write-fault bits, aged on first use in a later epoch. A caller
+	// that read an older epoch before waiting for the lock counts as the current one: going back
+	// would clear the bits of the epoch already started.
+	void RotateHistory(uint64_t history_epoch) noexcept {
+		if (history_epoch <= m_written_epoch) {
+			return;
+		}
+		if (history_epoch == m_written_epoch + 1) {
+			m_written[1] = m_written[0];
+		} else {
+			m_written[1].Clear();
+		}
+		m_written[0].Clear();
+		m_written_epoch = history_epoch;
+	}
+
 	void UpdateCpuSummary() noexcept {
 		const bool any = m_cpu_dirty.Any();
 		if (m_cpu_any.exchange(any, std::memory_order_acq_rel) == any || m_epochs == nullptr ||
@@ -299,6 +383,9 @@ private:
 	std::atomic<bool> m_gpu_full {false};
 	RegionBits        m_writable;
 	RegionBits        m_readable;
+	// Pages real write faults hit in the current and the previous history epoch.
+	std::array<RegionBits, 2> m_written {};
+	uint64_t                  m_written_epoch = 0;
 };
 
 } // namespace Libs::Graphics
