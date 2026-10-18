@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/queuePark.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -953,7 +954,15 @@ bool ReadGpuWrittenBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!settled(begin, end - begin)) {
 			const Common::FrameProfiler::ScopedCause cause(
 			    Common::FrameProfiler::ReadbackCause::FaultRead);
+			// A dispatch's materialization may park instead of waiting (QueuePark).
+			const Graphics::QueuePark::ReadScope park_read;
+			if (Graphics::GuestGpu::ForcedParkBeforeReadback()) {
+				return false;
+			}
 			buffers.ReadMemory(begin, 1);
+			if (Graphics::QueuePark::Pending()) {
+				return false;
+			}
 		}
 	}
 	return settled(vaddr, size) && TryReadBacking(vaddr, data, size);

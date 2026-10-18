@@ -813,6 +813,14 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --barrier-census-only)
 	add_test(NAME guest_ordered_barriers
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --guest-ordered-barriers-only)
+	add_test(NAME queue_release_switch
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --queue-release-switch-only)
+	add_test(NAME fetched_ahead_commands
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fetched-ahead-commands-only)
+	add_test(NAME queue_park_readback
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --queue-park-readback-only)
+	add_test(NAME queue_switch_fuzz
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --queue-switch-fuzz-only)
 	add_test(NAME native_indirect_dispatch
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --native-indirect-only)
 	add_test(NAME gpu_tiler

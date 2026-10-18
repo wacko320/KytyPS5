@@ -8,6 +8,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/queuePark.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -630,6 +631,11 @@ bool BufferCache::TryResolveWrittenBack(uint64_t vaddr, bool is_write) {
 		}
 		return false;
 	}
+	// GPU thread, in a dispatch that can park: another queue runs instead of the wait, and the
+	// read ends here (QueuePark::Pending).
+	if (GuestGpu::ParkInsteadOfWait(tick)) {
+		return true;
+	}
 	m_scheduler.GetMasterSemaphore().Wait(tick, WaitSite::WrittenBackPage);
 	m_scheduler.WaitPriorityOperations(tick, WaitSite::WrittenBackPage);
 	std::lock_guard lock(m_writeback_mutex);
@@ -912,6 +918,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			// A guest thread's download took the page's GPU-dirty bytes and has yet to publish
 			// them.
 			if (const auto pending = PendingWriteTick(fault_page, CACHING_PAGESIZE); pending != 0) {
+				if (GuestGpu::ParkInsteadOfWait(pending)) {
+					return;
+				}
 				m_scheduler.Wait(pending, WaitSite::ReadbackPendingPublish);
 				m_scheduler.WaitPriorityOperations(pending, WaitSite::ReadbackPendingPublish);
 			}
@@ -929,6 +938,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 					FrameProfiler::Add(direct == DirectReadback::Untracked
 					                       ? FrameProfiler::Counter::ReadbackDirectWaitedUntracked
 					                       : FrameProfiler::Counter::ReadbackDirectWaitedWriter);
+				}
+				// Nothing changed yet: in a dispatch that can park, another queue runs instead.
+				if (GuestGpu::ParkInsteadOfWait(blocking_tick)) {
+					return;
 				}
 				m_scheduler.Wait(blocking_tick, WaitSite::ReadbackGpuThread);
 				direct = TryReadDirect(m_slot_buffers[FindBuffer(vaddr, size)], vaddr, size,

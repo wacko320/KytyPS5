@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Lookahead.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/guest_gpu/queuePark.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -29,6 +30,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -123,6 +125,252 @@ void GuestGpu::ProcessCommands() {
 		}
 		command();
 	}
+}
+
+void GuestGpu::BeforeCommandProcessorStore() {
+	CommandProcessor::FetchAhead();
+}
+
+void GuestGpu::NoteGuestWrite(uint64_t vaddr, uint64_t size, const void* bytes) {
+	if (g_gpu_state != nullptr && g_gpu_state->m_wait_count != 0) {
+		g_gpu_state->ReleaseWaits(vaddr, size, bytes);
+	}
+}
+
+void GuestGpu::NoteSuspendedWait(const SuspendedWait& wait) {
+	if (m_current_queue >= QueueCount) {
+		return;
+	}
+	auto& slot = m_waits[m_current_queue];
+	if (slot.address == 0) {
+		m_wait_count++;
+	}
+	slot = wait;
+}
+
+void GuestGpu::ReleaseWaits(uint64_t vaddr, uint64_t size, const void* bytes) {
+	for (uint32_t queue = 0; queue < QueueCount && m_wait_count != 0; queue++) {
+		auto& wait = m_waits[queue];
+		if (wait.address == 0 || wait.address >= vaddr + size || vaddr >= wait.address + wait.size) {
+			continue;
+		}
+		// A store covering the label decides here; one that overlaps it in part leaves the test
+		// to the wait.
+		if (wait.address >= vaddr && wait.address + wait.size <= vaddr + size) {
+			uint64_t value = 0;
+			std::memcpy(&value, static_cast<const uint8_t*>(bytes) + (wait.address - vaddr),
+			            wait.size);
+			if (!TestWaitRegMemValue(value, wait.ref, wait.mask, wait.func)) {
+				continue;
+			}
+		}
+		wait = {};
+		m_wait_count--;
+		m_released.push_back(queue);
+		if (queue != m_current_queue) {
+			m_yield_requested = true;
+		}
+		Common::FrameProfiler::Rec(Common::FrameProfiler::Event::QueueSwitch, queue, 0);
+	}
+}
+
+bool GuestGpu::ParkedReady() const {
+	return m_park_count != 0 &&
+	       m_renderer.GetCommandScheduler().GetMasterSemaphore().KnownGpuTick() >= m_min_park_tick;
+}
+
+bool GuestGpu::ShouldYield() {
+	if (m_yield_requested) {
+		return true;
+	}
+	if (m_park_count == 0) {
+		return false;
+	}
+	if (ParkedReady()) {
+		return true;
+	}
+	// The known tick follows the priority thread's waits: query the timeline now and then.
+	constexpr auto RefreshInterval = std::chrono::microseconds(100);
+	const auto     now             = std::chrono::steady_clock::now();
+	if (now - m_park_refresh < RefreshInterval) {
+		return false;
+	}
+	m_park_refresh = now;
+	m_renderer.GetCommandScheduler().GetMasterSemaphore().Refresh();
+	return ParkedReady();
+}
+
+bool GuestGpu::OtherQueueRunnable() const {
+	if (ParkedReady()) {
+		return true;
+	}
+	for (const auto queue: m_released) {
+		if (queue != m_current_queue && !m_queues[queue].empty() && m_park_tick[queue] == 0) {
+			return true;
+		}
+	}
+	for (uint32_t queue = 0; queue < QueueCount; queue++) {
+		if (queue != m_current_queue && !m_queues[queue].empty() && m_park_tick[queue] == 0 &&
+		    !m_queues[queue].front().blocked) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void GuestGpu::UpdateParkedTick() {
+	m_min_park_tick = UINT64_MAX;
+	for (const auto tick: m_park_tick) {
+		if (tick != 0) {
+			m_min_park_tick = std::min(m_min_park_tick, tick);
+		}
+	}
+}
+
+void GuestGpu::Park(uint64_t tick, const uint32_t* packet) {
+	const auto queue = m_current_queue;
+	EXIT_IF(queue >= QueueCount || m_park_tick[queue] != 0 || tick == 0);
+	m_park_tick[queue] = tick;
+	m_park_count++;
+	UpdateParkedTick();
+	m_slice_yielded = true;
+	m_stats.parks++;
+	if (m_park_packet[queue] == packet) {
+		m_stats.park_retries++;
+	}
+	if (Common::FrameProfiler::Active()) {
+		using Common::FrameProfiler::Counter;
+		Common::FrameProfiler::Add(Counter::QueueParks);
+		if (m_park_packet[queue] == packet) {
+			Common::FrameProfiler::Add(Counter::QueueParkRetries);
+		}
+		m_park_since[queue] = Common::FrameProfiler::Ticks();
+		Common::FrameProfiler::RecordEvent(Common::FrameProfiler::Event::QueuePark, queue, tick);
+	}
+	m_park_packet[queue] = packet;
+}
+
+bool GuestGpu::ParkInsteadOfWait(uint64_t tick) {
+	auto* gpu = g_gpu_state;
+	if (gpu == nullptr || !QueuePark::CanPark() || gpu->m_current_queue >= QueueCount ||
+	    gpu->m_park_tick[gpu->m_current_queue] != 0) {
+		return false;
+	}
+	auto& scheduler = gpu->m_renderer.GetCommandScheduler();
+	if (scheduler.IsFree(tick)) {
+		return false;
+	}
+	{
+		Common::LockGuard lock(gpu->m_queue_mutex);
+		if (!gpu->OtherQueueRunnable()) {
+			return false;
+		}
+	}
+	// The queue runs again once the tick completes: the open command buffer holding it is
+	// submitted now, as the wait would.
+	EXIT_IF(tick > scheduler.CurrentTick());
+	if (tick == scheduler.CurrentTick()) {
+		scheduler.Flush();
+	}
+	QueuePark::t_state.pending_tick = tick;
+	return true;
+}
+
+bool GuestGpu::ForcedParkBeforeReadback() {
+	auto* gpu = g_gpu_state;
+	if (gpu == nullptr || !gpu->m_force_park || !QueuePark::CanPark() ||
+	    gpu->m_current_queue >= QueueCount || gpu->m_current_packet == nullptr ||
+	    gpu->m_forced_packet == gpu->m_current_packet) {
+		return false;
+	}
+	{
+		Common::LockGuard lock(gpu->m_queue_mutex);
+		if (!gpu->OtherQueueRunnable()) {
+			return false;
+		}
+	}
+	auto& scheduler = gpu->m_renderer.GetCommandScheduler();
+	// The open command buffer is submitted, as for a real park; the queue is ready again once the
+	// work recorded so far completes.
+	scheduler.Flush();
+	gpu->m_forced_packet            = gpu->m_current_packet;
+	QueuePark::t_state.pending_tick = scheduler.CurrentTick() - 1;
+	return true;
+}
+
+int GuestGpu::SelectQueue() {
+	const int queue = SelectNextQueue();
+	if (queue >= 0 && m_park_count != 0) {
+		m_stats.parked_slices++;
+	}
+	if (queue >= 0) {
+		// Released before another route picked it: its release is spent.
+		std::erase(m_released, static_cast<uint32_t>(queue));
+	}
+	return queue;
+}
+
+int GuestGpu::SelectNextQueue() {
+	m_yield_requested = false;
+	const auto unpark = [this](uint32_t queue) {
+		m_park_tick[queue] = 0;
+		m_park_count--;
+		UpdateParkedTick();
+		if (m_park_since[queue] != 0) {
+			Common::FrameProfiler::AddSince(Common::FrameProfiler::Counter::QueueParkHiddenTime,
+			                                m_park_since[queue]);
+			m_park_since[queue] = 0;
+		}
+	};
+	const auto first_parked = [this](uint64_t known) {
+		int      best      = -1;
+		uint64_t best_tick = UINT64_MAX;
+		for (uint32_t queue = 0; queue < QueueCount; queue++) {
+			const auto tick = m_park_tick[queue];
+			if (tick != 0 && tick <= known && tick < best_tick) {
+				best      = static_cast<int>(queue);
+				best_tick = tick;
+			}
+		}
+		return best;
+	};
+	// A parked queue whose tick has completed resumes first: the others ran in its wait.
+	if (m_park_count != 0) {
+		const auto queue =
+		    first_parked(m_renderer.GetCommandScheduler().GetMasterSemaphore().KnownGpuTick());
+		if (queue >= 0) {
+			unpark(static_cast<uint32_t>(queue));
+			m_stats.ready_resumes++;
+			return queue;
+		}
+	}
+	// Then the queues labels released, in release order.
+	while (!m_released.empty()) {
+		const auto queue = m_released.front();
+		m_released.pop_front();
+		if (!m_queues[queue].empty() && m_park_tick[queue] == 0) {
+			m_stats.release_switches++;
+			if (Common::FrameProfiler::Active()) {
+				Common::FrameProfiler::Add(Common::FrameProfiler::Counter::QueueReleaseSwitches);
+			}
+			return static_cast<int>(queue);
+		}
+	}
+	for (uint32_t offset = 0; offset < QueueCount; offset++) {
+		const auto queue = (m_next_queue + offset) % QueueCount;
+		if (!m_queues[queue].empty() && !m_queues[queue].front().blocked &&
+		    m_park_tick[queue] == 0) {
+			return static_cast<int>(queue);
+		}
+	}
+	// Nothing else can run: a parked queue waits for its tick in place.
+	if (m_park_count != 0) {
+		const auto queue = first_parked(UINT64_MAX);
+		unpark(static_cast<uint32_t>(queue));
+		m_stats.idle_resumes++;
+		return queue;
+	}
+	return -1;
 }
 
 void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
@@ -301,6 +549,171 @@ void CommandProcessor::WaitDeDiff(uint32_t diff) {
 	}
 }
 
+// The dwords FetchAhead takes from a buffer whose dword i is word(i), with `available` left:
+// whole packets up to FetchAheadDwords, at least one, ending with the first indirect buffer (a
+// chain leaves the buffer; after a call returns, the rest of the buffer is read from guest
+// memory, which a guest may patch while the call runs).
+template <typename Word>
+static uint32_t FetchAheadSize(Word word, uint32_t available, uint32_t limit) {
+	uint32_t size = 0;
+	while (size < available) {
+		const auto header = word(size);
+		const auto dwords = header == 0x80000000u || Pm4::PacketSizeDw(header) == 1u
+		                        ? 1u
+		                        : ((header >> 16u) & 0x3fffu) + 2u;
+		if (dwords > available - size) {
+			return available;
+		}
+		if (size != 0 && size + dwords > limit) {
+			break;
+		}
+		size += dwords;
+		const auto opcode = (header >> 8u) & 0xffu;
+		if ((header >> 30u) == 3u &&
+		    (opcode == Pm4::IT_INDIRECT_BUFFER || opcode == Pm4::IT_INDIRECT_BUFFER_CNST)) {
+			break;
+		}
+	}
+	return size;
+}
+
+bool CommandProcessor::RewindValid(const uint32_t* payload) {
+	constexpr uint32_t Valid = 0x80000000u;
+	if ((payload[0] & Valid) != 0 && m_packet_live != nullptr) {
+		return true;
+	}
+	auto* execution = g_current_execution;
+	EXIT_IF(execution == nullptr || execution->m_buffer_stack.empty());
+	const auto& top  = execution->m_buffer_stack.back();
+	const auto* live = m_packet_live != nullptr ? m_packet_live : payload - 1;
+	const auto* end  = top.fetched == nullptr ? top.commands.data() + top.commands.size()
+	                   : top.continued
+	                       ? execution->m_buffer_stack[execution->m_buffer_stack.size() - 2]
+	                                 .commands.data() +
+	                             execution->m_buffer_stack[execution->m_buffer_stack.size() - 2]
+	                                 .commands.size()
+	                       : top.live + top.commands.size();
+	const auto size  = FetchAheadSize([live](uint32_t at) { return live[at]; },
+	                                  static_cast<uint32_t>(end - live), FetchAheadDwords);
+	auto       words = std::make_shared<uint32_t[]>(size);
+	std::memcpy(words.get(), live, size * sizeof(uint32_t));
+	if ((words[1] & Valid) == 0) {
+		return false;
+	}
+	execution->m_refetched      = std::move(words);
+	execution->m_refetched_size = size;
+	execution->m_refetched_live = live;
+	execution->m_refetched_end  = end;
+	return true;
+}
+
+void CommandProcessor::FetchAhead() {
+	auto* execution = g_current_execution;
+	if (execution == nullptr || !execution->m_fetched_ahead.empty()) {
+		return;
+	}
+	// The buffer executing now: a buffer below it resumes after a call, from guest memory.
+	const auto& stack = execution->m_buffer_stack;
+	if (!stack.empty()) {
+		const auto  i         = stack.size() - 1;
+		const auto& cursor    = stack[i];
+		const auto  remaining = static_cast<uint32_t>(cursor.commands.size() - cursor.offset_dw);
+		if (cursor.fetched == nullptr) {
+			const auto* live = cursor.commands.data() + cursor.offset_dw;
+			const auto  size =
+			    FetchAheadSize([live](uint32_t at) { return live[at]; }, remaining, FetchAheadDwords);
+			if (size == 0) {
+				return;
+			}
+			auto words = std::make_shared<uint32_t[]>(size);
+			std::memcpy(words.get(), cursor.commands.data() + cursor.offset_dw,
+			            size * sizeof(uint32_t));
+			execution->m_fetched_ahead.push_back({i, std::move(words), size, 0});
+			return;
+		}
+		// Fetched before: extended once fewer than half the window's dwords are left.
+		if (!cursor.continued || remaining >= FetchAheadDwords / 2) {
+			return;
+		}
+		const auto& below  = stack[i - 1];
+		const auto* copied = cursor.commands.data() + cursor.offset_dw;
+		const auto* rest   = below.commands.data() + below.offset_dw;
+		const auto  word   = [copied, rest, remaining](uint32_t at) {
+			return at < remaining ? copied[at] : rest[at - remaining];
+		};
+		const auto size = FetchAheadSize(
+		    word, remaining + static_cast<uint32_t>(below.commands.size() - below.offset_dw),
+		    FetchAheadDwords);
+		if (size <= remaining) {
+			return;
+		}
+		const auto taken = size - remaining;
+		auto       words = std::make_shared<uint32_t[]>(remaining + taken);
+		std::memcpy(words.get(), cursor.commands.data() + cursor.offset_dw,
+		            remaining * sizeof(uint32_t));
+		std::memcpy(words.get() + remaining, below.commands.data() + below.offset_dw,
+		            taken * sizeof(uint32_t));
+		execution->m_fetched_ahead.push_back({i, std::move(words), remaining + taken, taken});
+	}
+}
+
+void CommandProcessor::ApplyFetchedAhead(Pm4Execution& execution) {
+	if (execution.m_fetched_ahead.empty() && execution.m_refetched == nullptr) {
+		return;
+	}
+	auto& stack = execution.m_buffer_stack;
+	// Highest cursor first: inserting above a cursor or removing the one below it leaves the
+	// lower ones in place.
+	for (auto fetched = execution.m_fetched_ahead.rbegin();
+	     fetched != execution.m_fetched_ahead.rend(); ++fetched) {
+		auto&                           cursor = stack[fetched->cursor];
+		const std::span<const uint32_t> words {fetched->words.get(), fetched->size};
+		if (cursor.fetched == nullptr) {
+			const auto* live = cursor.commands.data() + cursor.offset_dw;
+			const auto  rest = cursor.commands.size() - cursor.offset_dw - fetched->size;
+			Pm4Execution::BufferCursor ahead {words, 0, fetched->words, live, rest != 0};
+			if (rest == 0) {
+				cursor = std::move(ahead);
+			} else {
+				cursor = {{live + fetched->size, rest}};
+				stack.insert(stack.begin() + static_cast<ptrdiff_t>(fetched->cursor) + 1,
+				             std::move(ahead));
+			}
+			continue;
+		}
+		const auto* live  = cursor.live + cursor.offset_dw;
+		auto&       below = stack[fetched->cursor - 1];
+		below.offset_dw += fetched->continuation;
+		const bool more = below.offset_dw < below.commands.size();
+		cursor          = {words, 0, fetched->words, live, more};
+		if (!more) {
+			stack.erase(stack.begin() + static_cast<ptrdiff_t>(fetched->cursor) - 1);
+		}
+	}
+	execution.m_fetched_ahead.clear();
+	if (execution.m_refetched != nullptr) {
+		// The REWIND packet and what follows it, from the copy RewindValid took.
+		if (stack.back().continued) {
+			stack.pop_back();
+		}
+		const auto* live = execution.m_refetched_live;
+		const auto  size = execution.m_refetched_size;
+		const auto  rest = static_cast<size_t>(execution.m_refetched_end - live) - size;
+		Pm4Execution::BufferCursor fetched {{execution.m_refetched.get(), size},
+		                                    0,
+		                                    std::move(execution.m_refetched),
+		                                    live,
+		                                    rest != 0};
+		if (rest == 0) {
+			stack.back() = std::move(fetched);
+		} else {
+			stack.back() = {{live + size, rest}};
+			stack.push_back(std::move(fetched));
+		}
+		execution.m_refetched = nullptr;
+	}
+}
+
 void CommandProcessor::WaitForRewind(bool valid) {
 	if (!valid) {
 		SuspendPm4(SuspendReason::Rewind);
@@ -377,6 +790,13 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 			     static_cast<uint64_t>(ref));
 		}
 		SuspendPm4(SuspendReason::WaitRegMem, reinterpret_cast<uint64_t>(addr), func);
+		if (g_gpu_state != nullptr) {
+			g_gpu_state->NoteSuspendedWait({.address = reinterpret_cast<uint64_t>(addr),
+			                                .size    = sizeof(T),
+			                                .func    = func,
+			                                .ref     = static_cast<uint64_t>(ref),
+			                                .mask    = static_cast<uint64_t>(mask)});
+		}
 		Common::FrameProfiler::Rec(Common::FrameProfiler::Event::SuspendWait,
 		                           static_cast<uint64_t>(ref), static_cast<uint64_t>(mask));
 		return;
@@ -608,14 +1028,7 @@ void GuestGpu::ThreadRun(void* data) {
 				EXIT_IF(gpu->m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 				gpu->m_processing = true;
 			} else {
-				int selected_queue = -1;
-				for (uint32_t offset = 0; offset < QueueCount; offset++) {
-					const auto id = (gpu->m_next_queue + offset) % QueueCount;
-					if (!gpu->m_queues[id].empty() && !gpu->m_queues[id].front().blocked) {
-						selected_queue = static_cast<int>(id);
-						break;
-					}
-				}
+				const int selected_queue = gpu->SelectQueue();
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
 					const uint64_t block_t0 = Common::FrameProfiler::Start();
@@ -656,13 +1069,20 @@ void GuestGpu::ThreadRun(void* data) {
 			                                   command || submission.started ? 0u : 1u);
 			proc_cpu = Common::FrameProfiler::ThreadCpuNs();
 		}
-		const auto end_slice = [proc_t0, proc_cpu](bool complete) {
+		const auto end_slice = [proc_t0, proc_cpu, &command, &submission](bool complete) {
 			if (proc_t0 == 0) {
 				return;
 			}
 			Common::FrameProfiler::RecordEvent(Common::FrameProfiler::Event::ProcessEnd,
 			                                   complete ? 1u : 0u, 0);
 			Common::FrameProfiler::AddSince(Common::FrameProfiler::Counter::GpuProcessTime, proc_t0);
+			if (!command) {
+				Common::FrameProfiler::AddSince(
+				    submission.queue_id == 0
+				        ? Common::FrameProfiler::Counter::GpuProcessTimeGraphics
+				        : Common::FrameProfiler::Counter::GpuProcessTimeCompute,
+				    proc_t0);
+			}
 			Common::FrameProfiler::Add(Common::FrameProfiler::Counter::GpuProcessCpuTime,
 			                           Common::FrameProfiler::ThreadCpuNs() - proc_cpu);
 			Common::FrameProfiler::Add(Common::FrameProfiler::Counter::GpuProcessSlices);
@@ -682,12 +1102,14 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
-		const bool complete = gpu->Process(submission);
+		gpu->m_slice_yielded = false;
+		const bool complete  = gpu->Process(submission);
 		end_slice(complete);
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
-			submission.blocked = true;
+			// A slice that yielded to another queue, or parked, is not blocked on its own.
+			submission.blocked = !gpu->m_slice_yielded;
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
 		} else {
@@ -707,6 +1129,17 @@ void GuestGpu::ThreadRun(void* data) {
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
+	m_current_queue        = submission.queue_id;
+	struct CurrentQueueScope {
+		explicit CurrentQueueScope(GuestGpu& gpu): gpu(gpu) {}
+		~CurrentQueueScope() { gpu.m_current_queue = NoQueue; }
+		GuestGpu& gpu;
+	} current_queue_scope(*this);
+	// The queue runs: a wait it suspended on is tested again.
+	if (auto& wait = m_waits[submission.queue_id]; wait.address != 0) {
+		wait = {};
+		m_wait_count--;
+	}
 
 	if (first_slice) {
 		submission.started = true;
@@ -733,7 +1166,7 @@ bool GuestGpu::Process(Submission& submission) {
 					round_progress |= submission.constant_execution.MadeProgress();
 				}
 				cp.SetCeComplete(submission.constant_complete);
-				if (!submission.command_complete) {
+				if (!submission.command_complete && !m_slice_yielded) {
 					submission.command_complete =
 					    cp.Process(submission.command_execution, submission.commands) ==
 					    Pm4ProcessResult::Complete;
@@ -741,7 +1174,7 @@ bool GuestGpu::Process(Submission& submission) {
 				}
 				progressed |= round_progress;
 				complete = submission.command_complete && submission.constant_complete;
-				if (complete || !round_progress) {
+				if (complete || !round_progress || m_slice_yielded) {
 					break;
 				}
 			}
@@ -855,6 +1288,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
 		}
+		// A GPU-thread command may have stored to guest memory.
+		ApplyFetchedAhead(execution);
 		auto& cursor = execution.m_buffer_stack.back();
 		// Readbacks are labelled with the packet that asked for them (frame profiler).
 		const Common::FrameProfiler::ScopedPacket profile_packet(Common::FrameProfiler::PacketFetch);
@@ -862,6 +1297,14 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		if (cursor.offset_dw == cursor.commands.size()) {
 			execution.m_buffer_stack.pop_back();
 			continue;
+		}
+		// At a packet boundary, a queue a label released or a parked queue whose tick has
+		// completed runs before the rest of this one. Each slice executes a packet first.
+		if (g_gpu_state != nullptr && execution.m_made_progress && g_gpu_state->ShouldYield()) {
+			g_gpu_state->m_slice_yielded = true;
+			g_gpu_state->m_stats.yields++;
+			SuspendPm4(SuspendReason::Yield);
+			return;
 		}
 
 		const auto* const packet        = cursor.commands.data() + cursor.offset_dw;
@@ -949,9 +1392,24 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		Common::FrameProfiler::t_packet = static_cast<uint8_t>(opcode);
 		m_packet_commands = cursor.commands;
 		m_packet_offset   = cursor.offset_dw;
+		m_packet_live     = cursor.fetched != nullptr ? cursor.live + cursor.offset_dw : nullptr;
+		if (g_gpu_state != nullptr) {
+			g_gpu_state->m_current_packet = packet;
+		}
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		m_packet_commands = {};
+		m_packet_live     = nullptr;
+		// The cursor may change here: re-read the top of the stack below.
+		ApplyFetchedAhead(execution);
+		if (const auto park_tick = QueuePark::TakePending(); park_tick != 0) {
+			// A dispatch's readback would have waited for the host GPU: it returned before
+			// recording anything, and runs again once the tick completes.
+			EXIT_IF(g_gpu_state == nullptr);
+			g_gpu_state->Park(park_tick, packet);
+			SuspendPm4(SuspendReason::Park);
+			return;
+		}
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			const auto now = std::chrono::steady_clock::now();
@@ -971,12 +1429,16 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			}
 			return;
 		}
-		cursor.offset_dw += packet_dw;
+		execution.m_buffer_stack.back().offset_dw += packet_dw;
 		execution.m_made_progress = true;
 		if (!execution.m_next_buffer.empty()) {
 			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
 			if (execution.m_chain) {
-				cursor = {execution.m_next_buffer};
+				// A chain leaves the rest of a buffer fetched ahead in part as well.
+				if (execution.m_buffer_stack.back().continued) {
+					execution.m_buffer_stack.pop_back();
+				}
+				execution.m_buffer_stack.back() = {execution.m_next_buffer};
 			} else {
 				execution.m_buffer_stack.push_back({execution.m_next_buffer});
 			}
@@ -1415,10 +1877,17 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			}
 		}
 
-		auto batch = PlanThreadBatch(false);
+		// A dispatch packet of a stream may park (QueuePark) and run again.
+		const QueuePark::DispatchScope park_scope(!m_packet_commands.empty());
+		auto                           batch = PlanThreadBatch(false);
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode,
 		                                              IsAsyncComputeQueue(), &batch);
+		if (QueuePark::Pending()) {
+			// Its thread-dimension window was planned but not recorded.
+			EndThreadWindow();
+			return;
+		}
 		NoteThreadBatch(batch);
 	}
 }
@@ -1427,9 +1896,14 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	const bool threads = (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
-	auto       batch   = PlanThreadBatch(threads);
+	const QueuePark::DispatchScope park_scope(!m_packet_commands.empty());
+	auto                           batch = PlanThreadBatch(threads);
 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode,
 	                                                IsAsyncComputeQueue(), &batch);
+	if (QueuePark::Pending()) {
+		EndThreadWindow();
+		return;
+	}
 	NoteThreadBatch(batch);
 }
 

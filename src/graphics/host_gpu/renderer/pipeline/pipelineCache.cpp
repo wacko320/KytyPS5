@@ -9,6 +9,7 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/queuePark.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -151,7 +152,8 @@ const uint8_t* CheckedPageView(CheckedReadPages& pages, uint64_t page) {
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
-	if (values.empty()) {
+	// A dispatch that parked gives up its evaluation (QueuePark).
+	if (values.empty() || QueuePark::Pending()) {
 		return false;
 	}
 	const auto bytes = values.size_bytes();
@@ -177,6 +179,9 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 bool ReadOrdinaryGuestMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	if (ReadShaderGuestMemory(userdata, address, values)) {
 		return true;
+	}
+	if (QueuePark::Pending()) {
+		return false;
 	}
 	uint64_t mapped = 0;
 	while (mapped < values.size_bytes()) {
@@ -594,18 +599,26 @@ struct PipelineCache::ProgramCache {
 					}
 				}
 				ReportReplayMismatches(*prefetcher, resource_plan.shader_hash);
-				if (hit) {
+				// A parked dispatch's result is discarded: it evaluates again.
+				if (hit || QueuePark::Pending()) {
 					return true;
 				}
 			}
 			const uint64_t plain_t0 = profiling ? Common::FrameProfiler::Ticks() : 0;
 			std::vector<uint32_t> pcs;
+			// A parked attempt fails every read after the park and evaluates again: its failures
+			// are not reported.
+			ShaderRecompiler::IR::DeferredSpecializationFailureReports reports;
 			const bool materialized = ShaderRecompiler::IR::MaterializeResources(
 			    resource_plan, runtime, resources, specialization, &pcs);
 			if (plain_t0 != 0) {
 				Common::FrameProfiler::Add(Counter::PlainMaterializations);
 				Common::FrameProfiler::AddSince(Counter::PlainMaterializeTime, plain_t0);
 			}
+			if (QueuePark::Pending()) {
+				return true;
+			}
+			reports.Publish();
 			if (materialized) {
 				return true;
 			}
@@ -969,12 +982,21 @@ struct PipelineCache::ProgramCache {
 				if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 					if (source_changed) BuildSiblingsAhead(cached);
 				}
-				if (!source_changed)
+				if (!source_changed) {
+					// A cached plan's evaluation writes only outputs the next one rewrites: a
+					// dispatch may give up in it and run again (QueuePark).
+					const QueuePark::RestartableScope restartable;
 					permutation = cached.FindPermutation<true>(runtime, push_data_cursor,
 					                                           prefetcher.get());
+				}
 			} else {
+				const QueuePark::RestartableScope restartable;
 				permutation =
 				    cached.FindPermutation<false>(runtime, push_data_cursor, prefetcher.get());
+			}
+			if (QueuePark::Pending()) {
+				// The dispatch returns before recording, and runs again.
+				return {};
 			}
 			if (permutation != nullptr) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
@@ -1537,6 +1559,9 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t          push_data_cursor = 0;
 	auto              program = m_program_cache->Get(params, input_info, push_data_cursor);
+	if (QueuePark::Pending()) {
+		return program;
+	}
 	m_program_cache->Learn(ProgramCache::PrefetchSlot::Compute, regs.cs_regs.data_addr, params,
 	                       regs.cs_regs.user_sgpr, 0);
 	return program;

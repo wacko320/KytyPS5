@@ -43,14 +43,23 @@ void ReportBindlessFallback(const ResourcePlan& program, uint32_t root,
 	pcs->push_back(image.first_use_pc);
 }
 
-thread_local bool g_report_specialization_failures = true;
+thread_local bool                      g_report_specialization_failures = true;
+thread_local std::vector<std::string>* g_deferred_specialization_failures = nullptr;
+
+void PrintSpecializationFailure(std::string_view message) {
+	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
+	             static_cast<int>(message.size()), message.data());
+}
 
 bool SpecializationFail(std::string_view message) {
 	if (!g_report_specialization_failures) {
 		return false;
 	}
-	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
-	             static_cast<int>(message.size()), message.data());
+	if (g_deferred_specialization_failures != nullptr) {
+		g_deferred_specialization_failures->emplace_back(message);
+		return false;
+	}
+	PrintSpecializationFailure(message);
 	return false;
 }
 
@@ -1801,6 +1810,26 @@ SpecializationFailureReports::SpecializationFailureReports(bool enabled)
 
 SpecializationFailureReports::~SpecializationFailureReports() {
 	g_report_specialization_failures = m_previous;
+}
+
+DeferredSpecializationFailureReports::DeferredSpecializationFailureReports()
+    : m_previous(g_deferred_specialization_failures) {
+	g_deferred_specialization_failures = &m_reports;
+}
+
+DeferredSpecializationFailureReports::~DeferredSpecializationFailureReports() {
+	g_deferred_specialization_failures = m_previous;
+}
+
+void DeferredSpecializationFailureReports::Publish() {
+	for (const auto& message: m_reports) {
+		if (m_previous != nullptr) {
+			m_previous->push_back(message);
+		} else {
+			PrintSpecializationFailure(message);
+		}
+	}
+	m_reports.clear();
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,

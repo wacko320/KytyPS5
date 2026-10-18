@@ -409,8 +409,21 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
             snapshot.images[1].dwords == descriptor,
         "partial descriptor prefix did not zero its out-of-bounds DWORDs");
   memory.fail_address = 0x2008u;
-  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
-        "unreadable in-range table bytes were accepted");
+  {
+    // A failed read (as every read after a QueuePark park) is held by a deferred scope for the
+    // caller to publish or drop; a silenced evaluation adds nothing to it.
+    DeferredSpecializationFailureReports reports;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "unreadable in-range table bytes were accepted");
+    const auto held = reports.Reports().size();
+    Check(held != 0u, "a deferred scope did not hold the failure report");
+    {
+      const SpecializationFailureReports quiet(false);
+      Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+            "unreadable in-range table bytes were accepted while silenced");
+    }
+    Check(reports.Reports().size() == held, "a silenced failure was held for publication");
+  }
   memory.fail_address = UINT64_MAX;
   for (uint32_t size : {0u, 3u, 4u}) {
     data[6] = size;

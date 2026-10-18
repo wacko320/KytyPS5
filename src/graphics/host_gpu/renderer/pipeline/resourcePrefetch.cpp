@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/resourcePrefetch.h"
 
+#include "graphics/guest_gpu/queuePark.h"
+
 #include "graphics/host_gpu/renderer/cache/srtPageWatch.h"
 
 #include <algorithm>
@@ -452,6 +454,10 @@ bool ResourcePrefetcher::TryMaterialize(const void* key, const SrtRuntime& runti
 		}
 		m_stats.unreplayed++;
 	} else if (!Validate(*job, runtime)) {
+		// A dispatch that parked failed the replay on purpose: the job is not stale.
+		if (QueuePark::Pending()) {
+			return false;
+		}
 		m_stats.stale++;
 		health.score = std::max(health.score - HealthPenalty, HealthMin);
 		return false;

@@ -85,11 +85,13 @@ public:
 	template <typename Writer>
 	void GpuThreadGuestWrite(uint64_t vaddr, uint64_t size, Writer&& writer) {
 		Common::FrameProfiler::Rec(Common::FrameProfiler::Event::GpuGuestWrite, vaddr, size);
+		BeforeCommandProcessorStore();
 		// Uploads recorded before the store take the bytes before it.
 		m_buffer_cache.WaitUploadsFrom(vaddr, size);
 		if (auto* through = BeginWriteThrough(vaddr, size); through != nullptr) {
 			std::forward<Writer>(writer)(static_cast<void*>(through));
 			SrtPageWatch::Guest().Unsettle(vaddr, size);
+			NoteGuestWrite(vaddr, size, through);
 			m_buffer_cache.WriteThrough(vaddr, through, size);
 			return;
 		}
@@ -97,7 +99,12 @@ public:
 		std::forward<Writer>(writer)(reinterpret_cast<void*>(vaddr));
 		SrtPageWatch::Guest().Unsettle(vaddr, size);
 		m_buffer_cache.Epoch().SyncRangeNow(vaddr, size);
+		NoteGuestWrite(vaddr, size, reinterpret_cast<const void*>(vaddr));
 	}
+	// GPU thread: the command processor stored `bytes` at vaddr (GuestGpu::NoteGuestWrite).
+	static void NoteGuestWrite(uint64_t vaddr, uint64_t size, const void* bytes);
+	// GPU thread, before a command-processor store (GuestGpu::BeforeCommandProcessorStore).
+	static void BeforeCommandProcessorStore();
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	// Calls func(begin, end) for each mapped sub-range of [vaddr, vaddr + size).
 	template <typename Func>

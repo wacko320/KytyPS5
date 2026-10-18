@@ -103,6 +103,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <random>
 #include <regex>
 #include <semaphore>
 #include <set>
@@ -56003,6 +56004,591 @@ void CheckBarrierCensus(VulkanHarness &vulkan) {
   std::printf("[host]    %-32s ok\n", "BarrierCensus");
 }
 
+// Queue scheduling (GuestGpu::SelectQueue): a label release switches to the queue waiting for
+// it at the next packet boundary, and a dispatch whose readback would wait for the host GPU
+// parks while another queue runs.
+GuestGpu::SchedulingStats SchedulingStatsOf(GuestGpu &gpu) {
+  GuestGpu::SchedulingStats stats;
+  gpu.SendCommandSync([&] { stats = gpu.GetSchedulingStats(); });
+  return stats;
+}
+
+// Waits (polling on the GPU thread) until the word at `address` holds `value`.
+bool AwaitGuestWord(GuestGpu &gpu, const uint32_t *address, uint32_t value) {
+  bool reached = false;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!reached && std::chrono::steady_clock::now() < deadline) {
+    gpu.SendCommandSync([&] { reached = *address == value; });
+    std::this_thread::yield();
+  }
+  return reached;
+}
+
+// The dword at `address` once all recorded work and its completions are done, read back
+// explicitly (a store through a V# loaded from memory leaves its page unprotected).
+uint32_t ReadFinishedWord(RenderContext &renderer, GuestGpu &gpu, uint64_t address) {
+  uint32_t word = 0;
+  gpu.SendCommandSync([&] {
+    auto &scheduler = renderer.GetCommandScheduler();
+    scheduler.Finish();
+    scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+    renderer.GetBufferCache().ReadMemory(address, sizeof(word));
+    Require("QueueLabels", "readback",
+            Libs::LibKernel::Memory::TryReadBacking(address, &word, sizeof(word)),
+            "a dword could not be read back");
+  });
+  return word;
+}
+
+// Holds the GPU thread in a host command, so that submissions made meanwhile are all queued
+// when it selects the next queue.
+class GpuThreadHold {
+public:
+  explicit GpuThreadHold(GuestGpu &gpu) {
+    gpu.SendCommand([this] {
+      m_entered.release();
+      m_release.acquire();
+    });
+    m_entered.acquire();
+  }
+  void Release() {
+    if (!m_released) {
+      m_released = true;
+      m_release.release();
+    }
+  }
+  ~GpuThreadHold() { Release(); }
+  GpuThreadHold(const GpuThreadHold &) = delete;
+  GpuThreadHold &operator=(const GpuThreadHold &) = delete;
+
+private:
+  std::binary_semaphore m_entered{0};
+  std::binary_semaphore m_release{0};
+  bool m_released = false;
+};
+
+// Graphics writes the label a compute queue waits for, then keeps writing a shared word for
+// Packets / 2 packets. Compute, released at the next packet boundary, writes the word once:
+// graphics' later writes overwrite it. Without the switch, compute runs after graphics and its
+// value stays. A label value the wait does not accept releases nothing.
+void CheckQueueReleaseSwitch(VulkanHarness &vulkan) {
+  constexpr const char *name = "QueueReleaseSwitch";
+  auto &renderer = vulkan.RuntimeRenderer();
+  constexpr uint64_t base = 0x0000000208000000ull;
+  constexpr uint64_t size = 0x40000;
+  MapQueueLabelMemory(renderer, base, size);
+  renderer.InitializeGpu(nullptr);
+  auto &gpu = renderer.GetGpu();
+  constexpr uint32_t Packets = 64;
+  constexpr uint32_t ComputeValue = 7;
+  for (uint32_t round = 0; round < 2; round++) {
+    const bool two_step = round == 1;
+    auto *words = reinterpret_cast<uint32_t *>(base + round * 0x1000ull);
+    auto *label = words;
+    auto *started = words + 1;
+    auto *shared = words + 2;
+    auto *done = words + 3;
+    auto *scratch = words + 64;
+    const uint32_t target = two_step ? 2 : 1;
+    std::vector<uint32_t> compute;
+    AppendWriteData(compute, started, 1);
+    AppendWaitEqual(compute, label, target);
+    AppendWriteData(compute, shared, ComputeValue);
+    AppendWriteData(compute, done, 1);
+    std::vector<uint32_t> graphics;
+    AppendWriteData(graphics, label, 1);
+    for (uint32_t i = 0; i < Packets; i++) {
+      if (two_step && i == Packets / 4) {
+        AppendWriteData(graphics, label, 2);
+      }
+      AppendWriteData(graphics, i < Packets / 2 ? shared : scratch + i, 100 + i);
+    }
+    const auto before = SchedulingStatsOf(gpu);
+    gpu.SubmitCompute(0x20, compute);
+    Require(name, "compute waits", AwaitGuestWord(gpu, started, 1),
+            "the compute queue did not reach its wait");
+    gpu.Submit(graphics, {});
+    gpu.WaitForIdle();
+    const auto after = SchedulingStatsOf(gpu);
+    Require(name, two_step ? "two-step label" : "label", *done == 1 && *label == target,
+            "the compute queue did not complete");
+    Require(name, two_step ? "two-step switch" : "switch", *shared == 100 + Packets / 2 - 1,
+            "the shared word is " + Hex(*shared) + ", expected " + Hex(100 + Packets / 2 - 1) +
+                ": the released queue did not run before the rest of the releasing one");
+    Require(name, two_step ? "two-step releases" : "releases",
+            after.release_switches - before.release_switches == 1 &&
+                after.yields - before.yields == 1,
+            std::to_string(after.release_switches - before.release_switches) +
+                " release switches and " + std::to_string(after.yields - before.yields) +
+                " yields, expected 1 and 1 (a value the wait rejects releases nothing)");
+  }
+  renderer.UnmapMemory(base, size);
+  renderer.ShutdownGpu();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// A guest reuses command memory once a command-processor store after it shows the commands were
+// fetched: here a link [store label][REWIND][INDIRECT_BUFFER chain] whose label releases a
+// compute queue, which then rewrites the rest of the link, as a game's CPU recycles a link it has
+// seen passed. The graphics stream yields to the released queue right after the store and must
+// still chain where the link pointed when it stored the label. Then a link whose rewind the
+// guest validates after the store, having rewritten the chain: the commands after a rewind are
+// fetched again once it is valid.
+void CheckFetchedAheadCommands(VulkanHarness &vulkan) {
+  constexpr const char *name = "FetchedAheadCommands";
+  auto &renderer = vulkan.RuntimeRenderer();
+  constexpr uint64_t base = 0x0000000208000000ull;
+  constexpr uint64_t size = 0x40000;
+  MapQueueLabelMemory(renderer, base, size);
+  renderer.InitializeGpu(nullptr);
+  auto &gpu = renderer.GetGpu();
+  const auto chain_to = [](uint32_t *at, const uint32_t *target, uint32_t dwords) {
+    const auto address = reinterpret_cast<uint64_t>(target);
+    at[0] = KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0);
+    at[1] = static_cast<uint32_t>(address);
+    at[2] = static_cast<uint32_t>(address >> 32u);
+    at[3] = 0x0f200000u | (1u << 20u) | dwords;
+  };
+  constexpr uint32_t RewindValid = 0x80000000u;
+  for (uint32_t round = 0; round < 2; round++) {
+    const bool validated_late = round == 1;
+    const char *step = validated_late ? "rewind validated after the store" : "reused link";
+    auto *words = reinterpret_cast<uint32_t *>(base + round * 0x4000ull);
+    auto *label = words;
+    auto *started = words + 1;
+    auto *expected_done = words + 2;
+    auto *stale_done = words + 3;
+    auto *link = words + 0x100;
+    auto *expected = words + 0x200;
+    auto *stale = words + 0x300;
+    std::vector<uint32_t> buffer;
+    AppendWriteData(buffer, expected_done, 1);
+    std::copy(buffer.begin(), buffer.end(), expected);
+    buffer.clear();
+    AppendWriteData(buffer, stale_done, 1);
+    std::copy(buffer.begin(), buffer.end(), stale);
+    const auto buffer_dwords = static_cast<uint32_t>(buffer.size());
+    // The link: 5 dwords of label store, a 2-dword REWIND, a 4-dword chain.
+    buffer.clear();
+    AppendWriteData(buffer, label, 1);
+    std::copy(buffer.begin(), buffer.end(), link);
+    link[5] = KYTY_PM4(2, Pm4::IT_REWIND, 0);
+    link[6] = validated_late ? 0 : RewindValid;
+    chain_to(link + 7, validated_late ? stale : expected, buffer_dwords);
+    constexpr uint32_t LinkDwords = 11;
+    // Once the label is stored: the reused link chains elsewhere; the late one chains to the
+    // expected buffer, then its rewind is validated.
+    std::vector<uint32_t> compute;
+    AppendWriteData(compute, started, 1);
+    AppendWaitEqual(compute, label, 1);
+    std::array<uint32_t, 4> chain{};
+    chain_to(chain.data(), validated_late ? expected : stale, buffer_dwords);
+    for (uint32_t i = 0; i < chain.size(); i++) {
+      AppendWriteData(compute, link + 7 + i, chain[i]);
+    }
+    if (validated_late) {
+      AppendWriteData(compute, link + 6, RewindValid);
+    }
+    const auto before = SchedulingStatsOf(gpu);
+    gpu.SubmitCompute(0x20, compute);
+    Require(name, (std::string(step) + ": compute waits").c_str(), AwaitGuestWord(gpu, started, 1),
+            "the compute queue did not reach its wait");
+    gpu.Submit(std::span<const uint32_t>(link, LinkDwords), {});
+    gpu.WaitForIdle();
+    const auto after = SchedulingStatsOf(gpu);
+    Require(name, (std::string(step) + ": release").c_str(),
+            after.release_switches - before.release_switches == 1,
+            std::to_string(after.release_switches - before.release_switches) +
+                " release switches, expected 1: the compute queue did not run between the "
+                "store and the chain");
+    Require(name, step, *expected_done == 1 && *stale_done == 0,
+            "the link chained to the " + std::string(*stale_done != 0 ? "stale" : "no") +
+                " buffer (expected " + Hex(*expected_done) + ", stale " + Hex(*stale_done) +
+                "): " + (validated_late ? "the rewind did not fetch the rewritten chain"
+                                        : "the rest of the link was read after the guest reused it"));
+  }
+  // A store at the head of a buffer longer than the window fetched ahead, a packet across the
+  // window's 1024th dword: the window ends on a whole packet.
+  {
+    auto *words = reinterpret_cast<uint32_t *>(base + 0x10000ull);
+    auto *label = words;
+    auto *done = words + 1;
+    std::vector<uint32_t> graphics;
+    AppendWriteData(graphics, label, 1);
+    for (uint32_t i = 0; i < 2; i++) {
+      graphics.push_back(KYTY_PM4(1000, Pm4::IT_NOP, 0));
+      graphics.insert(graphics.end(), 999, 0u);
+    }
+    AppendWriteData(graphics, done, 1);
+    auto *stream = words + 0x100;
+    std::copy(graphics.begin(), graphics.end(), stream);
+    gpu.Submit(std::span<const uint32_t>(stream, graphics.size()), {});
+    gpu.WaitForIdle();
+    Require(name, "long buffer", *label == 1 && *done == 1,
+            "the buffer after a packet across the fetched window did not complete");
+  }
+  renderer.UnmapMemory(base, size);
+  renderer.ShutdownGpu();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// Stores s4..s7 to the dwords 0..3 of s[0:3] (a V# table writer).
+const std::vector<u32> &TableWriterCode() {
+  static const std::vector<u32> code = [] {
+    std::vector<u32> words;
+    for (u32 i = 0; i < 4; i++) {
+      words.push_back(EncodeVop1(0x01u, 1, 4 + i));               // v_mov_b32 v1, s[4 + i]
+      words.push_back(EncodeMubuf0(0x1cu, 4 * i, false, false)); // buffer_store_dword v1
+      words.push_back(EncodeMubuf1(1, 0, 0));
+    }
+    AppendEnd(&words);
+    return words;
+  }();
+  return code;
+}
+
+// Stores s2 through the V# it loads from s[0:1] (its materialization reads the table).
+const std::vector<u32> &TableReaderCode() {
+  static const std::vector<u32> code = [] {
+    std::vector<u32> words;
+    words.push_back(EncodeSmem0(0x02, 8, 0)); // s_load_dwordx4 s[8:11], s[0:1], 0
+    words.push_back(EncodeSmem1(0, 0x7d));
+    words.push_back(EncodeVop1(0x01u, 1, 2)); // v_mov_b32 v1, s2
+    words.push_back(EncodeMubuf0(0x1cu, 0, false, false)); // buffer_store_dword v1, s[8:11]
+    words.push_back(EncodeMubuf1(1, 2, 0));
+    AppendEnd(&words);
+    return words;
+  }();
+  return code;
+}
+
+// A program copied to a 256-byte aligned address.
+class AlignedProgram {
+public:
+  explicit AlignedProgram(const std::vector<u32> &code) {
+    EXIT_IF(code.size() > m_code.size());
+    std::copy(code.begin(), code.end(), m_code.begin());
+    ShaderMapUserData(Address(), {.type = Prospero::ShaderBinaryType::kCs,
+                                  .code_size_bytes =
+                                      static_cast<uint32_t>(code.size() * sizeof(u32))});
+  }
+  [[nodiscard]] uint64_t Address() const { return reinterpret_cast<uint64_t>(m_code.data()); }
+
+private:
+  alignas(256) std::array<u32, 64> m_code{};
+};
+
+// A dispatch writes a V# table, the next dispatch loads its V# from it: the second one's
+// materialization reads the table back, which waits for the first (and the long dispatch
+// beside it) on the host GPU. A graphics stream can run meanwhile: the compute queue parks, the
+// graphics queue runs, and the compute queue resumes once the tick completes, before graphics
+// ends (the open command buffer holding the writer was submitted). The re-executed dispatch
+// stores what a serial run stores. Then the same with a park forced on every dispatch that reads
+// GPU-written memory back, direct and indirect.
+void CheckQueueParkReadback(VulkanHarness &vulkan) {
+  constexpr const char *name = "QueueParkReadback";
+  auto &renderer = vulkan.RuntimeRenderer();
+  constexpr uint64_t base = 0x0000000208000000ull;
+  constexpr uint64_t size = 0x200000;
+  MapQueueLabelMemory(renderer, base, size);
+  renderer.InitializeGpu(nullptr);
+  // Materialization reads GPU-written guest memory back through the renderer.
+  LibKernel::Memory::InstallGpuResources(&renderer);
+  auto &gpu = renderer.GetGpu();
+  static const ChainKernel chain;
+  static const AlignedProgram writer(TableWriterCode());
+  static const AlignedProgram reader(TableReaderCode());
+  // Graphics outlasts the long dispatch (several milliseconds on the GPU) on the GPU thread.
+  constexpr uint32_t GraphicsPackets = 131072;
+  constexpr uint32_t ComputeValue = 7;
+  constexpr uint32_t WriterLoops = ProducerLoops;
+
+  // One table write and its reader; `indirect` dispatches the reader indirectly (CPU-written
+  // arguments).
+  const auto append_round = [&](std::vector<uint32_t> &stream, uint64_t table, uint64_t target,
+                                uint64_t args, uint32_t value, bool indirect) {
+    AppendProgram(stream, writer.Address(), 8, 1);
+    const auto table_vsharp = RawDwordBuffer(table, 16);
+    const auto target_vsharp = RawDwordBuffer(target, sizeof(uint32_t));
+    AppendSetSh(stream, Pm4::COMPUTE_USER_DATA_0,
+                {table_vsharp.fields[0], table_vsharp.fields[1], table_vsharp.fields[2],
+                 table_vsharp.fields[3], target_vsharp.fields[0], target_vsharp.fields[1],
+                 target_vsharp.fields[2], target_vsharp.fields[3]});
+    stream.insert(stream.end(), {KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, 0), 1, 1, 1, 0x41u});
+    // The reader's scalar load reads what the writer stored.
+    AppendPartialFlush(stream);
+    AppendProgram(stream, reader.Address(), 3, 1);
+    AppendSetSh(stream, Pm4::COMPUTE_USER_DATA_0,
+                {static_cast<uint32_t>(table), static_cast<uint32_t>(table >> 32u), value});
+    if (indirect) {
+      stream.insert(stream.end(),
+                    {KYTY_PM4(4, Pm4::IT_DISPATCH_INDIRECT, 0), static_cast<uint32_t>(args),
+                     static_cast<uint32_t>(args >> 32u), 0x41u});
+    } else {
+      stream.insert(stream.end(), {KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, 0), 1, 1, 1, 0x41u});
+    }
+  };
+  const auto graphics_stream = [&](uint32_t *shared) {
+    std::vector<uint32_t> graphics;
+    for (uint32_t i = 0; i < GraphicsPackets; i++) {
+      AppendWriteData(graphics, shared, 100 + i);
+    }
+    return graphics;
+  };
+  // Round robin starts at the first compute queue: a graphics submission was selected last.
+  const auto start_at_compute = [&](uint32_t *scratch) {
+    std::vector<uint32_t> stream;
+    AppendWriteData(stream, scratch, 1);
+    gpu.Submit(stream, {});
+    gpu.WaitForIdle();
+  };
+
+  // Programs compiled on first use evaluate their plan while translating, which cannot park:
+  // a first run compiles both, with nothing else to run.
+  {
+    std::vector<uint32_t> warm;
+    append_round(warm, base + 0x70000, base + 0x71000, 0, 1, false);
+    gpu.SubmitCompute(0x20, warm);
+    gpu.WaitForIdle();
+    Require(name, "warm-up", ReadFinishedWord(renderer, gpu, base + 0x71000) == 1,
+            "the table reader did not store through the GPU-written V#");
+  }
+
+  // The writer in the open command buffer, behind a long dispatch.
+  {
+    const uint64_t region = base;
+    auto *words = reinterpret_cast<uint32_t *>(region);
+    auto *shared = words;
+    auto *scratch = words + 1;
+    const uint64_t zero = region + 0x1000;
+    const uint64_t produced = region + 0x2000;
+    const uint64_t table = region + 0x3000;
+    const uint64_t target = region + 0x4000;
+    constexpr uint32_t Value = 0x5e1f0001u;
+    std::vector<uint32_t> compute;
+    AppendChainDispatch(compute, chain, produced, zero, 3, WriterLoops);
+    append_round(compute, table, target, 0, Value, false);
+    AppendWriteData(compute, shared, ComputeValue);
+    const auto graphics = graphics_stream(shared);
+    start_at_compute(scratch);
+    const auto before = SchedulingStatsOf(gpu);
+    {
+      GpuThreadHold hold(gpu);
+      gpu.SubmitCompute(0x20, compute);
+      gpu.Submit(graphics, {});
+    }
+    gpu.WaitForIdle();
+    const auto after = SchedulingStatsOf(gpu);
+    const auto stored = ReadFinishedWord(renderer, gpu, target);
+    Require(name, "parked dispatch output", stored == Value,
+            "the re-executed dispatch stored " + Hex(stored) + ", expected " + Hex(Value));
+    RequireChainWords(renderer, name, produced, 3 + WriterLoops,
+                      "the dispatch before the parked one lost its output");
+    Require(name, "parks", after.parks - before.parks >= 1 &&
+                               after.parked_slices - before.parked_slices >= 1,
+            std::to_string(after.parks - before.parks) + " parks and " +
+                std::to_string(after.parked_slices - before.parked_slices) +
+                " slices of other queues while parked, expected at least 1 and 1");
+    Require(name, "resumed on its tick",
+            after.ready_resumes - before.ready_resumes >= 1 && *shared == 100 + GraphicsPackets - 1,
+            std::to_string(after.ready_resumes - before.ready_resumes) +
+                " resumes on a completed tick, shared word " + Hex(*shared) +
+                ": the parked queue did not resume before graphics ended (an unsubmitted tick?)");
+  }
+
+  // A park forced on every dispatch whose materialization reads GPU-written memory back.
+  {
+    constexpr uint32_t Rounds = 8;
+    const uint64_t region = base + 0x80000;
+    auto *words = reinterpret_cast<uint32_t *>(region);
+    auto *shared = words;
+    auto *scratch = words + 1;
+    const uint64_t args = region + 0x1000;
+    const std::array<uint32_t, 3> groups{1, 1, 1};
+    std::memcpy(reinterpret_cast<void *>(args), groups.data(), sizeof(groups));
+    std::vector<uint32_t> compute;
+    for (uint32_t round = 0; round < Rounds; round++) {
+      append_round(compute, region + 0x2000 + round * 0x1000ull,
+                   region + 0x20000 + round * 0x1000ull, args, 0x6e000000u + round,
+                   round % 2 == 1);
+    }
+    AppendWriteData(compute, shared, ComputeValue);
+    const auto graphics = graphics_stream(shared);
+    start_at_compute(scratch);
+    gpu.ForceParkForTesting(true);
+    const auto before = SchedulingStatsOf(gpu);
+    {
+      GpuThreadHold hold(gpu);
+      gpu.SubmitCompute(0x20, compute);
+      gpu.Submit(graphics, {});
+    }
+    gpu.WaitForIdle();
+    const auto after = SchedulingStatsOf(gpu);
+    gpu.ForceParkForTesting(false);
+    for (uint32_t round = 0; round < Rounds; round++) {
+      const auto stored = ReadFinishedWord(renderer, gpu, region + 0x20000 + round * 0x1000ull);
+      Require(name, "forced park output", stored == 0x6e000000u + round,
+              "round " + std::to_string(round) + (round % 2 == 1 ? " (indirect)" : "") +
+                  ": the re-executed dispatch stored " + Hex(stored) + ", expected " +
+                  Hex(0x6e000000u + round));
+    }
+    Require(name, "forced parks", after.parks - before.parks >= 2,
+            std::to_string(after.parks - before.parks) + " forced parks, expected at least 2");
+  }
+  renderer.UnmapMemory(base, size);
+  LibKernel::Memory::InstallGpuResources(nullptr);
+  renderer.ShutdownGpu();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// Label-synchronised producer/consumer chains over the graphics queue and three compute queues,
+// in random queue assignments, submission orders and packet padding: every step reads the step
+// before it, so any interleaving the scheduler picks must give the serial words.
+void CheckQueueSwitchFuzz(VulkanHarness &vulkan) {
+  constexpr const char *name = "QueueSwitchFuzz";
+  auto &renderer = vulkan.RuntimeRenderer();
+  constexpr uint64_t base = 0x0000000208000000ull;
+  constexpr uint64_t size = 0x400000;
+  MapQueueLabelMemory(renderer, base, size);
+  renderer.InitializeGpu(nullptr);
+  auto &gpu = renderer.GetGpu();
+  static const ChainKernel kernel;
+  constexpr std::array<uint32_t, 4> Queues{0, 0x20, 0x28, 0x30};
+  constexpr uint32_t Seeds = 12;
+  constexpr uint32_t Steps = 24;
+  const auto before = SchedulingStatsOf(gpu);
+  for (uint32_t seed = 0; seed < Seeds; seed++) {
+    std::mt19937 rng(0x51a7e000u + seed);
+    // Fresh (zero) memory per seed: labels, the first input, then each step's output.
+    const uint64_t region = base + seed * 0x20000ull;
+    auto *labels = reinterpret_cast<uint32_t *>(region);
+    const uint64_t zero = region + 0x1000;
+    const auto output = [&](uint32_t step) { return region + 0x2000 + step * 0x1000ull; };
+    std::array<std::vector<uint32_t>, Queues.size()> streams;
+    std::vector<uint32_t> expected(Steps);
+    uint32_t value = 0;
+    for (uint32_t step = 0; step < Steps; step++) {
+      auto &stream = streams[rng() % Queues.size()];
+      if (step > 0) {
+        AppendWaitEqual(stream, &labels[step - 1], seed + 1);
+      }
+      for (uint32_t pad = rng() % 4; pad > 0; pad--) {
+        AppendWriteData(stream, &labels[512 + step], pad);
+      }
+      const uint32_t constant = rng() % 1000;
+      const uint32_t loops = rng() % 4 == 0 ? 20000 + rng() % 20000 : 1 + rng() % 64;
+      AppendChainDispatch(stream, kernel, output(step), step == 0 ? zero : output(step - 1),
+                          constant, loops);
+      value += constant + loops;
+      expected[step] = value;
+      const auto address = reinterpret_cast<uint64_t>(&labels[step]);
+      if (rng() % 2 == 0) {
+        stream.insert(stream.end(),
+                      {KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM), 0x28u | (5u << 8u),
+                       1u << 29u, static_cast<uint32_t>(address),
+                       static_cast<uint32_t>(address >> 32u), seed + 1, 0u, 0u});
+      } else {
+        AppendWriteData(stream, &labels[step], seed + 1);
+      }
+    }
+    std::array<uint32_t, Queues.size()> order{0, 1, 2, 3};
+    std::shuffle(order.begin(), order.end(), rng);
+    {
+      // Queued together, or one by one as the GPU thread runs.
+      std::optional<GpuThreadHold> hold;
+      if (seed % 3 != 0) {
+        hold.emplace(gpu);
+      }
+      for (const auto index : order) {
+        if (streams[index].empty()) {
+          continue;
+        }
+        if (Queues[index] == 0) {
+          gpu.Submit(streams[index], {});
+        } else {
+          gpu.SubmitCompute(Queues[index], streams[index]);
+        }
+      }
+    }
+    gpu.WaitForIdle();
+    for (uint32_t step = 0; step < Steps; step++) {
+      const auto what = "seed " + std::to_string(seed) + " step " + std::to_string(step) +
+                        ": a consumer ran before its producer's label ordered it";
+      RequireChainWords(renderer, name, output(step), expected[step], what.c_str());
+    }
+  }
+  const auto after = SchedulingStatsOf(gpu);
+  Require(name, "switches", after.release_switches - before.release_switches > 0,
+          "no release switched queues");
+  renderer.UnmapMemory(base, size);
+  renderer.ShutdownGpu();
+  std::printf("[host]    %-32s ok (%" PRIu64 " release switches)\n", name,
+              after.release_switches - before.release_switches);
+}
+
+// The same orders across queues: the producer on one queue releases a label (RELEASE_MEM or
+// WRITE_DATA after it), and the consumer on another waits for it (WAIT_REG_MEM) before its
+// dispatch. `suspend_first`: the consumer is submitted and suspends on the label before the
+// producer is submitted (a release switches to it); otherwise the label is set when it arrives.
+void CheckCrossQueueSyncOrders(RenderContext &renderer, GuestGpu &gpu, uint64_t base,
+                               const char *name, uint32_t producer_queue,
+                               uint32_t consumer_queue, bool release_mem, bool suspend_first) {
+  static const ChainKernel kernel;
+  constexpr uint32_t Rounds = 4;
+  const auto submit = [&](uint32_t queue, std::vector<uint32_t> &stream) {
+    if (queue == 0) {
+      gpu.Submit(stream, {});
+    } else {
+      gpu.SubmitCompute(queue, stream);
+    }
+  };
+  for (uint32_t round = 0; round < Rounds; round++) {
+    const uint64_t zero = base + round * 0x4000ull;
+    const uint64_t produced = zero + 0x1000;
+    const uint64_t consumed = zero + 0x2000;
+    auto *label = reinterpret_cast<uint32_t *>(zero + 0x3000);
+    auto *started = label + 1;
+    const uint32_t producer_constant = 0x10000u * (round + 1);
+    const uint32_t consumer_constant = 0x20u + round;
+    std::vector<uint32_t> producer;
+    std::vector<uint32_t> consumer;
+    AppendChainDispatch(producer, kernel, produced, zero, producer_constant, ProducerLoops);
+    if (release_mem) {
+      const auto address = reinterpret_cast<uint64_t>(label);
+      producer.insert(producer.end(),
+                      {KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM), 0x28u | (5u << 8u),
+                       1u << 29u, static_cast<uint32_t>(address),
+                       static_cast<uint32_t>(address >> 32u), round + 1, 0u, 0u});
+    } else {
+      AppendWriteData(producer, label, round + 1);
+    }
+    AppendWriteData(consumer, started, 1);
+    AppendWaitEqual(consumer, label, round + 1);
+    AppendChainDispatch(consumer, kernel, consumed, produced, consumer_constant, 1);
+    if (suspend_first) {
+      submit(consumer_queue, consumer);
+      // The consumer reaches its wait (and suspends) before the producer exists.
+      bool reached = false;
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (!reached && std::chrono::steady_clock::now() < deadline) {
+        gpu.SendCommandSync([&] { reached = *started == 1; });
+        std::this_thread::yield();
+      }
+      Require("GuestOrderedBarriers", name, reached, "the consumer did not start");
+      submit(producer_queue, producer);
+    } else {
+      submit(producer_queue, producer);
+      gpu.WaitForIdle();
+      submit(consumer_queue, consumer);
+    }
+    gpu.WaitForIdle();
+    RequireChainWords(renderer, name, consumed,
+                      producer_constant + ProducerLoops + consumer_constant + 1,
+                      "the consumer on another queue ran before the label ordered it");
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckGuestOrderedBarriers(VulkanHarness &vulkan) {
   auto &renderer = vulkan.RuntimeRenderer();
   constexpr uint64_t base = 0x0000000208000000ull;
@@ -56215,6 +56801,23 @@ void CheckGuestOrderedBarriers(VulkanHarness &vulkan) {
   }
 
   CheckThreadDimensionBatches(renderer, gpu, region(16));
+
+  // Graphics (queue 0) and compute (0x20) in both directions, each sync both ways.
+  {
+    uint32_t index = 24;
+    for (const bool release_mem : {true, false}) {
+      for (const bool suspend_first : {false, true}) {
+        for (const bool compute_produces : {true, false}) {
+          const auto label = std::string(compute_produces ? "ComputeToGraphics" : "GraphicsToCompute") +
+                             (release_mem ? "ReleaseMem" : "WriteData") +
+                             (suspend_first ? "Suspended" : "Arrived");
+          CheckCrossQueueSyncOrders(renderer, gpu, region(index++), label.c_str(),
+                                    compute_produces ? 0x20u : 0u, compute_produces ? 0u : 0x20u,
+                                    release_mem, suspend_first);
+        }
+      }
+    }
+  }
 
   renderer.UnmapMemory(base, size);
   renderer.ShutdownGpu();
@@ -57231,6 +57834,26 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--barrier-census-only") == 0) {
     VulkanHarness vulkan;
     GuestOrder::CheckBarrierCensus(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--queue-release-switch-only") == 0) {
+    VulkanHarness vulkan;
+    GuestOrder::CheckQueueReleaseSwitch(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--fetched-ahead-commands-only") == 0) {
+    VulkanHarness vulkan;
+    GuestOrder::CheckFetchedAheadCommands(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--queue-park-readback-only") == 0) {
+    VulkanHarness vulkan;
+    GuestOrder::CheckQueueParkReadback(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--queue-switch-fuzz-only") == 0) {
+    VulkanHarness vulkan;
+    GuestOrder::CheckQueueSwitchFuzz(vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--guest-ordered-barriers-only") == 0) {

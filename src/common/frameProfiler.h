@@ -116,6 +116,12 @@ enum class Kind : uint8_t { Sum, Max };
 	X(GpuBlockedTime, Ticks, Sum, "GPU thread: blocked-queue polls")                                   \
 	X(GpuBlockedWaits, Count, Sum, "GPU thread: blocked-queue polls, count")                       \
 	X(GpuLongestWait, Ticks, Max, "GPU thread: longest single wait")                               \
+	X(GpuProcessTimeGraphics, Ticks, Sum, "GPU thread: processing wall time, graphics queue")        \
+	X(GpuProcessTimeCompute, Ticks, Sum, "GPU thread: processing wall time, compute queues")         \
+	X(QueueReleaseSwitches, Count, Sum, "queue scheduling: switches to a queue a label released")    \
+	X(QueueParks, Count, Sum, "queue scheduling: dispatches parked on a host-GPU tick")             \
+	X(QueueParkRetries, Count, Sum, "queue scheduling: parked again on the same packet")             \
+	X(QueueParkHiddenTime, Ticks, Sum, "queue scheduling: parked time other queues ran in")         \
 	X(SubmitsCommand, Count, Sum, "host submits: command buffers (QueueSubmits less the others)") \
 	X(SubmitsPreSubmit, Count, Sum, "host submits: from a pre-submit hook")                        \
 	X(SubmitsOther, Count, Sum, "host submits: without command registers")                         \

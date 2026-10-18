@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <bit>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -91,6 +93,26 @@ public:
 
 private:
 	bool m_previous;
+};
+
+// Holds this thread's specialization-failure reports while in scope instead of printing them;
+// Publish prints them. For an evaluation that learns only afterwards whether its result is
+// discarded: a dispatch that parks (QueuePark) fails every read after the park, and evaluates
+// again.
+class DeferredSpecializationFailureReports {
+public:
+	DeferredSpecializationFailureReports();
+	~DeferredSpecializationFailureReports();
+	DeferredSpecializationFailureReports(const DeferredSpecializationFailureReports&) = delete;
+	DeferredSpecializationFailureReports& operator=(const DeferredSpecializationFailureReports&) =
+	    delete;
+
+	[[nodiscard]] const std::vector<std::string>& Reports() const { return m_reports; }
+	void                                          Publish();
+
+private:
+	std::vector<std::string>* m_previous;
+	std::vector<std::string>  m_reports;
 };
 
 // Applies an already-derived specialization to native IR before layout and emission.

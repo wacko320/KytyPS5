@@ -56,9 +56,29 @@ private:
 	struct BufferCursor {
 		std::span<const uint32_t> commands;
 		uint32_t                  offset_dw = 0;
+		// Fetched ahead (CommandProcessor::FetchAhead): `commands` is a copy of the dwords at
+		// `live` in guest memory. With `continued`, the cursor below holds the rest of the
+		// buffer, still in guest memory.
+		std::shared_ptr<const uint32_t[]> fetched;
+		const uint32_t*                   live      = nullptr;
+		bool                              continued = false;
+	};
+	// Dwords FetchAhead copied while a packet ran: the stack takes them once the packet returns.
+	struct FetchedAhead {
+		size_t                      cursor = 0;
+		std::shared_ptr<uint32_t[]> words;
+		uint32_t                    size         = 0;
+		uint32_t                    continuation = 0; // dwords taken from the continuation
 	};
 
 	std::vector<BufferCursor> m_buffer_stack;
+	std::vector<FetchedAhead> m_fetched_ahead;
+	// A rewind passed: the buffer from the REWIND packet on, fetched again (`refetched`, null for
+	// none), which ends at `refetched_end` in guest memory.
+	std::shared_ptr<uint32_t[]> m_refetched;
+	uint32_t                    m_refetched_size = 0;
+	const uint32_t*             m_refetched_live = nullptr;
+	const uint32_t*             m_refetched_end  = nullptr;
 	std::span<const uint32_t> m_next_buffer;
 	bool                      m_chain         = false;
 	bool                      m_suspended     = false;
@@ -172,7 +192,19 @@ public:
 	void SetCeComplete(bool complete) { m_ce_complete = complete; }
 	void WaitCe();
 	void WaitDeDiff(uint32_t diff);
-	void WaitForRewind(bool valid);
+	// Whether the REWIND packet whose payload is at `payload` is valid. One fetched ahead
+	// (FetchAhead) as valid stays valid; otherwise the buffer is fetched again from guest memory
+	// from the packet on, and once the guest has validated the rewind, the execution reads that
+	// copy: the guest validates a rewind once the commands after it are written, and may reuse
+	// their memory once it sees the command processor's later stores.
+	[[nodiscard]] bool RewindValid(const uint32_t* payload);
+	void               WaitForRewind(bool valid);
+	// Before a store of the packet executing now becomes visible to the guest (labels and
+	// other command-processor writes): the hardware command processor has fetched the dwords
+	// after the packet by then, so the guest may reuse their memory once it sees the store.
+	// Copies the rest of each command buffer of the execution (up to FetchAheadDwords), which
+	// the execution then reads instead of guest memory. GPU thread.
+	static void FetchAhead();
 	void IncrementDe();
 	void IncrementCe();
 
@@ -207,7 +239,12 @@ private:
 	                      uint32_t cache_action, uint32_t event_index, uint32_t event_write_source,
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
 	                      uint32_t interrupt_context_id);
+	// How far ahead of a store FetchAhead copies a command buffer (4 KiB).
+	static constexpr uint32_t FetchAheadDwords = 1024;
 	void ProcessPm4(Pm4Execution& execution);
+	// After a packet returns: the stack reads what FetchAhead and RewindValid copied while it
+	// ran.
+	static void ApplyFetchedAhead(Pm4Execution& execution);
 	void SuspendPm4(SuspendReason reason = SuspendReason::Other, uint64_t address = 0,
 	                uint32_t func = 0);
 	// The thread-dimension batch for the dispatch packet executing now: a new one when the
@@ -257,9 +294,11 @@ private:
 	// Decodes draws ahead of execution for the pipeline cache's prefetch workers.
 	std::unique_ptr<Pm4Lookahead> m_lookahead;
 	bool                          m_lookahead_checked = false;
-	// The packet a handler is executing, within its command buffer (empty outside ProcessPm4).
+	// The packet a handler is executing, within its command buffer (empty outside ProcessPm4),
+	// and its address in guest memory when the buffer was fetched ahead (null otherwise).
 	std::span<const uint32_t> m_packet_commands;
 	uint32_t                  m_packet_offset = 0;
+	const uint32_t*           m_packet_live   = nullptr;
 	// The span of the stream the last thread-dimension window scan covered, and its batch.
 	struct ThreadWindow {
 		const uint32_t* commands = nullptr;

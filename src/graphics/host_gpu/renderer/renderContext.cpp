@@ -5,6 +5,7 @@
 #include "common/frameProfiler.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/queuePark.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
@@ -69,6 +70,8 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 }
 
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+	// The faulting access is retried: its readback cannot park (QueuePark).
+	const QueuePark::NoParkScope no_park;
 	Common::FrameProfiler::Rec(Common::FrameProfiler::Event::Fault, static_cast<uint64_t>(access),
 	                           fault_vaddr);
 	// The host reports the faulting byte, not the instruction's access width. Both caches
@@ -126,6 +129,14 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	return true;
 }
 
+void RenderContext::NoteGuestWrite(uint64_t vaddr, uint64_t size, const void* bytes) {
+	GuestGpu::NoteGuestWrite(vaddr, size, bytes);
+}
+
+void RenderContext::BeforeCommandProcessorStore() {
+	GuestGpu::BeforeCommandProcessorStore();
+}
+
 bool RenderContext::CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
                                       uint64_t size) noexcept {
 	return IsMapped(vaddr, size) && m_page_manager.IsReadWatched(fault_vaddr) &&
@@ -163,6 +174,7 @@ uint8_t* RenderContext::BeginWriteThrough(uint64_t vaddr, uint64_t size) {
 }
 
 bool RenderContext::TryWriteGpuOrdered(uint64_t vaddr, const void* data, uint64_t size) {
+	BeforeCommandProcessorStore();
 	return IsMapped(vaddr, size) && !m_texture_cache.IsRegionGpuModified(vaddr, size) &&
 	       m_buffer_cache.TryWriteGpuOrdered(vaddr, data, size);
 }
