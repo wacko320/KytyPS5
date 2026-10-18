@@ -3893,6 +3893,16 @@ private:
 				source = indirect->source;
 			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
 			               memory.resource * 4u, handle, source)) {
+				// A store or atomic through a V# the host cannot evaluate goes through the BDA
+				// page table; the host does not track the pages it writes.
+				if (m_program.untracked_writes && buffer != BufferAccess::Read &&
+				    memory.kind == ResourceKind::Buffer &&
+				    (memory.SupportsIndirectBufferStore(op) || memory.SupportsIndirectBufferAtomic(op))) {
+					m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
+					m_program.has_address_writes            = true;
+					m_info.uses_dma                         = true;
+					return;
+				}
 				if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
 				                                                        : ResourceKind::Buffer) ||
 				    !memory.SupportsIndirectBufferLoad(op)) {

@@ -87,6 +87,8 @@ int main(int argc, char** argv) {
 	options.dump_ir            = true;
 	options.early_dump         = early_dump;
 	options.user_data          = user_data;
+	// As the emulator compiles them (see PipelineCache).
+	options.untracked_writes   = true;
 	auto        result         = ShaderRecompiler::TranslateProgram(code, options);
 	const auto& program        = result.program;
 	std::printf("uses_dma=%d srt_reads=%zu buffers=%zu images=%zu\n", program.info.uses_dma,

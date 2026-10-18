@@ -30,6 +30,10 @@ struct CompileOptions {
 	// Debugging (--shader-loop-limit): structured loops end the invocation after this many
 	// iterations and report through the fault buffer (0: no watchdog).
 	uint32_t                    loop_watchdog_limit = 0;
+	// Accept stores and atomics the host cannot track: through GPU-selected V#s and through
+	// FLAT/GLOBAL addresses. They go through the BDA page table; the host does not learn which
+	// pages they write, so CPU reads may see stale data. Off rejects them.
+	bool                        untracked_writes    = false;
 };
 
 struct TranslateResult {

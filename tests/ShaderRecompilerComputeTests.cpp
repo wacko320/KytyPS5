@@ -1358,6 +1358,7 @@ struct TestCase {
   std::vector<BdaMapping> bda_mappings;
   std::optional<uint64_t> fault_free_address;
   u32 loop_watchdog_limit = 0;
+  bool untracked_writes = false;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   float expected_float_tolerance = 0.0f;
@@ -1682,6 +1683,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     options.wave_size = test.compute_info.wave_size;
   }
   options.loop_watchdog_limit = test.loop_watchdog_limit;
+  options.untracked_writes = test.untracked_writes;
 
   auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
   auto resource_plan =
@@ -31639,6 +31641,49 @@ TestCase BufferLoadDwordGpuSelectedDescriptors() {
   return BufferLoadsGpuSelectedDescriptors(1u);
 }
 
+TestCase BufferStoresGpuSelectedDescriptor() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  TestCase test;
+  test.name = "BufferStoresGpuSelectedDescriptor";
+  test.initial.resize(1028);
+  // A raw (OOB_SELECT=3) descriptor at byte 520 over 12 bytes at guest byte 4096 - 16.
+  const std::array<u32, 4> descriptor{static_cast<u32>(GuestBase + 4080), 1u, 12u,
+                                      0x5204u | (3u << 28u)};
+  std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 130);
+  test.initial[1022] = 0x10;
+  test.initial[1023] = 0x77;
+  test.expected = test.initial;
+  test.expected[1021] = 0xaaaa;
+  test.expected[1022] = 0x13;
+  // The descriptor offset comes from a GPU load and readfirstlane, not host constants.
+  AppendVMovU32(&test.code, 30, 64 * 4);
+  AppendBufferLoadDword(&test.code, 0, 30);
+  test.code.push_back(EncodeVop1(0x02, 20, Vgpr(0)));
+  test.code.push_back(EncodeSmem0(0x0a, 8, 0));
+  test.code.push_back(EncodeSmem1(520, 20));
+  AppendVMovLiteral(&test.code, 1, 0xaaaa);
+  AppendVMovU32(&test.code, 2, 3);
+  AppendVMovU32(&test.code, 21, 4);
+  AppendVMovU32(&test.code, 22, 12);
+  AppendVMovU32(&test.code, 23, 8);
+  test.code.push_back(EncodeMubuf0(0x1c));
+  test.code.push_back(EncodeMubuf1(1, 2, 21));
+  // Past NUM_RECORDS: dropped.
+  test.code.push_back(EncodeMubuf0(0x1c));
+  test.code.push_back(EncodeMubuf1(1, 2, 22));
+  test.code.push_back(EncodeMubuf0(0x3a));
+  test.code.push_back(EncodeMubuf1(2, 2, 23));
+  AppendEnd(&test.code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.untracked_writes = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32,
+                  O::S_BUFFER_LOAD_DWORDX4, O::BUFFER_STORE_DWORD, O::BUFFER_ATOMIC_OR,
+                  O::S_ENDPGM};
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer", "OpAtomicOr"};
+  return test;
+}
+
 TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   using O = ShaderOpcode;
   const bool formatted = load == O::BUFFER_LOAD_FORMAT_X;
@@ -42646,6 +42691,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadUshortGpuSelectedDescriptors64);
   AddCase(BufferLoadUbyteGpuSelectedDescriptors);
   AddCase(BufferLoadUbyteGpuSelectedDescriptors64);
+  AddCase(BufferStoresGpuSelectedDescriptor);
   AddCase(BufferStoreDwordx4DropsOnlyOutOfBoundsTail);
   AddCase(BufferLoadFormatXyzwRejectsPartialRecord);
   AddCase(BufferStoreFormatXyzwDropsPartialRecord);
@@ -48703,6 +48749,7 @@ int main(int argc, char **argv) {
     CheckSharedIndirectBufferLoads(vulkan);
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors64());
+    RunCase(&vulkan, BufferStoresGpuSelectedDescriptor());
     RunCase(&vulkan, BufferLoadFormatXRejectsPartialRecord());
     RunCase(&vulkan, BufferLoadFormatXyRejectsPartialRecord());
     RunCase(&vulkan, BufferLoadDwordx4SnapshotsOverlappingAddress());

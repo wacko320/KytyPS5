@@ -33,6 +33,8 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cinttypes>
+#include <cstdio>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -955,7 +957,19 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
 					if (written.size != 0 && ImageRangeOverlaps(address, size,
 					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+						// The stage reads a snapshot of memory it may write first (GTA V branches on a
+						// flag word it sets with an atomic OR); the GPU would see the update. Keep the
+						// snapshot, as before reads were checked against writes.
+						if (writer != reader) {
+							EXIT("scalar resource reads overlap a shader buffer write\n");
+						}
+						static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+						if (!warned.test_and_set(std::memory_order_relaxed)) {
+							std::fprintf(stderr,
+							             "Warning: shader 0x%016" PRIx64 " reads a snapshot of memory "
+							             "it writes\n",
+							             program.shader_hash);
+						}
 					}
 				}
 			}

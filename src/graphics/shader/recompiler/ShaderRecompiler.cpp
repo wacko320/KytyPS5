@@ -817,6 +817,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			     MakeIrDump(cfg_dump, ir).c_str());
 		}
 	}
+	ir.untracked_writes = options.untracked_writes;
 	IR::TrackResources(ir, decoded, native_cfg, options.input_info);
 	TranslateResult result;
 	result.program = std::move(ir);

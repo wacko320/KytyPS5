@@ -328,7 +328,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				info.function_scratch = true;
 				info.function_lds |= kind == ResourceKind::FlatLocal &&
 				                     program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh;
-			} else if (address_access == AddressAccess::Write) {
+			} else if (address_access == AddressAccess::Write && !program.untracked_writes) {
 				return Fail("writable FLAT/GLOBAL addresses require GPU ownership tracking");
 			} else {
 				info.coherent_buffers |= memory.coherent;

@@ -100,6 +100,35 @@ struct MemoryInfo {
 		                        opcode == ValueOpcode::LoadBufferU32x4);
 	}
 
+	// Raw DWORD stores through a V# only the GPU knows.
+	[[nodiscard]] bool SupportsIndirectBufferStore(ValueOpcode opcode) const {
+		return !formatted && !typed && data_bits == 32u &&
+		       ((opcode == ValueOpcode::StoreBufferU32 && data_dwords == 1u) ||
+		        opcode == ValueOpcode::StoreBufferU32x2 || opcode == ValueOpcode::StoreBufferU32x3 ||
+		        opcode == ValueOpcode::StoreBufferU32x4);
+	}
+
+	// 32-bit integer atomics through a V# only the GPU knows.
+	[[nodiscard]] bool SupportsIndirectBufferAtomic(ValueOpcode opcode) const {
+		if (formatted || typed) {
+			return false;
+		}
+		switch (opcode) {
+			case ValueOpcode::BufferAtomicSwap32:
+			case ValueOpcode::BufferAtomicCmpSwap32:
+			case ValueOpcode::BufferAtomicIAdd32:
+			case ValueOpcode::BufferAtomicISub32:
+			case ValueOpcode::BufferAtomicSMin32:
+			case ValueOpcode::BufferAtomicUMin32:
+			case ValueOpcode::BufferAtomicSMax32:
+			case ValueOpcode::BufferAtomicUMax32:
+			case ValueOpcode::BufferAtomicAnd32:
+			case ValueOpcode::BufferAtomicOr32:
+			case ValueOpcode::BufferAtomicXor32: return true;
+			default: return false;
+		}
+	}
+
 	bool operator==(const MemoryInfo& other) const = default;
 };
 
@@ -709,6 +738,8 @@ struct Program: ResourcePlan {
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
 	uint32_t                      loop_watchdog_limit = 0;
+	// CompileOptions::untracked_writes.
+	bool                          untracked_writes    = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
 	struct ScalarWrite { uint32_t pc; ScalarReg reg; Value value; };

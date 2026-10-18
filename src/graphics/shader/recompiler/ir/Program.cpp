@@ -480,7 +480,9 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				if (memory.kind == ResourceKind::IndirectBuffer &&
-				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
+				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode()) &&
+				    !(program.untracked_writes && (memory.SupportsIndirectBufferStore(inst.GetOpcode()) ||
+				                                   memory.SupportsIndirectBufferAtomic(inst.GetOpcode())))) {
 					return Fail("indirect buffer requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, "
 					            "or formatted X load");
 				}

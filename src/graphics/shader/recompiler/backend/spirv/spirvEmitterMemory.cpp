@@ -249,6 +249,81 @@ uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint3
 	});
 }
 
+// A store of bits (8, 16 or 32) through a guest pointer; stores to missing pages are dropped. An
+// aligned dword is a plain store; a subword or unaligned dword updates its containing dwords with
+// an atomic AND and OR each, so racing writes to the other bytes of a dword are kept, as on
+// hardware. The host does not track the written range.
+void StoreBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t bits,
+              uint32_t data) {
+	auto&      state = ctx.state;
+	const auto u32   = TypeU32(state);
+	const auto u64   = TypeU64(state);
+	const auto byte  = Binary(state, spv::OpBitwiseAnd, u32, Unary(state, spv::OpUConvert, u32, address),
+	                          ConstantU32(state, 3));
+	const auto present = [&](uint32_t host) {
+		return Binary(state, spv::OpINotEqual, TypeBool(state), host, ConstantU64(state, 0));
+	};
+	const auto pointer_to = [&](uint32_t host) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, host);
+		return pointer;
+	};
+	const auto is_aligned = Binary(state, spv::OpIEqual, TypeBool(state), byte, ConstantU32(state, 0));
+	if (bits == 32u) {
+		EmitIfCondition(state, AndCondition(state, active, is_aligned), [&]() {
+			const auto host = GetBdaPointer(state, address);
+			EmitIfCondition(state, present(host), [&]() {
+				state.builder.AddFunction(spv::OpStore, pointer_to(host), data,
+				                          spv::MemoryAccessAlignedMask, uint32_t {4});
+			});
+		});
+	}
+	// The masked path: always for subwords, for unaligned dwords otherwise.
+	const auto masked =
+	    bits == 32u ? AndCondition(state, active, Unary(state, spv::OpLogicalNot, TypeBool(state), is_aligned))
+	                : active;
+	EmitIfCondition(state, masked, [&]() {
+		const auto value_mask = bits == 32u ? 0xffffffffull : (1ull << bits) - 1ull;
+		const auto shift      = Unary(state, spv::OpUConvert, u64,
+		                              Binary(state, spv::OpShiftLeftLogical, u32, byte, ConstantU32(state, 3)));
+		const auto mask64 =
+		    Binary(state, spv::OpShiftLeftLogical, u64, ConstantU64(state, value_mask), shift);
+		const auto data64 = Binary(
+		    state, spv::OpShiftLeftLogical, u64,
+		    Unary(state, spv::OpUConvert, u64,
+		          Binary(state, spv::OpBitwiseAnd, u32, data,
+		                 ConstantU32(state, static_cast<uint32_t>(value_mask)))),
+		    shift);
+		const auto aligned =
+		    Binary(state, spv::OpBitwiseAnd, u64, address, ConstantU64(state, ~uint64_t {3}));
+		for (uint32_t dword = 0; dword < 2u; dword++) {
+			const auto part = [&](uint32_t value64) {
+				return Unary(state, spv::OpUConvert, u32,
+				             Binary(state, spv::OpShiftRightLogical, u64, value64,
+				                    ConstantU64(state, 32u * dword)));
+			};
+			const auto mask  = part(mask64);
+			const auto value = part(data64);
+			EmitIfCondition(
+			    state, Binary(state, spv::OpINotEqual, TypeBool(state), mask, ConstantU32(state, 0)), [&]() {
+				    const auto host = GetBdaPointer(
+				        state, Binary(state, spv::OpIAdd, u64, aligned, ConstantU64(state, 4u * dword)));
+				    EmitIfCondition(state, present(host), [&]() {
+					    const auto pointer = pointer_to(host);
+					    for (const auto [op, operand]:
+					         {std::pair {spv::OpAtomicAnd, Unary(state, spv::OpNot, u32, mask)},
+					          std::pair {spv::OpAtomicOr, value}}) {
+						    state.builder.AddFunction(op, u32, state.builder.AllocateId(), pointer,
+						                              ConstantU32(state, spv::ScopeDevice),
+						                              ConstantU32(state, spv::MemorySemanticsMaskNone),
+						                              operand);
+					    }
+				    });
+			    });
+		}
+	});
+}
+
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                      uint32_t prefix = 0) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
@@ -1132,6 +1207,62 @@ uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	return result;
 }
 
+// Raw DWORD stores through a V# only the GPU knows. Each component checks its own bounds, as raw
+// loads do.
+void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
+	auto& state = ctx.state;
+	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto buffer       = PrepareIndirectBuffer(state, IndirectBufferArgs(ctx, inst), false);
+		const auto valid_format = Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format,
+		                                 ConstantU32(state, 0));
+		const auto data         = ctx.Arg(inst, inst.NumArgs() - 2);
+		for (uint32_t component = 0; component < components; ++component) {
+			auto value = data;
+			if (components > 1u) {
+				value = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, data,
+				                          component);
+			}
+			const auto address = component == 0u
+			                         ? buffer.address
+			                         : Binary(state, spv::OpIAdd, TypeU64(state), buffer.address,
+			                                  ConstantU64(state, component * 4u));
+			StoreBda(ctx, address,
+			         AndCondition(state, valid_format,
+			                      IndirectBufferInBounds(state, buffer, component * 4u,
+			                                             ConstantU32(state, 4u), false)),
+			         32u, value);
+		}
+	});
+}
+
+// 32-bit integer atomics through a V# only the GPU knows.
+uint32_t AtomicIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	return EmitValueOrZeroIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto buffer    = PrepareIndirectBuffer(state, IndirectBufferArgs(ctx, inst), false);
+		const auto in_bounds = AndCondition(
+		    state,
+		    Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format, ConstantU32(state, 0)),
+		    IndirectBufferInBounds(state, buffer, 0u, ConstantU32(state, 4u), false));
+		return EmitValueOrZeroIfCondition(state, in_bounds, [&]() {
+			const auto host = GetBdaPointer(
+			    state, Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
+			                  ConstantU64(state, ~uint64_t {3})));
+			return EmitValueOrZeroIfCondition(
+			    state, Binary(state, spv::OpINotEqual, TypeBool(state), host, ConstantU64(state, 0)),
+			    [&]() {
+				    const auto pointer = state.builder.AllocateId();
+				    state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state),
+				                              pointer, host);
+				    const auto old = EmitAtomicOperation(ctx, inst, pointer, spv::ScopeDevice);
+				    EmitAtomicMemoryBarrier(state, IR::ResourceKind::Buffer);
+				    return old;
+			    });
+		});
+	});
+}
+
 uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	const auto mem = ctx.Memory(inst);
@@ -1416,6 +1547,9 @@ void DefineGetBdaPointer(EmitterState& state) {
 
 uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& mem = ctx.Memory(inst);
+	if (mem.kind == IR::ResourceKind::IndirectBuffer) {
+		return AtomicIndirectBuffer(ctx, inst);
+	}
 	return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
 		const auto scope =
 		    mem.kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
@@ -1668,6 +1802,12 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  type              = inst.Arg(inst.NumArgs() - 2).GetType();
 	if (mem.kind == IR::ResourceKind::FlatLocal)
 		StoreLocalFlat(ctx, inst);
+	else if (mem.kind == IR::ResourceKind::IndirectBuffer)
+		StoreIndirectBuffer(ctx, inst, std::max(buffer_components, 1u));
+	else if (IR::AddressOpcodeInfoOf(op).access == IR::AddressAccess::Write &&
+	         mem.kind != IR::ResourceKind::Scratch)
+		StoreBda(ctx, GuestAddress(ctx, inst, mem), ctx.Arg(inst, inst.NumArgs() - 1),
+		         IR::AddressOpcodeInfoOf(op).data_bits, ctx.Arg(inst, inst.NumArgs() - 2));
 	else if (buffer_components > 1u)
 		StoreBuffer(ctx, inst, buffer_components);
 	else if (shared_components > 1u)
