@@ -445,6 +445,8 @@ endfunction()
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
 # Offline oracle: translates raw compute shader dumps; not a test.
 add_kyty_full_emulator_test(shader_dump_tool "${KYTY_TESTS_DIR}/ShaderDumpTool.cpp")
+# Offline benchmark: replays a captured compute dispatch; not a test.
+add_kyty_full_emulator_test(dispatch_replay_tool "${KYTY_TESTS_DIR}/DispatchReplayTool.cpp")
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
