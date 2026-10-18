@@ -16,6 +16,8 @@
 //   --game-spirv       run the captured SPIR-V instead of recompiling
 //   --spirv FILE       run FILE instead of recompiling
 //   --save-spirv FILE  write the SPIR-V that runs
+//   --compile-only     stop once the pipeline is built (with RADV_DEBUG=shaders: its ISA)
+//   --dump-ir PREFIX   write the decoded guest program and the IR to PREFIX.decoded/.ir
 //   --save-output FILE write the written objects' bytes after the first run
 //   --reference FILE   compare the first run with a --save-output file instead of the capture
 //   --unordered N      compare a buffer that differs as a multiset of N-byte records (a
@@ -31,6 +33,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
+#include "spirv-tools/libspirv.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -282,6 +285,8 @@ struct Compiled {
 	uint32_t              wave_size = 64;
 };
 
+std::string g_dump_ir;
+
 Compiled Recompile(const std::string& path, const std::vector<uint32_t>* override_spirv) {
 	using namespace ShaderRecompiler;
 	Reader r {ReadFile(path)};
@@ -301,7 +306,7 @@ Compiled Recompile(const std::string& path, const std::vector<uint32_t>* overrid
 	options.emit_debug_info      = r.U32() != 0;
 	(void)r.U32();
 	(void)r.U32();
-	options.dump_ir              = false;
+	options.dump_ir              = !g_dump_ir.empty();
 	options.early_dump           = false;
 	options.shader_hash          = hash;
 	options.dump_label           = "replay";
@@ -334,6 +339,10 @@ Compiled Recompile(const std::string& path, const std::vector<uint32_t>* overrid
 	std::printf("recompiled in %.1f ms: %zu words\n",
 	            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
 	            result.spirv.size());
+	if (!g_dump_ir.empty()) {
+		std::ofstream(g_dump_ir + ".decoded") << result.decoded_dump;
+		std::ofstream(g_dump_ir + ".ir") << result.ir_dump;
+	}
 	out.spirv     = std::move(result.spirv);
 	out.wave_size = result.program.wave_size;
 	return out;
@@ -651,12 +660,15 @@ int main(int argc, char** argv) {
 	uint32_t                 repeats    = 20;
 	uint64_t                 unordered  = 0;
 	bool                     game_spirv = false;
+	bool                     compile_only = false;
 	for (int i = 1; i < argc; i++) {
 		const std::string a = argv[i];
 		if (a == "--repeats" && i + 1 < argc) repeats = std::strtoul(argv[++i], nullptr, 0);
 		else if (a == "--game-spirv") game_spirv = true;
+		else if (a == "--compile-only") compile_only = true;
 		else if (a == "--spirv" && i + 1 < argc) spirv_path = argv[++i];
 		else if (a == "--save-spirv" && i + 1 < argc) save_spirv = argv[++i];
+		else if (a == "--dump-ir" && i + 1 < argc) g_dump_ir = argv[++i];
 		else if (a == "--save-output" && i + 1 < argc) save_output = argv[++i];
 		else if (a == "--reference" && i + 1 < argc) reference = argv[++i];
 		else if (a == "--unordered" && i + 1 < argc) unordered = std::strtoull(argv[++i], nullptr, 0);
@@ -674,7 +686,16 @@ int main(int argc, char** argv) {
 	subsystems.Initialize<Log::Lifecycle>();
 	ShaderInit();
 
-	const auto capture = Load(dir);
+	auto capture = Load(dir);
+	if (compile_only) {
+		// Only the layouts, from the writes, are needed.
+		capture.objs.clear();
+		capture.ptes.clear();
+		capture.images.clear();
+		capture.views.clear();
+		capture.subs.clear();
+		capture.samplers.clear();
+	}
 	const auto parent  = dir.substr(0, dir.find_last_of('/'));
 	char       name[64];
 	std::snprintf(name, sizeof(name), "%016" PRIx64 "-%" PRIu64, capture.hash, capture.program);
@@ -696,6 +717,16 @@ int main(int argc, char** argv) {
 	std::printf("shader %016" PRIx64 " frame %" PRIu64 ": %s SPIR-V, %s the game's\n", capture.hash,
 	            capture.frame, game_spirv ? "game" : (spirv_path.empty() ? "recompiled" : "given"),
 	            compiled.spirv == game ? "identical to" : "differs from");
+	{
+		spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+		std::string          messages;
+		tools.SetMessageConsumer([&](spv_message_level_t, const char*, const spv_position_t&,
+		                             const char* message) { messages += message + std::string("\n"); });
+		spvtools::ValidatorOptions validator;
+		validator.SetScalarBlockLayout(true);
+		if (!tools.Validate(compiled.spirv.data(), compiled.spirv.size(), validator))
+			Fail("invalid SPIR-V:\n%s", messages.c_str());
+	}
 	if (!save_spirv.empty()) {
 		std::ofstream out(save_spirv, std::ios::binary);
 		out.write(reinterpret_cast<const char*>(compiled.spirv.data()),
@@ -705,8 +736,8 @@ int main(int argc, char** argv) {
 	Gpu gpu;
 	gpu.Init();
 	auto&        device = gpu.device;
-	const Mapped pre(dir + "/pre.bin");
-	const Mapped post(dir + "/post.bin");
+	const Mapped pre(compile_only ? std::string("/dev/null") : dir + "/pre.bin");
+	const Mapped post(compile_only ? std::string("/dev/null") : dir + "/post.bin");
 
 	// Buffers.
 	std::vector<Gpu::Buf> bufs(capture.objs.size());
@@ -929,6 +960,10 @@ int main(int argc, char** argv) {
 	std::printf("pipeline built in %.1f ms (wave%u)\n",
 	            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pipeline).count(),
 	            compiled.wave_size);
+	if (compile_only) {
+		std::fflush(stdout);
+		std::_Exit(0);
+	}
 
 	// Descriptor writes.
 	std::vector<std::vector<vk::DescriptorBufferInfo>> buffer_infos;
