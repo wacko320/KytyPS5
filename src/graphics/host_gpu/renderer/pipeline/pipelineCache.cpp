@@ -398,6 +398,7 @@ struct PipelineCache::ProgramCache {
 		options.stage       = stage;
 		options.maintenance8_enabled = graphics.maintenance8_enabled;
 		options.shader_hash = params.hash;
+		options.loop_watchdog_limit = Config::ShaderLoopLimit();
 		options.user_data   = user_data;
 		options.back_code      = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;

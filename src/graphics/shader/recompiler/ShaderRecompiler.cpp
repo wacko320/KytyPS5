@@ -875,6 +875,12 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::EliminateDeadCode(ir.blocks);
 
 	IR::CollectShaderInfo(ir, options.input_info);
+	ir.loop_watchdog_limit = options.loop_watchdog_limit;
+	ir.info.loop_watchdog =
+	    options.loop_watchdog_limit != 0 && !ir.dispatcher_fallback &&
+	    std::ranges::any_of(ir.blocks, [](const IR::Block* block) {
+		    return block->terminator.loop_header;
+	    });
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);

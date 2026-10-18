@@ -1,5 +1,6 @@
 #include "emulator.h"
 
+#include "common/frameProfiler.h"
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -118,6 +119,10 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	subsystems.Initialize<Libs::Controller::Lifecycle>();
 	subsystems.Initialize<Libs::Audio::Lifecycle>();
 	subsystems.Initialize<Libs::Graphics::Lifecycle>();
+
+	if (Config::ProfileStartFrame() != 0) {
+		Common::FrameProfiler::Arm(Config::ProfileStartFrame(), Config::ProfileFrameCount());
+	}
 }
 
 static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = false,

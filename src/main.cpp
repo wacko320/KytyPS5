@@ -85,6 +85,8 @@ static void PrintUsage() {
 	::printf("  --graphics-debug-dump <true|false>   Enable graphics debug dumps.\n");
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
+	::printf("  --frame-times <path>                 Append each frame's number and time (ms) to <path>.\n");
+	::printf("  --exit-frame <n>                     Quit cleanly once frame <n> is presented.\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
@@ -106,6 +108,13 @@ static void PrintUsage() {
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
+	::printf("  --shader-loop-limit <num>           Debugging: end shader loops after <num>\n"
+	         "                                       iterations and log the trip.\n");
+	::printf("  --profile-frames <start>[,<count>]  Profile <count> frames (default 100) from frame\n"
+	         "                                       <start>, write kyty-profile-*/ and quit.\n"
+	         "                                       F12 does the same from the next frame.\n");
+	::printf("  --pad-script <frame>:<Control>[,...] Press DualSense controls (--keymap names) for a\n"
+	         "                                       few frames at the given frames.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
 }
 
@@ -189,6 +198,24 @@ static bool ParseInt32(const std::string& value, int32_t& out) {
 	}
 	out = number;
 	return true;
+}
+
+static bool ParseFrameWindow(const std::string& value, uint64_t& start, uint32_t& count) {
+	const auto* begin = value.data();
+	const auto* end   = value.data() + value.size();
+	auto [next, error] = std::from_chars(begin, end, start);
+	if (error != std::errc {} || start == 0) {
+		return false;
+	}
+	count = 0;
+	if (next == end) {
+		return true;
+	}
+	if (*next != ',') {
+		return false;
+	}
+	auto [last, count_error] = std::from_chars(next + 1, end, count);
+	return count_error == std::errc {} && last == end && count != 0;
 }
 
 static bool ParseUserId(const std::string& value, int32_t& out) {
@@ -462,6 +489,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid printf direction: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--frame-times") {
+			options.config.frame_times_file = Common::PathFromUtf8(value);
+		} else if (arg == "--exit-frame") {
+			if (!ParseUint32(value, options.config.exit_frame) || options.config.exit_frame == 0) {
+				::printf("invalid exit frame: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--printf-output-file") {
 			options.config.printf_output_file = Common::PathFromUtf8(value);
 		} else if (arg == "--spirv-debug-printf") {
@@ -499,6 +533,20 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--shader-loop-limit") {
+			if (!ParseUint32(value, options.config.shader_loop_limit)) {
+				::printf("invalid shader loop limit: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--profile-frames") {
+			if (!ParseFrameWindow(value, options.config.profile_start_frame,
+			                      options.config.profile_frame_count)) {
+				::printf("invalid profile frames (expected <start>[,<count>]): %s\n",
+				         value.c_str());
+				return false;
+			}
+		} else if (arg == "--pad-script") {
+			options.config.pad_script = value;
 		} else if (arg == "--keymap") {
 			const auto split = value.find('=');
 			if (split == std::string::npos || split == 0 || split + 1 == value.size()) {

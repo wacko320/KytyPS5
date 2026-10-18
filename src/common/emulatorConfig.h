@@ -80,6 +80,10 @@ struct ConfigOptions {
 	bool                   graphics_debug_dump_enabled = false;
 	LogDirection           printf_direction            = LogDirection::Silent;
 	std::filesystem::path  printf_output_file          = "_kyty.txt";
+	// When set, each presented frame appends "<frame> <ms since the previous frame>" here.
+	std::filesystem::path  frame_times_file;
+	// When non-zero, the emulator quits (as closing the window does) once this frame is presented.
+	uint32_t               exit_frame                  = 0;
 	bool                   profiler_enabled            = false;
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   gpu_assisted_validation_enabled = false;
@@ -99,6 +103,13 @@ struct ConfigOptions {
 	Keymap keymap;
 	// Ordinary boots need a non-null argv[0]; --guest-exec supplies the caller's arguments.
 	std::vector<std::string> guest_arguments {""};
+	// "<frame>:<Control>[,...]": controls pressed for a few frames at the given frames.
+	std::string pad_script;
+	// Frame profiler capture armed from the command line: first frame (0: none) and length.
+	uint64_t profile_start_frame = 0;
+	uint32_t profile_frame_count = 0;
+	// Debugging: shader loops end after this many iterations (0: no limit).
+	uint32_t shader_loop_limit = 0;
 };
 
 void Load(const ConfigOptions& cfg);
@@ -142,6 +153,8 @@ bool GraphicsDebugDumpEnabled();
 
 LogDirection          GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();
+std::filesystem::path GetFrameTimesFile();
+uint32_t              GetExitFrame();
 
 bool ProfilerEnabled();
 
@@ -164,6 +177,10 @@ bool RedZoneProtectionEnabled();
 
 const Keymap& GetKeymap();
 const std::vector<std::string>& GetGuestArguments();
+const std::string& GetPadScript();
+uint64_t           ProfileStartFrame();
+uint32_t           ProfileFrameCount();
+uint32_t           ShaderLoopLimit();
 
 } // namespace Config
 

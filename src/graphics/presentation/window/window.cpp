@@ -1,5 +1,6 @@
 ﻿#include "graphics/presentation/window.h"
 
+#include "common/frameProfiler.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -24,6 +25,8 @@
 #include "loader/systemContent.h"
 
 #include <SDL3/SDL.h>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fmt/format.h>
@@ -189,6 +192,15 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 			case SDLK_F11:
 				if (!key.repeat) {
 					ToggleDesktopFullscreen();
+				}
+				break;
+			case SDLK_F12:
+				if (!key.repeat) {
+					// Profile the next frames, write the capture and quit.
+					Common::FrameProfiler::Arm(0, Common::FrameProfiler::DefaultFrameCount);
+					Log::WriteToConsoleAndLog(
+					    fmt::format("Frame profiler: capturing {} frames from the next one\n",
+					                Common::FrameProfiler::DefaultFrameCount));
 				}
 				break;
 			case SDLK_RETURN:
@@ -949,6 +961,52 @@ void WindowContext::UpdateIcon() {
 
 	if (icon.surface != nullptr) {
 		SDL_SetWindowIcon(window, icon.surface);
+	}
+}
+
+void WindowContext::OnFramePresented(uint64_t frame_num) {
+	// Written as it goes, so a script can follow progress and frame times of a run.
+	static FILE*    times     = nullptr;
+	static bool     opened    = false;
+	static uint64_t last_time = 0;
+	const auto      now       = Common::Timer::QueryPerformanceCounter();
+	if (!opened) {
+		opened = true;
+		if (const auto path = Config::GetFrameTimesFile(); !path.empty()) {
+			times = std::fopen(path.string().c_str(), "w");
+			if (times == nullptr) {
+				LOGF("cannot open frame times file %s\n", Common::PathToString(path).c_str());
+			}
+		}
+	}
+	if (times != nullptr) {
+		if (last_time != 0) {
+			std::fprintf(times, "%" PRIu64 " %.2f\n", frame_num,
+			             1000.0 * static_cast<double>(now - last_time) /
+			                 static_cast<double>(Common::Timer::QueryPerformanceFrequency()));
+			std::fflush(times);
+		}
+		last_time = now;
+	}
+	HostInputOnFrame(frame_num);
+	// Scripted runs end here rather than by a kill, which can leave GPU work behind.
+	if (const auto exit_frame = Config::GetExitFrame(); exit_frame != 0 && frame_num == exit_frame) {
+		SDL_Event quit {};
+		quit.type = SDL_EVENT_QUIT;
+		if (!SDL_PushEvent(&quit)) {
+			LOGF("--exit-frame: cannot post quit: %s\n", SDL_GetError());
+		}
+	}
+	if (Common::FrameProfiler::OnFrame(frame_num)) {
+		// The capture is written: quit the way closing the window does.
+		Log::WriteToConsoleAndLog(
+		    fmt::format("Frame profiler: capture written to {}\n",
+		                Common::PathToString(Common::FrameProfiler::LastOutputDirectory())));
+		SDL_Event quit {};
+		quit.type = SDL_EVENT_QUIT;
+		if (!SDL_PushEvent(&quit)) {
+			LOGF("Frame profiler: cannot post quit: %s\n", SDL_GetError());
+		}
 	}
 }
 

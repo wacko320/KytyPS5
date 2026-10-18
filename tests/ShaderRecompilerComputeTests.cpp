@@ -1357,6 +1357,7 @@ struct TestCase {
   std::vector<std::pair<u32, u32>> storage_buffer_ranges;
   std::vector<BdaMapping> bda_mappings;
   std::optional<uint64_t> fault_free_address;
+  u32 loop_watchdog_limit = 0;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   float expected_float_tolerance = 0.0f;
@@ -1680,6 +1681,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   if (test.has_compute_info) {
     options.wave_size = test.compute_info.wave_size;
   }
+  options.loop_watchdog_limit = test.loop_watchdog_limit;
 
   auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
   auto resource_plan =
@@ -16936,10 +16938,11 @@ public:
     }
 
     const bool uses_bda = Count(Kind::BdaPagetable) != 0;
-    Require(test.name, "dispatch",
-            uses_bda == (Count(Kind::FaultBuffer) != 0),
-            "BDA page table and fault buffer must be bound together");
-    if (uses_bda) {
+    // The loop watchdog reports through the fault buffer without BDA.
+    const bool uses_fault_buffer = Count(Kind::FaultBuffer) != 0;
+    Require(test.name, "dispatch", !uses_bda || uses_fault_buffer,
+            "BDA page table requires the fault buffer");
+    if (uses_fault_buffer) {
       EnsureBdaBuffers(test.name);
       bda_pagetable_info = {m_bda_pagetable_buffer.buffer, 0,
                             m_bda_pagetable_buffer.size};
@@ -16949,6 +16952,7 @@ public:
           std::pair{Kind::FaultBuffer, &fault_buffer_info},
       };
       for (const auto &[kind, info] : special_buffers) {
+        if (Count(kind) == 0) continue;
         vk::WriteDescriptorSet write{};
         write.sType = vk::StructureType::eWriteDescriptorSet;
         write.dstSet = descriptor_set;
@@ -17108,6 +17112,22 @@ public:
     }
 
     vk::CommandBuffer cmd = BeginCommands(test.name, "dispatch");
+    if (uses_fault_buffer && !uses_bda) {
+      cmd.fillBuffer(m_fault_buffer.buffer, 0, m_fault_buffer.size, 0);
+      vk::BufferMemoryBarrier barrier{};
+      barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+      barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask =
+          vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.buffer = m_fault_buffer.buffer;
+      barrier.offset = 0;
+      barrier.size = m_fault_buffer.size;
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                          vk::PipelineStageFlagBits::eComputeShader, {}, 0,
+                          nullptr, 1, &barrier, 0, nullptr);
+    }
     if (uses_bda) {
       Require(test.name, "dispatch", buffer.device_address != 0,
               "BDA test backing has no device address");
@@ -21388,6 +21408,32 @@ void CheckOpcodeCoverage(const std::vector<TestCase> &tests,
   PrintPendingOpcodes(
       CoverageClass::NeedsGraphicsStageCase,
       pending[static_cast<uint32_t>(CoverageClass::NeedsGraphicsStageCase)]);
+}
+
+TestCase LoopWatchdogEndsInfiniteLoop() {
+  using O = ShaderOpcode;
+
+  // loop: s_cmp_eq_u32 0, 0 ; s_cbranch_scc0 exit ; s_branch loop — never exits on its own.
+  // A tripped watchdog ends the invocation, so the dispatch completes and earlier stores remain.
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 7);
+  AppendStoreVgpr(&code, 0, 0);
+  code.push_back(EncodeSopc(0x06, 128, 128));
+  code.push_back(EncodeSopp(0x04, 1));
+  code.push_back(EncodeSopp(0x02, 0xfffdu));
+  AppendVMovLiteral(&code, 0, 9);
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "LoopWatchdogEndsInfiniteLoop";
+  test.code = std::move(code);
+  test.initial = {0};
+  test.expected = {7};
+  test.loop_watchdog_limit = 1000;
+  test.opcodes = {O::V_MOV_B32, O::S_CMP_EQ_U32, O::S_CBRANCH_SCC0, O::S_BRANCH,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
 }
 
 TestCase IntegerAddSubMul() {
@@ -42295,6 +42341,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(BufferWorkgroupPublication(64, false, true));
 
   AddCase(IntegerAddSubMul);
+  AddCase(LoopWatchdogEndsInfiniteLoop);
   AddCase(BitwiseOps);
   AddCase(Shifts);
   AddCase(ScalarZeroShiftWithRuntimeCount);
@@ -48247,6 +48294,50 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, CvtPkrtzF16F32SdwaAndOutputModifiers());
     return 0;
   }
+  // Case selection, without the device checks of a full run:
+  //   --list-cases               print "<index> <name>" for every compute case
+  //   --case <name>...           run the named compute cases
+  //   --cases-only [first-index] run every compute case from first-index on; each prints
+  //                              "case <index> <name>" first, so a driver can resume after the
+  //                              case that aborted
+  if (argc >= 2 && (std::strcmp(argv[1], "--list-cases") == 0 ||
+                    std::strcmp(argv[1], "--case") == 0 ||
+                    std::strcmp(argv[1], "--cases-only") == 0)) {
+    const auto tests = MakeCases();
+    if (std::strcmp(argv[1], "--list-cases") == 0) {
+      for (size_t index = 0; index < tests.size(); index++) {
+        std::printf("%zu %s\n", index, tests[index].name);
+      }
+      return 0;
+    }
+    VulkanHarness vulkan;
+    if (std::strcmp(argv[1], "--cases-only") == 0) {
+      const size_t first = argc > 2 ? std::strtoul(argv[2], nullptr, 0) : 0u;
+      for (size_t index = first; index < tests.size(); index++) {
+        std::printf("case %zu %s\n", index, tests[index].name);
+        RunCase(&vulkan, tests[index]);
+      }
+      return 0;
+    }
+    if (argc < 3) {
+      std::fprintf(stderr, "--case needs at least one case name\n");
+      return 2;
+    }
+    for (int arg = 2; arg < argc; arg++) {
+      bool found = false;
+      for (const auto &test : tests) {
+        if (std::strcmp(test.name, argv[arg]) == 0) {
+          RunCase(&vulkan, test);
+          found = true;
+        }
+      }
+      if (!found) {
+        std::fprintf(stderr, "ShaderRecompilerComputeTests: no compute case named %s\n", argv[arg]);
+        return 2;
+      }
+    }
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeThreadDimensions(vulkan);
@@ -48311,6 +48402,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferAtomicAddX2GlcAndExec());
     RunCase(&vulkan, ImageAtomicSignedMinMax<false>());
     RunCase(&vulkan, ImageAtomicSignedMinMax<true>());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--loop-watchdog-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, LoopWatchdogEndsInfiniteLoop());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {

@@ -54,6 +54,8 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	// A shader that reports through the fault buffer (the loop watchdog) was recorded.
+	void               RequestFaultProcessing() { m_fault_process_pending = true; }
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);

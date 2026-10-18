@@ -7,10 +7,12 @@
 
 namespace Common::DebugCounters {
 
-static_assert(std::atomic<uint64_t>::is_always_lock_free && std::atomic<bool>::is_always_lock_free);
+static_assert(std::atomic<uint64_t>::is_always_lock_free &&
+              std::atomic<uint8_t>::is_always_lock_free);
 
-// Collect events only while the panel is visible. Relaxed, lock-free atomics keep updates
-// cheap and safe in signal handlers. Rates come from comparing two snapshots.
+// Collect events only while the panel is visible or a frame profiler capture runs. Relaxed,
+// lock-free atomics keep updates cheap and safe in signal handlers. Rates come from comparing two
+// snapshots.
 enum class Counter {
 	// GPU work.
 	Draws,
@@ -50,21 +52,45 @@ enum class Counter {
 enum class Peak { ShaderCompileNs, PipelineCreateNs, Count };
 
 namespace Detail {
-inline std::atomic<bool>     g_enabled {false};
+// Who collects: the panel, the frame profiler.
+inline constexpr uint8_t     PANEL    = 1u;
+inline constexpr uint8_t     PROFILER = 2u;
+inline std::atomic<uint8_t>  g_collectors {0};
 inline std::atomic<uint64_t> g_counters[static_cast<int>(Counter::Count)] {};
 inline std::atomic<uint64_t> g_peaks[static_cast<int>(Peak::Count)] {};
 } // namespace Detail
 
+// Whether the panel is shown.
 [[nodiscard]] inline bool Enabled() noexcept {
-	return Detail::g_enabled.load(std::memory_order_relaxed);
+	return (Detail::g_collectors.load(std::memory_order_relaxed) & Detail::PANEL) != 0;
 }
 
 inline void SetEnabled(bool enabled) noexcept {
-	Detail::g_enabled.store(enabled, std::memory_order_relaxed);
+	if (enabled) {
+		Detail::g_collectors.fetch_or(Detail::PANEL, std::memory_order_relaxed);
+	} else {
+		Detail::g_collectors.fetch_and(static_cast<uint8_t>(~Detail::PANEL),
+		                               std::memory_order_relaxed);
+	}
+}
+
+// Whether events are counted: for the panel or a frame profiler capture.
+[[nodiscard]] inline bool Collecting() noexcept {
+	return Detail::g_collectors.load(std::memory_order_relaxed) != 0;
+}
+
+// The frame profiler reads these counters during a capture, without showing the panel.
+inline void SetProfilerCollecting(bool collecting) noexcept {
+	if (collecting) {
+		Detail::g_collectors.fetch_or(Detail::PROFILER, std::memory_order_relaxed);
+	} else {
+		Detail::g_collectors.fetch_and(static_cast<uint8_t>(~Detail::PROFILER),
+		                               std::memory_order_relaxed);
+	}
 }
 
 inline void Add(Counter counter, uint64_t value = 1) noexcept {
-	if (!Enabled()) {
+	if (!Collecting()) {
 		return;
 	}
 	Detail::g_counters[static_cast<int>(counter)].fetch_add(value, std::memory_order_relaxed);
@@ -74,10 +100,10 @@ class ScopedTimer final {
 public:
 	ScopedTimer(Counter count, Counter duration, Peak peak = Peak::Count)
 	    : m_count(count), m_duration(duration), m_peak(peak),
-	      m_start(Enabled() ? std::chrono::steady_clock::now()
+	      m_start(Collecting() ? std::chrono::steady_clock::now()
 	                        : std::chrono::steady_clock::time_point {}) {}
 	~ScopedTimer() {
-		if (m_start == std::chrono::steady_clock::time_point {} || !Enabled()) {
+		if (m_start == std::chrono::steady_clock::time_point {} || !Collecting()) {
 			return;
 		}
 		const auto elapsed =

@@ -37,6 +37,8 @@ void               HostInputDisconnectGamepadTouchPad(int id);
 [[nodiscard]] HostInputTouchPadVisualState GetHostInputTouchPadVisualState();
 void               HostInputToggleMouseToJoystick();
 [[nodiscard]] bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms);
+// Plays --pad-script: call once per presented frame.
+void               HostInputOnFrame(uint64_t frame);
 
 } // namespace Libs::Graphics
 

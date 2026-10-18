@@ -11,6 +11,21 @@
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
+void EmitLoopWatchdogReport(EmitterState& state, uint32_t loop_id) {
+	if (state.fault_buffer_variable == 0) {
+		return;
+	}
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          state.fault_buffer_variable, ConstantU32(state, 0),
+	                          ConstantU32(state, LoopWatchdogWord(state.program.shader_hash)));
+	const auto old = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), old, pointer);
+	state.builder.AddFunction(
+	    spv::OpStore, pointer,
+	    Binary(state, spv::OpBitwiseOr, TypeU32(state), old,
+	           ConstantU32(state, 1u << (loop_id & 31u))));
+}
 namespace {
 
 void EmitKillIfBoolFalse(EmitterState& state, uint32_t active) {
@@ -118,6 +133,39 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 			const auto* target = term.true_block;
 			if (target == nullptr) {
 				EmitReturn(ctx);
+				return;
+			}
+			if (term.loop_header && ctx.state.loop_watchdog_variable != 0 &&
+			    term.merge_block != nullptr && term.continue_block != nullptr &&
+			    target != term.merge_block && term.continue_block != block && target != block &&
+			    (target->empty() || target->begin()->GetOpcode() != IR::ValueOpcode::Phi)) {
+				// Loop header: end the invocation once it has iterated too often. A check block
+				// between the header and its target returns from the loop body, which is a
+				// structured exit, so no merge or header Phi gains an edge; only the target's
+				// predecessor changes, hence the Phi-free target requirement.
+				auto&      builder = ctx.state.builder;
+				const auto check   = builder.AllocateId();
+				const auto tripped = builder.AllocateId();
+				emit_merge();
+				builder.AddFunction(spv::OpBranch, check);
+				EmitLabel(ctx.state, check);
+				const auto count = builder.AllocateId();
+				builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), count,
+				                    ctx.state.loop_watchdog_variable);
+				const auto next = Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state), count,
+				                         ConstantU32(ctx.state, 1));
+				builder.AddFunction(spv::OpStore, ctx.state.loop_watchdog_variable, next);
+				const auto again =
+				    Binary(ctx.state, spv::OpULessThan, TypeBool(ctx.state), next,
+				           ConstantU32(ctx.state, ctx.state.program.loop_watchdog_limit));
+				const auto ok = builder.AllocateId();
+				builder.AddFunction(spv::OpSelectionMerge, ok, spv::SelectionControlMaskNone);
+				builder.AddFunction(spv::OpBranchConditional, again, ok, tripped);
+				EmitLabel(ctx.state, tripped);
+				EmitLoopWatchdogReport(ctx.state, block->id);
+				EmitReturn(ctx);
+				EmitLabel(ctx.state, ok);
+				builder.AddFunction(spv::OpBranch, target->Definition());
 				return;
 			}
 			emit_merge();
@@ -707,6 +755,13 @@ void EmitProgram(EmitterState& state) {
 		state.builder.AddFunction(spv::OpVariable,
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.pixel_valid_mask_variable, spv::StorageClassFunction);
+	}
+	if (state.program.info.loop_watchdog) {
+		state.loop_watchdog_variable = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.loop_watchdog_variable, spv::StorageClassFunction,
+		                          ConstantU32(state, 0));
 	}
 	for (uint32_t half = 0; half < state.lane_count; half++) {
 		auto& lane = half == 0 ? ctx : high;

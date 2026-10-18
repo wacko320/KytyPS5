@@ -394,6 +394,8 @@ function(configure_macos_guest_address_space target)
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+# Offline oracle: translates raw compute shader dumps; not a test.
+add_kyty_full_emulator_test(shader_dump_tool "${KYTY_TESTS_DIR}/ShaderDumpTool.cpp")
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
@@ -418,6 +420,12 @@ add_executable(archive_file_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(archive_file_tests common ZArchive::zarchive)
 target_include_directories(archive_file_tests PRIVATE ${inc_headers})
+
+add_executable(frame_profiler_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FrameProfilerTests.cpp"
+)
+target_link_libraries(frame_profiler_tests common)
+target_include_directories(frame_profiler_tests PRIVATE ${inc_headers})
 
 add_executable(trophy_system_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/TrophySystemTests.cpp"
@@ -625,11 +633,18 @@ if(BUILD_TESTING)
 	add_test(NAME emulator_present_mode_invalid
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME emulator_exit_frame_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --exit-frame 3200)
+	add_test(NAME emulator_exit_frame_invalid
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --exit-frame 0)
+	set_tests_properties(emulator_exit_frame_invalid PROPERTIES
+	                     PASS_REGULAR_EXPRESSION "invalid exit frame")
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
+	add_test(NAME frame_profiler COMMAND $<TARGET_FILE:frame_profiler_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
 	add_test(NAME trophy_system COMMAND $<TARGET_FILE:trophy_system_tests>)
@@ -657,6 +672,8 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
+	add_test(NAME shader_recompiler_loop_watchdog
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --loop-watchdog-only)
 	add_test(NAME graphics_pipeline_rasterization
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
 	add_test(NAME graphics_draw_offsets
@@ -711,6 +728,7 @@ if(BUILD_TESTING)
 		page_manager_tests
 		archive_file_tests
 		trophy_system_tests
+		frame_profiler_tests
 		avplayer_file_tests
 		vdecsw_tests
 		bit_array_tests

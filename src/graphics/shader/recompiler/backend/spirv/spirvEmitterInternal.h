@@ -114,6 +114,8 @@ struct EmitterState {
 	std::vector<uint32_t>                           memory_byte_offsets;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
+	// The per-invocation loop iteration count (CompileOptions::loop_watchdog_limit), or 0.
+	uint32_t                                         loop_watchdog_variable  = 0;
 	uint32_t                                         bda_pointer_function    = 0;
 	uint32_t                                         indirect_format_function = 0;
 	uint32_t                                         indirect_format_geometry_function = 0;
@@ -651,6 +653,14 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	EmitAtomicMemoryBarrier(state, kind);
 	return observed;
 }
+
+// Loop watchdog trip reports mark bit (loop id % 32) of fault-buffer word 1 + (shader hash %
+// 1024); the host logs faults on those never-mapped low pages.
+constexpr uint32_t LoopWatchdogWords = 1024;
+constexpr uint32_t LoopWatchdogWord(uint64_t shader_hash) {
+	return 1u + static_cast<uint32_t>(shader_hash % LoopWatchdogWords);
+}
+void EmitLoopWatchdogReport(EmitterState& state, uint32_t loop_id);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
 

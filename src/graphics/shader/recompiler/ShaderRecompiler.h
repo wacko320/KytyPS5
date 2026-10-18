@@ -27,6 +27,9 @@ struct CompileOptions {
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
+	// Debugging (--shader-loop-limit): structured loops end the invocation after this many
+	// iterations and report through the fault buffer (0: no watchdog).
+	uint32_t                    loop_watchdog_limit = 0;
 };
 
 struct TranslateResult {

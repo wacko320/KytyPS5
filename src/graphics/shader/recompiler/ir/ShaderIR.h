@@ -508,6 +508,9 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                            has_bitwise_xor               = false;
 	bool                            uses_dma                      = false;
+	// The loop watchdog (CompileOptions::loop_watchdog_limit) is on and the program has loops:
+	// it reports through the fault buffer.
+	bool                            loop_watchdog                 = false;
 	bool                            uses_swizzle                  = false;
 	bool                            uses_lds                      = false;
 	bool                            uses_gds                      = false;
@@ -705,6 +708,7 @@ struct Program: ResourcePlan {
 	uint32_t                      wave_size      = 64;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
+	uint32_t                      loop_watchdog_limit = 0;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
 	struct ScalarWrite { uint32_t pc; ScalarReg reg; Value value; };

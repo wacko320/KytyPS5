@@ -44,6 +44,8 @@ struct WindowContext {
 	void                                                    RefreshSurfaceCapabilities();
 	void                                                    UpdateIcon();
 	void UpdateTitle(uint64_t frame_num, double current_fps);
+	// Presentation thread, once per presented frame (1 for the first).
+	void OnFramePresented(uint64_t frame_num);
 	void                                                    Resize(int width, int height);
 	void ProcessWindowEvent(const SDL_WindowEvent& event);
 	void ProcessDisplayEvent(const SDL_DisplayEvent& event);

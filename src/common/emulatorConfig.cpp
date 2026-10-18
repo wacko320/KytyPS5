@@ -165,6 +165,14 @@ std::filesystem::path GetPrintfOutputFile() {
 	return g_config->printf_output_file;
 }
 
+std::filesystem::path GetFrameTimesFile() {
+	return g_config->frame_times_file;
+}
+
+uint32_t GetExitFrame() {
+	return g_config->exit_frame;
+}
+
 bool ProfilerEnabled() {
 	return g_config->profiler_enabled;
 }
@@ -218,6 +226,22 @@ bool RedZoneProtectionEnabled() {
 	return g_config->red_zone_protection_enabled;
 }
 #endif
+
+const std::string& GetPadScript() {
+	return g_config->pad_script;
+}
+
+uint64_t ProfileStartFrame() {
+	return g_config->profile_start_frame;
+}
+
+uint32_t ProfileFrameCount() {
+	return g_config->profile_frame_count;
+}
+
+uint32_t ShaderLoopLimit() {
+	return g_config->shader_loop_limit;
+}
 
 const Keymap& GetKeymap() {
 	return g_config->keymap;

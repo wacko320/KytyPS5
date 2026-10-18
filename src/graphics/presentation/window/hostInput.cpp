@@ -9,13 +9,16 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -255,7 +258,8 @@ public:
 
 			const bool reserved = binding.key == SDLK_ESCAPE || binding.key == SDLK_F1 ||
 			                      binding.key == SDLK_F2 || binding.key == SDLK_F7 ||
-			                      binding.key == SDLK_F8 || binding.key == SDLK_F11;
+			                      binding.key == SDLK_F8 || binding.key == SDLK_F11 ||
+			                      binding.key == SDLK_F12;
 			if (binding.control == INVALID_CONTROL || reserved ||
 			    (binding.key == SDLK_UNKNOWN && binding.mouse_button == 0)) {
 				EXIT("Invalid input mapping: %s\n", value.c_str());
@@ -739,9 +743,48 @@ void HostInputDisconnectGamepad(int id) {
 	g_pad_trigger_pressed.erase(id);
 	HostInputDisconnectGamepadTouchPad(id);
 }
+namespace {
+
+struct PadScriptStep {
+	uint64_t    frame   = 0;
+	std::size_t control = INVALID_CONTROL;
+};
+
+// Frames a scripted control stays pressed, so a game polling once per frame sees it.
+constexpr uint64_t PAD_SCRIPT_HOLD_FRAMES = 6;
+
+std::vector<PadScriptStep> g_pad_script;
+
+std::vector<PadScriptStep> ParsePadScript(std::string_view script) {
+	std::vector<PadScriptStep> steps;
+	while (!script.empty()) {
+		const auto comma = script.find(',');
+		const auto item  = script.substr(0, comma);
+		script           = comma == std::string_view::npos ? std::string_view {}
+		                                                   : script.substr(comma + 1);
+		const auto  colon = item.find(':');
+		PadScriptStep step;
+		const auto  frame = colon == std::string_view::npos ? std::string_view {} : item.substr(0, colon);
+		const auto  name  = colon == std::string_view::npos ? std::string_view {} : item.substr(colon + 1);
+		const auto [end, error] = std::from_chars(frame.data(), frame.data() + frame.size(), step.frame);
+		step.control            = ControlFromName(name);
+		if (frame.empty() || error != std::errc {} || end != frame.data() + frame.size() ||
+		    step.frame == 0 || step.control == INVALID_CONTROL) {
+			EXIT("invalid --pad-script step '%.*s' (expected <frame>:<Control>)\n",
+			     static_cast<int>(item.size()), item.data());
+		}
+		steps.push_back(step);
+	}
+	std::sort(steps.begin(), steps.end(),
+	          [](const auto& a, const auto& b) { return a.frame < b.frame; });
+	return steps;
+}
+
+} // namespace
 
 void HostInputInit(SDL_Window* window) {
 	GetInputMap();
+	g_pad_script = ParsePadScript(Config::GetPadScript());
 	g_mouse_window = window;
 	if (Config::HideCursorEnabled()) {
 		g_cursor_hide_at = SDL_GetTicks() + CURSOR_IDLE_HIDE_MS;
@@ -768,6 +811,16 @@ void HostInputShutdown() {
 	g_cursor_hide_at = 0;
 	if (Config::HideCursorEnabled()) {
 		SDL_ShowCursor();
+	}
+}
+
+void HostInputOnFrame(uint64_t frame) {
+	for (const auto& step: g_pad_script) {
+		if (step.frame == frame) {
+			SetControl(step.control, true);
+		} else if (step.frame + PAD_SCRIPT_HOLD_FRAMES == frame) {
+			SetControl(step.control, false);
+		}
 	}
 }
 

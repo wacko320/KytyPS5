@@ -134,6 +134,21 @@ void FaultManager::ProcessFaultBuffer() {
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
 		const auto  count  = static_cast<uint32_t>(faults[0]);
 		for (uint32_t index = 1; index <= count; ++index) {
+			// --shader-loop-limit reports tripped loops as faults on the never-mapped low pages
+			// (word = 1 + shader hash % 1024, bit = loop header id % 32).
+			// The first 32 pages hold no watchdog words: a fault there is a near-null guest pointer,
+			// which has nothing to cache either.
+			if (faults[index] < 32ull * (1 + 1024) * BufferCache::CACHING_PAGESIZE) {
+				const auto page = faults[index] / BufferCache::CACHING_PAGESIZE;
+				if (page < 32) {
+					continue;
+				}
+				LOGF_COLOR(Log::Color::BrightRed,
+				           "Shader loop watchdog tripped: shader hash %% 1024 = 0x%03" PRIx64
+				           ", loop id %" PRIu64 " (mod 32)\n",
+				           page / 32 - 1, page % 32);
+				continue;
+			}
 			const auto address = BufferCache::GuestAddress(faults[index]);
 			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
 			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
