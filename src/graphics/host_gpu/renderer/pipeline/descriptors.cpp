@@ -991,6 +991,11 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
 	bool uses_dma = false;
+	for (auto* stage: stages) {
+		if (stage->runtime->program->info.uses_dma) {
+			m_context.PrefetchBda(stage->runtime->resources->dma_prefetch);
+		}
+	}
 	FindBuffers(stages);
 	for (auto* stage: stages) {
 		uses_dma |= stage->runtime->program->info.uses_dma;

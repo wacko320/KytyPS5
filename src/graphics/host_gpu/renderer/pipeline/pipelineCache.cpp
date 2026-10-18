@@ -415,6 +415,9 @@ struct PipelineCache::ProgramCache {
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 			runtime.indirect_args_address = input_info.indirect_args_address;
+			if (input_info.dispatch_thread_indirect) {
+				runtime.indirect_args_group_size = input_info.threads_num;
+			}
 		}
 		bool source_changed = false;
 		uint32_t plan_generation = 0;

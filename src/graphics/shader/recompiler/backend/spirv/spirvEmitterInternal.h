@@ -232,6 +232,13 @@ uint32_t EmitGlsl(EmitterState& state, Args... args) {
 	return EmitNative<spv::OpExtInst, type>(state, GlslStd450(state), opcode, args...);
 }
 
+// A thread-dimension indirect dispatch: the thread counts are read through a device address.
+[[nodiscard]] inline bool UsesIndirectDispatchThreads(const EmitterState& state) {
+	return state.program.stage == ShaderType::Compute && state.input_info.compute != nullptr &&
+	       state.input_info.compute->dispatch_thread_dimensions &&
+	       state.input_info.compute->dispatch_thread_indirect;
+}
+
 inline uint32_t Unary(EmitterState& state, spv::Op opcode, uint32_t type, uint32_t value) {
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(opcode, type, result, value);

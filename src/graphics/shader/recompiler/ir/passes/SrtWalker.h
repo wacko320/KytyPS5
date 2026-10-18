@@ -20,6 +20,9 @@ struct SrtRuntime {
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
 	uint64_t                  indirect_args_address = 0;
+	// Set when the indirect arguments are thread counts (USE_THREAD_DIMENSIONS): the workgroup
+	// size per axis, which the counts are rounded up to whole workgroups of.
+	std::span<const uint32_t> indirect_args_group_size;
 };
 
 class SrtReadCapture {

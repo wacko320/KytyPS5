@@ -3,6 +3,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/frameProfiler.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -13,6 +14,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
+#include "graphics/host_gpu/renderer/indirectThreadDispatch.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -221,6 +223,14 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
 		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
 		            sizeof(input.workgroup_counts));
+		if (input.dispatch_thread_dimensions) {
+			// Thread counts, rounded up to whole workgroups as the GPU conversion does.
+			for (uint32_t axis = 0; axis < 3u; ++axis) {
+				const auto size    = std::max(input.threads_num[axis], 1u);
+				const auto threads = input.workgroup_counts[axis];
+				input.workgroup_counts[axis] = threads / size + (threads % size != 0u);
+			}
+		}
 	}
 	// LDS has no contents to preserve between dispatches. The existing shader hazard
 	// barriers also order other users of this GPU-only utility buffer.
@@ -355,6 +365,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		std::copy(std::begin(input_info.dispatch_threads_num), std::end(input_info.dispatch_threads_num),
 		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
 	}
+	if (program.info.uses_dma) {
+		m_context.PrefetchBda(resources.dma_prefetch);
+	}
 	PreparedBindings* descriptor_stage = &bindings;
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	if (program.info.uses_dma) {
@@ -450,6 +463,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+	if (use_thread_dimensions) {
+		Common::FrameProfiler::Add(Common::FrameProfiler::Counter::ComputeThreadDimensionDispatches);
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -459,10 +475,23 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ResetBindings();
 }
 
+RenderExecutor::RenderExecutor(RenderContext& context): m_context(context) {}
+
+RenderExecutor::~RenderExecutor() = default;
+
+IndirectThreadDispatch& RenderExecutor::IndirectThreads() {
+	if (m_indirect_threads == nullptr) {
+		m_indirect_threads = std::make_unique<IndirectThreadDispatch>(
+		    m_context.GetGraphics(), m_context.GetCommandScheduler());
+	}
+	return *m_indirect_threads;
+}
+
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
                                       uint64_t args_addr, uint32_t mode, bool async_compute) {
-	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
-	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
+	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0);
+	const bool use_thread_dimensions =
+	    (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	m_context.GetCommandScheduler().PopPendingOperations();
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
@@ -481,15 +510,21 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute = async_compute;
 	input_info.indirect_args_address = args_addr;
+	// Thread counts only the GPU may know: the shader reads them through a device address.
+	input_info.dispatch_thread_dimensions = use_thread_dimensions;
+	input_info.dispatch_thread_indirect   = use_thread_dimensions;
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
+	const auto& program = *input_info.stage.program;
+	if (program.info.uses_dma) {
+		m_context.PrefetchBda(input_info.stage.resources->dma_prefetch);
+	}
 	PreparedBindings* descriptor_stage = &bindings;
 	FindBuffers(std::span {&descriptor_stage, 1u});
-	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	} else if (program.info.loop_watchdog) {
@@ -501,6 +536,23 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
+	// Thread-dimension arguments are converted on the GPU: earlier dispatches of this submission
+	// may still be computing them. Record the conversion before binding this pipeline.
+	auto indirect_buffer = args_buffer->Handle();
+	auto indirect_offset = static_cast<uint64_t>(args_offset);
+	if (use_thread_dimensions) {
+		const auto converted = IndirectThreads().Convert(
+		    buffer.Handle(), indirect_buffer, indirect_offset,
+		    {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
+		     cs_regs.cs_regs.num_thread_z});
+		indirect_buffer = converted.buffer;
+		indirect_offset = converted.offset;
+		if (const auto dword = program.bindings.dispatch_thread_dword;
+		    dword != ShaderRecompiler::IR::PushData::NoStart) {
+			bindings.shader_data[dword]      = static_cast<uint32_t>(converted.threads_address);
+			bindings.shader_data[dword + 1u] = static_cast<uint32_t>(converted.threads_address >> 32u);
+		}
+	}
 	RebindBuffers(bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
@@ -525,8 +577,19 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+	if (Common::FrameProfiler::Active()) {
+		using Common::FrameProfiler::Counter;
+		Common::FrameProfiler::Add(Counter::ComputeIndirectDispatches);
+		if (use_thread_dimensions) {
+			Common::FrameProfiler::Add(Counter::ComputeThreadDimensionDispatches);
+		}
+		if (m_context.GetBufferCache().HasGpuDirtyBytes(args_addr,
+		                                                sizeof(vk::DispatchIndirectCommand))) {
+			Common::FrameProfiler::Add(Counter::ComputeIndirectArgsGpuWritten);
+		}
+	}
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	if (bindings.uses_bindless) {
 		m_context.GetBindlessHeap().Finish();

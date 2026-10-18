@@ -10933,6 +10933,9 @@ public:
         DispatchCase{{1, 1, 0}, 0x41u, 0},
         DispatchCase{{3, 1, 1}, 0x41u, 12, true},
         DispatchCase{{8, 1, 1}, 0x61u, 8},
+        // Thread counts converted on the GPU; the last group of 4 runs two lanes.
+        DispatchCase{{6, 1, 1}, 0x61u, 6},
+        DispatchCase{{0, 1, 1}, 0x61u, 0},
     };
 
     // Separate DWORD descriptors preserve two owners until the indirect argument
@@ -11088,9 +11091,9 @@ public:
                   CpOpDispatchIndirect(processor, 0xc0011600u, packet.data(), 0, 0) == 2,
                   "the offset indirect packet was not consumed");
         }
+        Require(name, "asynchronous indirect dispatch", scheduler.CurrentTick() == tick,
+                "indirect arguments caused a host submission or readback");
         if (test.mode == 0x41u) {
-          Require(name, "asynchronous indirect dispatch", scheduler.CurrentTick() == tick,
-                  "workgroup-count arguments caused a host submission or readback");
           if (!test.transfer) {
             const auto merged = BufferCacheTestAccess::PageOwner(cache, args);
             Require(name, "argument/output owner merge",
@@ -16946,6 +16949,20 @@ public:
       std::copy_n(test.compute_info.dispatch_threads_num, 3,
                   shader_data.begin() + layout.dispatch_thread_dword);
     }
+    // An indirect thread-dimension dispatch reads its counts through a device address.
+    Buffer dispatch_threads_buffer;
+    if (layout.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart &&
+        test.compute_info.dispatch_thread_indirect) {
+      dispatch_threads_buffer = CreateStorageBuffer(
+          test.name,
+          {std::begin(test.compute_info.dispatch_threads_num),
+           std::end(test.compute_info.dispatch_threads_num)},
+          3, true);
+      const auto address = dispatch_threads_buffer.device_address;
+      shader_data[layout.dispatch_thread_dword] = static_cast<u32>(address);
+      shader_data[layout.dispatch_thread_dword + 1] = static_cast<u32>(address >> 32u);
+      shader_data[layout.dispatch_thread_dword + 2] = 0;
+    }
     auto Count = [&](Kind kind) {
       return layout.descriptor_counts[static_cast<size_t>(kind)];
     };
@@ -17590,6 +17607,9 @@ public:
     }
     if (user_data_buffer.buffer != nullptr) {
       DestroyBuffer(&user_data_buffer);
+    }
+    if (dispatch_threads_buffer.buffer != nullptr) {
+      DestroyBuffer(&dispatch_threads_buffer);
     }
     DestroyBuffer(&shared_buffer);
     m_device.destroyDescriptorPool(descriptor_pool, nullptr);
@@ -39035,10 +39055,17 @@ void CheckComputeThreadDimensions(VulkanHarness &vulkan) {
   const std::array extents = {std::array{9u, 5u, 3u}, std::array{13u, 7u, 4u},
                               std::array{3u, 2u, 1u}, std::array{16u, 8u, 4u}};
   for (const u32 wave_size : {32u, 64u}) {
-    for (const bool thread_dimensions : {false, true}) {
+    for (const int variant : {0, 1, 2}) {
+      // 0: workgroup counts; 1: thread counts in shader data; 2: thread counts an indirect
+      // dispatch leaves on the GPU, read through a device address.
+      const bool thread_dimensions = variant != 0;
+      const bool indirect = variant == 2;
       TestCase test;
-      test.name = thread_dimensions ? (wave_size == 32 ? "ThreadDimensions32" : "ThreadDimensions64")
-                                    : (wave_size == 32 ? "GroupDimensions32" : "GroupDimensions64");
+      test.name = indirect ? (wave_size == 32 ? "IndirectThreadDimensions32"
+                                              : "IndirectThreadDimensions64")
+                  : thread_dimensions
+                      ? (wave_size == 32 ? "ThreadDimensions32" : "ThreadDimensions64")
+                      : (wave_size == 32 ? "GroupDimensions32" : "GroupDimensions64");
       auto &code = test.code;
       code.push_back(EncodeSop1(0x04, 20, 126)); // Save the SPI-provided initial EXEC.
       AppendSMovLiteral(&code, 24, grid_size * 4);
@@ -39078,6 +39105,7 @@ void CheckComputeThreadDimensions(VulkanHarness &vulkan) {
       test.compute_info.thread_ids_num = 3;
       test.compute_info.workgroup_register = 4;
       test.compute_info.dispatch_thread_dimensions = thread_dimensions;
+      test.compute_info.dispatch_thread_indirect = indirect;
       test.has_compute_info = true;
       test.expand_shader_data_storage = thread_dimensions && wave_size == 32;
       const auto compiled = CompileCase(test, vulkan.SubgroupSize());

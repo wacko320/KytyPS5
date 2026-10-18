@@ -374,6 +374,7 @@ public:
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
 		m_info.uses_dma = false;
+		m_program.dma_prefetches.clear();
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
 
@@ -3740,6 +3741,25 @@ private:
 		return true;
 	}
 
+	// Records a scalar DMA load whose address the host can evaluate (ResourcePlan::dma_prefetches).
+	void AddDmaPrefetch(const Inst& inst, const MemoryInfo& memory) {
+		static constexpr size_t MaxDmaPrefetches = 32;
+		if (memory.kind != ResourceKind::ScalarAddress || inst.NumArgs() < 2 ||
+		    m_program.dma_prefetches.size() >= MaxDmaPrefetches) {
+			return;
+		}
+		const auto* handle = inst.Arg(0).Resolve().TryInstruction();
+		DmaPrefetch prefetch {handle->Arg(0).Resolve(), handle->Arg(1).Resolve(),
+		                      inst.Arg(1).Resolve(), static_cast<int32_t>(memory.offset)};
+		for (const auto value: {prefetch.low, prefetch.high, prefetch.offset}) {
+			if (value.GetType() != Type::U32 ||
+			    !ValidateRuntimeValue(m_program, value, RuntimeValueType::Integer)) {
+				return;
+			}
+		}
+		m_program.dma_prefetches.push_back(prefetch);
+	}
+
 	void ValidateAddressHandle(Value value, uint32_t pc) const {
 		const auto* handle = value.Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource) {
@@ -4061,6 +4081,7 @@ private:
 				m_program.has_address_writes = true;
 			}
 			m_info.uses_dma = true;
+			AddDmaPrefetch(inst, memory);
 			return;
 		}
 

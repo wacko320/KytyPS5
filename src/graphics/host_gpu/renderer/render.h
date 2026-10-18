@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -144,9 +145,12 @@ private:
 	friend class CommandScheduler;
 };
 
+class IndirectThreadDispatch;
+
 class RenderExecutor {
 public:
-	explicit RenderExecutor(RenderContext& context): m_context(context) {}
+	explicit RenderExecutor(RenderContext& context);
+	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
@@ -167,6 +171,7 @@ public:
 	                        std::span<PreparedBindings* const> bindings);
 
 private:
+	[[nodiscard]] IndirectThreadDispatch& IndirectThreads();
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
@@ -218,6 +223,7 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	std::unique_ptr<IndirectThreadDispatch> m_indirect_threads;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

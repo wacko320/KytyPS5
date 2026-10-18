@@ -37,6 +37,8 @@ struct ResourceSnapshot {
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<uint32_t>        user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
+	// Guest addresses of ResourcePlan::dma_prefetches that evaluated.
+	std::vector<uint64_t>        dma_prefetch;
 	UniformFill                 uniform_fill;
 };
 

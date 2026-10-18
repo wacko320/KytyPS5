@@ -17,6 +17,7 @@
 #include "kernel/eventQueue.h"
 
 #include <memory>
+#include <span>
 #include <shared_mutex>
 #include <vector>
 
@@ -61,6 +62,9 @@ public:
 	}
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	// Gives the pages of host-computed scalar DMA addresses cache buffers before a dispatch or
+	// draw, so the BDA table maps them and first reads of fresh guest memory do not return zero.
+	void               PrefetchBda(std::span<const uint64_t> addresses);
 	void               PrepareBda();
 	// A shader that reports through the fault buffer (the loop watchdog) was recorded.
 	void               RequestFaultProcessing() { m_fault_process_pending = true; }

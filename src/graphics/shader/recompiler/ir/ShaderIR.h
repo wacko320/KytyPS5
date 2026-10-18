@@ -638,6 +638,16 @@ struct SrtRead {
 	bool operator==(const SrtRead& other) const = default;
 };
 
+// A scalar DMA load whose guest address the host can compute before the dispatch
+// (address = {low, high} + immediate + offset). The dispatch maps its page into the BDA table
+// first, so the load does not read zero from a page no cache buffer holds yet.
+struct DmaPrefetch {
+	Value   low;
+	Value   high;
+	Value   offset;
+	int32_t immediate = 0;
+};
+
 struct ResourceBlock {
 	// Conditional successors are ordered true, false; an empty condition follows every edge.
 	Value                 condition;
@@ -708,6 +718,7 @@ struct ResourcePlan {
 	std::vector<ResourceBlock>          control_flow;
 	std::unordered_map<const Inst*, std::vector<uint32_t>> control_phi_predecessors;
 	std::vector<SrtRead>                srt_reads;
+	std::vector<DmaPrefetch>            dma_prefetches;
 	bool                                requires_specialization_memory = false;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
 	bool                                capture_specialization_reads = false;

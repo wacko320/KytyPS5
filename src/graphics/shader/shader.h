@@ -165,6 +165,9 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	uint64_t           indirect_args_address       = 0;
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
+	// With dispatch_thread_dimensions: the thread counts are only on the GPU (an indirect
+	// dispatch). The shader-data dwords at dispatch_thread_dword then hold their device address.
+	bool               dispatch_thread_indirect   = false;
 	bool               lds_storage                = false;
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;

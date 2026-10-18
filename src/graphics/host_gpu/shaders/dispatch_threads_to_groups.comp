@@ -1,0 +1,32 @@
+#version 450
+
+// DISPATCH_INDIRECT with DISPATCH_INITIATOR.USE_THREAD_DIMENSIONS gives thread counts, which
+// earlier GPU work in the same submission may still be writing. Convert them to workgroup counts
+// on the GPU for vkCmdDispatchIndirect, rounding up like the direct dispatch path, and keep the
+// thread counts beside them for the dispatched shader.
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer thread_counts {
+    uint threads[];
+};
+
+layout(std430, binding = 1) writeonly buffer group_counts {
+    uint groups[];
+};
+
+layout(push_constant) uniform constants {
+    uvec3 group_size;
+    uint threads_index;
+    uint groups_index;
+} pc;
+
+void main() {
+    for (uint axis = 0u; axis < 3u; axis++) {
+        const uint count = threads[pc.threads_index + axis];
+        const uint size  = max(pc.group_size[axis], 1u);
+        groups[pc.groups_index + axis] = count == 0u ? 0u : (count - 1u) / size + 1u;
+        // The dispatched shader disables the lanes of partial workgroups past these counts.
+        groups[pc.groups_index + 4u + axis] = count;
+    }
+}

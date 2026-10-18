@@ -1428,6 +1428,11 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	for (const auto& read: program.srt_reads) {
 		plan.srt_reads.push_back({Clone(read.value), read.flat_offset});
 	}
+	plan.dma_prefetches.reserve(program.dma_prefetches.size());
+	for (const auto& prefetch: program.dma_prefetches) {
+		plan.dma_prefetches.push_back(
+		    {Clone(prefetch.low), Clone(prefetch.high), Clone(prefetch.offset), prefetch.immediate});
+	}
 	// Retain integer control expressions with opaque varying leaves. Their identities
 	// matter when an EXEC factor also guards a selected value; never clone float work.
 	bool capture_control_reads = false;
@@ -1597,8 +1602,30 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if ((runtime.indirect_args_address & 3u) != 0u ||
 			    !ReadTable(runtime.indirect_args_address, sizeof(workgroup_counts), 0u,
 			               observed, workgroup_counts)) return false;
+			if (runtime.indirect_args_group_size.size() == workgroup_counts.size()) {
+				// Thread counts, rounded up to whole workgroups as the dispatch does.
+				for (uint32_t axis = 0; axis < workgroup_counts.size(); ++axis) {
+					const auto size    = std::max(runtime.indirect_args_group_size[axis], 1u);
+					const auto threads = workgroup_counts[axis];
+					workgroup_counts[axis] = threads / size + (threads % size != 0u);
+				}
+			}
 			observed.workgroup_counts = workgroup_counts;
 			break;
+		}
+	}
+	// A prefetch that does not evaluate falls back to the fault-driven mapping.
+	snapshot.dma_prefetch.clear();
+	for (const auto& prefetch: program.dma_prefetches) {
+		uint32_t low    = 0;
+		uint32_t high   = 0;
+		uint32_t offset = 0;
+		if (walker.Evaluate(prefetch.low, low) && walker.Evaluate(prefetch.high, high) &&
+		    walker.Evaluate(prefetch.offset, offset)) {
+			const auto base = ((static_cast<uint64_t>(high & 0xffffu) << 32u) | low) & ~uint64_t {3};
+			const auto relative = static_cast<int64_t>(prefetch.immediate & ~int32_t {3}) +
+			                      static_cast<int64_t>(offset & ~3u);
+			snapshot.dma_prefetch.push_back(base + static_cast<uint64_t>(relative));
 		}
 	}
 	snapshot.uniform_fill = {};

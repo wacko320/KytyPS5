@@ -726,7 +726,21 @@ uint32_t EmitGetDispatchThreadExtent(ValueEmitContext& ctx, const IR::Inst& inst
 	if (start == IR::PushData::NoStart || !inst.Arg(0).IsImmediate() || inst.Arg(0).U32() >= 3u) {
 		ctx.Fail(inst, "invalid dispatch thread extent");
 	}
-	return EmitShaderDataDwordLoad(ctx.state, start + inst.Arg(0).U32());
+	auto& state = ctx.state;
+	if (!UsesIndirectDispatchThreads(state)) {
+		return EmitShaderDataDwordLoad(state, start + inst.Arg(0).U32());
+	}
+	// An indirect dispatch: the counts are on the GPU, at the device address in the first two
+	// dwords.
+	const auto base    = PackU64(state, EmitShaderDataDwordLoad(state, start),
+	                             EmitShaderDataDwordLoad(state, start + 1u));
+	const auto address = Binary(state, spv::OpIAdd, TypeU64(state), base,
+	                            ConstantU64(state, uint64_t {inst.Arg(0).U32()} * 4u));
+	const auto pointer = Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), address);
+	const auto value   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+	                          spv::MemoryAccessAlignedMask, uint32_t {4});
+	return value;
 }
 
 uint32_t EmitUndefU1(EmitterState& state, const IR::Inst& inst) {

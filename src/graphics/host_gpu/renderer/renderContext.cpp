@@ -136,6 +136,17 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
+void RenderContext::PrefetchBda(std::span<const uint64_t> addresses) {
+	uint64_t previous = 0;
+	for (const auto address: addresses) {
+		const auto page = address & ~(BufferCache::CACHING_PAGESIZE - 1);
+		if (page != 0 && page != previous && IsMapped(page, BufferCache::CACHING_PAGESIZE)) {
+			(void)m_buffer_cache.FindBuffer(page, BufferCache::CACHING_PAGESIZE);
+		}
+		previous = page;
+	}
+}
+
 void RenderContext::PrepareBda() {
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");

@@ -6404,6 +6404,19 @@ void TestWorkgroupSelectedBufferRecords() {
                 snapshot.specialization_reads.end(),
             "batched selector prefix escaped writable-alias tracking");
   }
+  // USE_THREAD_DIMENSIONS arguments are thread counts: 65 and 128 threads in groups of 64 are
+  // both two workgroups, the prefix of the {2, 1, 1} case above.
+  const std::array group_size{64u, 1u, 1u};
+  runtime.indirect_args_group_size = group_size;
+  for (const uint32_t threads : {65u, 128u}) {
+    memory.words[0] = threads;
+    Check(materialize() && snapshot.buffers.size() == plan.info.buffers.size() + 2u &&
+              memory.reads == 6u,
+          "thread-dimension arguments were not rounded up to whole workgroups");
+  }
+  runtime.indirect_args_group_size = {};
+  memory.words[0] = 2u;
+  Check(materialize(), "workgroup prefix failed after the thread-dimension cases");
   const auto valid = specialization;
   memory.words[selector / 4u] = 0x40000001u; // key*192 wraps to the valid second row.
   Check(materialize() && specialization == valid,
@@ -7833,6 +7846,36 @@ void TestDmaAddressMaterialization() {
   ApplyResourceSpecialization(fixture.program, specialization);
 }
 
+// A scalar load through a pointer the host can compute is recorded for prefetching: the dispatch
+// gives its page a cache buffer first, so the BDA table maps it before the shader reads it.
+void TestScalarDmaLoadsArePrefetched() {
+  Fixture fixture;
+  const auto pointer = fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarAddress;
+  scalar.offset = 0x27;
+  fixture.Emit(ValueOpcode::LoadAddressU32,
+               {pointer, fixture.UserData(2), Value(0u), Value(true)},
+               fixture.AddMemory(scalar, 4));
+  // An offset the host cannot evaluate is not prefetched.
+  const auto undef = fixture.Emit(ValueOpcode::UndefU32);
+  fixture.Emit(ValueOpcode::LoadAddressU32, {pointer, undef, Value(0u), Value(true)},
+               fixture.AddMemory(scalar, 8));
+  fixture.PlanAndTrack();
+  Check(fixture.program.info.uses_dma && fixture.program.dma_prefetches.size() == 1,
+        "the evaluable scalar DMA load was not the one prefetch");
+  auto resource_plan = ExtractResourcePlan(fixture.program);
+  // The high dword keeps 16 address bits; dword alignment drops the low bits of each part.
+  std::array<uint32_t, 3> user_data{0x10000003u, 0xabcd0002u, 0x13u};
+  SrtRuntime runtime{.user_data = user_data};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "DMA shader resources did not materialize");
+  Check(snapshot.dma_prefetch == std::vector<uint64_t>{0x0000000210000034ull},
+        "the prefetch address was not base + immediate + offset");
+}
+
 void TestDynamicFlatAddressesUseDma() {
   Fixture fixture;
   const auto low_root = fixture.UserData(0);
@@ -8550,6 +8593,7 @@ int main() {
     Run("bounded relative register writes", TestBoundedRelativeRegisterWrites);
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
+    Run("scalar DMA prefetch", TestScalarDmaLoadsArePrefetched);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);
     Run("guarded scalar descriptor reads", TestGuardedScalarDescriptorReads);
