@@ -206,6 +206,70 @@ uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
 	return state.builder.Type(spv::OpTypeArray, TypeF32(state), ConstantU32(state, count));
 }
 
+// Descriptor set 1: the bindless heap's lookup table, miss list, and one image array per class
+// and two sampler arrays that the shader uses (BindlessImages.h).
+void DefineBindlessHeap(EmitterState& state) {
+	namespace Bindless = IR::Bindless;
+	const auto& info   = state.program.info;
+	if (std::ranges::none_of(info.images, [](const auto& image) { return image.bindless; }) &&
+	    std::ranges::none_of(info.samplers, [](const auto& sampler) { return sampler.bindless; })) {
+		return;
+	}
+	const auto Define = [&](uint32_t type, const char* name, uint32_t binding,
+	                        spv::StorageClass storage) {
+		const auto variable =
+		    state.builder.DefineGlobalVariable(TypePointer(state, storage, type), storage);
+		state.builder.AddName(variable, name);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
+		                            Bindless::DescriptorSet);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
+		return variable;
+	};
+	const auto words = StorageBufferType(state, state.storage_buffers[2]);
+	state.bindless_table_variable =
+	    Define(words, "bindless_table", Bindless::TableBinding, spv::StorageClassStorageBuffer);
+	state.bindless_miss_variable =
+	    Define(words, "bindless_misses", Bindless::MissBinding, spv::StorageClassStorageBuffer);
+	state.bindless_miss_record_variable = state.builder.DefineGlobalVariable(
+	    TypePointer(state, spv::StorageClassPrivate,
+	                state.builder.Type(spv::OpTypeArray, TypeU32(state),
+	                                   ConstantU32(state, Bindless::MissDwords))),
+	    spv::StorageClassPrivate);
+	state.builder.AddName(state.bindless_miss_record_variable, "bindless_miss_record");
+	for (const auto& image: info.images) {
+		if (!image.bindless) {
+			continue;
+		}
+		const auto image_class = Bindless::ClassFor(image.dimension, image.depth_compare);
+		EXIT_IF(!image_class.has_value());
+		auto& variable = state.bindless_image_variables[static_cast<uint32_t>(*image_class)];
+		if (variable != 0) {
+			continue;
+		}
+		const auto array = state.builder.Type(spv::OpTypeArray, ImageType(state, image),
+		                                      ConstantU32(state, Bindless::HeapSlots));
+		const auto name  = "bindless_images_" + std::to_string(static_cast<uint32_t>(*image_class));
+		variable = Define(array, name.c_str(),
+		                  Bindless::FirstImageBinding + static_cast<uint32_t>(*image_class),
+		                  spv::StorageClassUniformConstant);
+		if (image.dimension == ImageDimension::Dim1D ||
+		    image.dimension == ImageDimension::Dim1DArray) {
+			state.builder.RequireCapability(spv::CapabilitySampled1D);
+		}
+	}
+	if (std::ranges::any_of(info.samplers, [](const auto& sampler) { return sampler.bindless; })) {
+		const auto array = state.builder.Type(spv::OpTypeArray,
+		                                      state.builder.Type(spv::OpTypeSampler),
+		                                      ConstantU32(state, Bindless::HeapSlots));
+		state.bindless_sampler_variable = Define(array, "bindless_samplers",
+		                                         Bindless::SamplerBinding,
+		                                         spv::StorageClassUniformConstant);
+		state.bindless_compare_sampler_variable =
+		    Define(array, "bindless_compare_samplers", Bindless::CompareSamplerBinding,
+		           spv::StorageClassUniformConstant);
+	}
+}
+
 void DefineDescriptors(EmitterState& state) {
 	using Kind = IR::DescriptorBindingKind;
 	auto& info = state.program.info;
@@ -350,6 +414,7 @@ void DefineDescriptors(EmitterState& state) {
 			}
 		}
 	}
+	DefineBindlessHeap(state);
 }
 
 } // namespace

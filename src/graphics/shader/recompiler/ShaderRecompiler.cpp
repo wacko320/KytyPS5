@@ -818,6 +818,8 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		}
 	}
 	ir.untracked_writes = options.untracked_writes;
+	ir.bindless_images  = options.bindless_images;
+	ir.bindless_image_pcs = options.bindless_image_pcs;
 	IR::TrackResources(ir, decoded, native_cfg, options.input_info);
 	TranslateResult result;
 	result.program = std::move(ir);
@@ -857,10 +859,17 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 				                          : 0u;
 			} else if (op == IR::ValueOpcode::GetImageResource) {
 				const auto resource = inst.Flags<uint32_t>();
+				// The emitter looks bindless descriptors up on the GPU by their dwords.
+				if (resource < ir.info.images.size() && ir.info.images[resource].bindless) {
+					continue;
+				}
 				first = resource < ir.info.images.size() &&
 				                ir.info.images[resource].indirect_root == resource ? 1u : 0u;
 			} else if (op == IR::ValueOpcode::GetSamplerResource) {
 				const auto resource = inst.Flags<uint32_t>();
+				if (resource < ir.info.samplers.size() && ir.info.samplers[resource].bindless) {
+					continue;
+				}
 				first = resource < ir.info.samplers.size() &&
 				                !ir.info.samplers[resource].indirect_resources.empty() ? 1u : 0u;
 			} else {

@@ -225,6 +225,8 @@ struct PipelineCache::ProgramCache {
 
 	struct Permutation {
 		std::vector<uint32_t>                       function_code;
+		// SourceEntry::plan_generation it was compiled for.
+		uint32_t                                    plan_generation = 0;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
@@ -250,15 +252,41 @@ struct PipelineCache::ProgramCache {
 			return revision != call_source->revision;
 		}
 
+		// Materializes the plan. When an indirect image table cannot be specialized for this
+		// runtime, its image is added to bindless_pcs and false is returned: the program must be
+		// translated again (with CompileOptions::bindless_image_pcs) and its plan extracted again.
+		bool Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime) {
+			std::vector<uint32_t> pcs;
+			if (ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
+			                                               specialization, &pcs)) {
+				return true;
+			}
+			bool added = false;
+			for (const auto pc: pcs) {
+				if (std::ranges::find(bindless_pcs, pc) == bindless_pcs.end()) {
+					bindless_pcs.push_back(pc);
+					added = true;
+					std::printf("Shader 0x%016" PRIx64 ": indirect image table at pc 0x%08x falls "
+					            "back to the bindless heap\n",
+					            resource_plan.shader_hash, pc);
+				}
+			}
+			EXIT_IF(!added);
+			++plan_generation;
+			return false;
+		}
+
 		template <bool HasCalls>
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                             uint32_t push_data_cursor) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    resource_plan, runtime, resources, specialization));
+			if (!Materialize(runtime)) {
+				return nullptr;
+			}
 			for (auto& candidate: permutations) {
 				const auto& layout = candidate.program.bindings;
 				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
 				        push_data_cursor, layout.ShaderDataDwords()) ||
+				    candidate.plan_generation != plan_generation ||
 				    candidate.specialization != specialization) {
 					continue;
 				}
@@ -275,6 +303,10 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
+		// Tier-2 bindless fallback: first-use pcs of images whose tables could not be specialized
+		// (sticky for the entry), and how often the plan changed because of them.
+		std::vector<uint32_t>                       bindless_pcs;
+		uint32_t                                    plan_generation = 0;
 	};
 
 	struct ProgramKeyHash {
@@ -358,8 +390,10 @@ struct PipelineCache::ProgramCache {
 			runtime.indirect_args_address = input_info.indirect_args_address;
 		}
 		bool source_changed = false;
+		uint32_t plan_generation = 0;
 		if (entry != programs.end()) {
 			auto& cached = entry->second;
+			plan_generation = cached.plan_generation;
 			Permutation* permutation = nullptr;
 			if (cached.call_source) {
 				source_changed = cached.RefreshCallSource(runtime);
@@ -400,6 +434,7 @@ struct PipelineCache::ProgramCache {
 		options.shader_hash = params.hash;
 		options.loop_watchdog_limit = Config::ShaderLoopLimit();
 		options.untracked_writes    = true;
+		options.bindless_images     = true;
 		options.user_data   = user_data;
 		options.back_code      = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
@@ -422,27 +457,39 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::ShaderSource source;
 		if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
 		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
-		ShaderRecompiler::TranslateResult translated;
-		if (current != nullptr) {
-			if (current->call) {
-				if (entry == programs.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
-				translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
-				translated.program.source_reads = current->reads;
+		const auto translate = [&]() {
+			if (entry != programs.end()) options.bindless_image_pcs = entry->second.bindless_pcs;
+			ShaderRecompiler::TranslateResult result;
+			if (current != nullptr) {
+				if (current->call) {
+					if (entry == programs.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
+					result = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
+					result.program.source_reads = current->reads;
+				} else {
+					result = ShaderRecompiler::TranslateProgram(current->decoded, options);
+				}
 			} else {
-				translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
+				result = ShaderRecompiler::TranslateProgram(params.code, options);
 			}
-		} else {
-			translated = ShaderRecompiler::TranslateProgram(params.code, options);
-		}
+			return result;
+		};
+		auto translated = translate();
+		// Tables that cannot be specialized move to the bindless heap; each retry adds new pcs.
+		const auto materialize = [&]() {
+			while (!entry->second.Materialize(runtime)) {
+				translated = translate();
+				entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			}
+		};
 		if (entry == programs.end()) {
 			auto retained = source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
-		} else if (source_changed) {
+			current = entry->second.call_source.get();
+			materialize();
+		} else if (source_changed || plan_generation != entry->second.plan_generation) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			materialize();
 			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor)) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
@@ -452,6 +499,7 @@ struct PipelineCache::ProgramCache {
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
 		    entry->second.FunctionCode()));
+		entry->second.permutations.back().plan_generation = entry->second.plan_generation;
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);

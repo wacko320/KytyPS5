@@ -45,6 +45,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/ir/BindlessImages.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
@@ -1362,6 +1363,11 @@ struct TestCase {
   std::vector<uint64_t> expected_fault_pages;
   u32 loop_watchdog_limit = 0;
   bool untracked_writes = false;
+  // Bindless heap for images whose T# the GPU computes (CompileOptions::bindless_images): the
+  // table either holds the shader's T# (user data s[0:7]) at slot 1, the test's sampled image, or
+  // is empty, and the miss must then be recorded.
+  enum class BindlessTable { None, HoldsDescriptor, Empty };
+  BindlessTable bindless_table = BindlessTable::None;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   float expected_float_tolerance = 0.0f;
@@ -1410,6 +1416,7 @@ struct CompiledShader {
   ShaderRecompiler::IR::Program program;
   ShaderRecompiler::IR::ResourceSnapshot resources;
   std::vector<u32> packed_user_data;
+  std::array<u32, 64> user_data{};
 };
 
 std::array<u32, 64> MakeNativeUserData(const std::array<u32, 64> *source) {
@@ -1692,6 +1699,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   }
   options.loop_watchdog_limit = test.loop_watchdog_limit;
   options.untracked_writes = test.untracked_writes;
+  options.bindless_images = test.bindless_table != TestCase::BindlessTable::None;
 
   auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
   auto resource_plan =
@@ -1794,7 +1802,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
         offset << ((index % 4u) * 8u);
   }
   return {std::move(result.spirv), std::move(result.program),
-          std::move(resources), std::move(packed_user_data)};
+          std::move(resources), std::move(packed_user_data), user_data};
 }
 
 std::array<u32, 64> MakeStructuredStorageBufferData(u32 stride_bytes,
@@ -16867,10 +16875,57 @@ public:
                                                  &descriptor_layout),
               "vkCreateDescriptorSetLayout");
 
+    namespace BindlessAbi = ShaderRecompiler::IR::Bindless;
+    std::vector<u32> heap_classes;
+    for (const auto &image : compiled.program.info.images) {
+      if (image.bindless) {
+        const auto image_class = static_cast<u32>(
+            *BindlessAbi::ClassFor(image.dimension, image.depth_compare));
+        if (std::ranges::find(heap_classes, image_class) == heap_classes.end()) {
+          heap_classes.push_back(image_class);
+        }
+      }
+    }
+    const bool bindless = !heap_classes.empty();
+    Require(test.name, "dispatch",
+            bindless == (test.bindless_table != TestCase::BindlessTable::None),
+            "bindless images and the test's bindless table disagree");
+    Require(test.name, "dispatch",
+            std::ranges::none_of(compiled.program.info.samplers,
+                                 [](const auto &sampler) { return sampler.bindless; }),
+            "the harness heap holds images only");
+    vk::DescriptorSetLayout heap_layout = nullptr;
+    if (bindless) {
+      std::vector<vk::DescriptorSetLayoutBinding> heap_bindings;
+      std::vector<vk::DescriptorBindingFlags> heap_flags;
+      for (const auto binding : {BindlessAbi::TableBinding, BindlessAbi::MissBinding}) {
+        heap_bindings.push_back({binding, vk::DescriptorType::eStorageBuffer, 1,
+                                 vk::ShaderStageFlagBits::eCompute, nullptr});
+        heap_flags.push_back({});
+      }
+      for (const auto image_class : heap_classes) {
+        heap_bindings.push_back({BindlessAbi::FirstImageBinding + image_class,
+                                 vk::DescriptorType::eSampledImage, BindlessAbi::HeapSlots,
+                                 vk::ShaderStageFlagBits::eCompute, nullptr});
+        heap_flags.push_back(vk::DescriptorBindingFlagBits::ePartiallyBound);
+      }
+      vk::DescriptorSetLayoutBindingFlagsCreateInfo flags_info{};
+      flags_info.bindingCount = static_cast<u32>(heap_flags.size());
+      flags_info.pBindingFlags = heap_flags.data();
+      vk::DescriptorSetLayoutCreateInfo heap_info{};
+      heap_info.pNext = &flags_info;
+      heap_info.bindingCount = static_cast<u32>(heap_bindings.size());
+      heap_info.pBindings = heap_bindings.data();
+      RequireVk(test.name, "dispatch",
+                m_device.createDescriptorSetLayout(&heap_info, nullptr, &heap_layout),
+                "vkCreateDescriptorSetLayout (bindless heap)");
+    }
+    const std::array set_layouts{descriptor_layout, heap_layout};
+
     vk::PipelineLayoutCreateInfo pipeline_layout_info{};
     pipeline_layout_info.sType = vk::StructureType::ePipelineLayoutCreateInfo;
-    pipeline_layout_info.setLayoutCount = 1;
-    pipeline_layout_info.pSetLayouts = &descriptor_layout;
+    pipeline_layout_info.setLayoutCount = bindless ? 2u : 1u;
+    pipeline_layout_info.pSetLayouts = set_layouts.data();
     vk::PushConstantRange push_range{};
     if (layout.UsesPushData()) {
       push_range.stageFlags = vk::ShaderStageFlagBits::eCompute;
@@ -16925,9 +16980,14 @@ public:
       const auto index = std::countr_zero(mask);
       add_pool_size(NativeDescriptorType(static_cast<Kind>(index)), layout.descriptor_counts[index]);
     }
+    if (bindless) {
+      add_pool_size(vk::DescriptorType::eStorageBuffer, 2);
+      add_pool_size(vk::DescriptorType::eSampledImage,
+                    static_cast<u32>(heap_classes.size()) * BindlessAbi::HeapSlots);
+    }
     vk::DescriptorPoolCreateInfo pool_info{};
     pool_info.sType = vk::StructureType::eDescriptorPoolCreateInfo;
-    pool_info.maxSets = 1;
+    pool_info.maxSets = 2;
     pool_info.poolSizeCount = static_cast<u32>(pool_sizes.size());
     pool_info.pPoolSizes = pool_sizes.empty() ? nullptr : pool_sizes.data();
     vk::DescriptorPool descriptor_pool = nullptr;
@@ -17144,6 +17204,64 @@ public:
       write.pImageInfo = sampler_infos.data();
       writes.push_back(write);
     }
+    vk::DescriptorSet heap_set = nullptr;
+    Buffer heap_table;
+    Image heap_null_image;
+    std::vector<vk::DescriptorImageInfo> heap_images;
+    vk::DescriptorBufferInfo heap_table_info{};
+    vk::DescriptorBufferInfo heap_miss_info{};
+    if (bindless) {
+      Require(test.name, "dispatch", sampled_image != nullptr,
+              "bindless heap needs the test's sampled image");
+      set_info.pSetLayouts = &heap_layout;
+      RequireVk(test.name, "dispatch", m_device.allocateDescriptorSets(&set_info, &heap_set),
+                "vkAllocateDescriptorSets (bindless heap)");
+      constexpr u32 capacity = 8;
+      std::vector<u32> table(1u + capacity * BindlessAbi::EntryDwords, 0u);
+      table[0] = capacity;
+      if (test.bindless_table == TestCase::BindlessTable::HoldsDescriptor) {
+        std::array<u32, 8> descriptor{};
+        std::copy_n(compiled.user_data.begin(), 8, descriptor.begin());
+        const auto image_class = heap_classes.front();
+        const auto hash = BindlessAbi::Hash(descriptor, image_class);
+        const auto entry = 1u + (hash & (capacity - 1u)) * BindlessAbi::EntryDwords;
+        table[entry] = hash;
+        std::copy(descriptor.begin(), descriptor.end(), table.begin() + entry + 1u);
+        table[entry + 9u] = image_class;
+        table[entry + 10u] = 2u; // slot 1
+      }
+      heap_table = CreateStorageBuffer(test.name, table, table.size());
+      DestroyBuffer(&m_bindless_misses);
+      m_bindless_misses = CreateStorageBuffer(
+          test.name, {}, 1u + BindlessAbi::MaxMisses * BindlessAbi::MissDwords);
+      heap_null_image = CreateImage2D(
+          test.name, 1, 1, sampled_image->format, vk::ImageUsageFlagBits::eSampled,
+          std::vector<u32>(4, 0u), 4, vk::ImageLayout::eShaderReadOnlyOptimal);
+      heap_table_info = {heap_table.buffer, 0, heap_table.size};
+      heap_miss_info = {m_bindless_misses.buffer, 0, m_bindless_misses.size};
+      heap_images = {{nullptr, heap_null_image.view, heap_null_image.layout},
+                     {nullptr, sampled_image->view, sampled_image->layout}};
+      for (const auto &[binding, info] :
+           {std::pair{BindlessAbi::TableBinding, &heap_table_info},
+            std::pair{BindlessAbi::MissBinding, &heap_miss_info}}) {
+        vk::WriteDescriptorSet write{};
+        write.dstSet = heap_set;
+        write.dstBinding = binding;
+        write.descriptorCount = 1;
+        write.descriptorType = vk::DescriptorType::eStorageBuffer;
+        write.pBufferInfo = info;
+        writes.push_back(write);
+      }
+      for (const auto image_class : heap_classes) {
+        vk::WriteDescriptorSet write{};
+        write.dstSet = heap_set;
+        write.dstBinding = BindlessAbi::FirstImageBinding + image_class;
+        write.descriptorCount = static_cast<u32>(heap_images.size());
+        write.descriptorType = vk::DescriptorType::eSampledImage;
+        write.pImageInfo = heap_images.data();
+        writes.push_back(write);
+      }
+    }
     if (!writes.empty()) {
       m_device.updateDescriptorSets(static_cast<u32>(writes.size()),
                                     writes.data(), 0, nullptr);
@@ -17223,6 +17341,10 @@ public:
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
     cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout, 0,
                            1, &descriptor_set, 0, nullptr);
+    if (bindless) {
+      cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout,
+                             BindlessAbi::DescriptorSet, 1, &heap_set, 0, nullptr);
+    }
     if (layout.UsesPushData()) {
       ShaderRecompiler::IR::PushData push_data;
       std::copy(shader_data.begin(), shader_data.end(),
@@ -17345,6 +17467,11 @@ public:
     m_device.destroyPipeline(pipeline, nullptr);
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
     m_device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
+    if (bindless) {
+      DestroyBuffer(&heap_table);
+      DestroyImage(&heap_null_image);
+      m_device.destroyDescriptorSetLayout(heap_layout, nullptr);
+    }
     m_device.destroyShaderModule(module, nullptr);
   }
 
@@ -20479,6 +20606,7 @@ private:
     auto device_features11 = WindowContext::RequiredVulkan11Features();
     auto device_features12 = WindowContext::RequiredVulkan12Features();
     device_features12.shaderSharedInt64Atomics = true;
+    device_features12.descriptorBindingPartiallyBound = true;
     vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout{};
     workgroup_layout.workgroupMemoryExplicitLayout = true;
     device_features12.pNext = &device_features11;
@@ -20586,6 +20714,7 @@ private:
       DestroyBuffer(&m_fault_buffer);
       DestroyBuffer(&m_bda_pagetable_buffer);
       DestroyBuffer(&m_bda_zero_page);
+      DestroyBuffer(&m_bindless_misses);
       if (m_runtime_context.allocator != nullptr) {
         m_renderer.reset();
         vmaDestroyAllocator(m_runtime_context.allocator);
@@ -20894,6 +21023,12 @@ private:
   Buffer m_bda_pagetable_buffer;
   Buffer m_fault_buffer;
   Buffer m_bda_zero_page;
+
+public:
+  // The last bindless dispatch's miss list (BindlessImages.h).
+  Buffer m_bindless_misses;
+
+private:
   GraphicContext m_runtime_context{};
   std::unique_ptr<RenderContext> m_renderer;
 };
@@ -21049,6 +21184,25 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
                    needs_storage_image ? &storage_image_uint : nullptr,
                    sampler);
   auto actual = vulkan->ReadBuffer(test.name, buffer, test.expected.size());
+  if (test.bindless_table != TestCase::BindlessTable::None) {
+    namespace BindlessAbi = ShaderRecompiler::IR::Bindless;
+    const auto misses = vulkan->ReadBuffer(test.name, vulkan->m_bindless_misses,
+                                           1u + BindlessAbi::MissDwords);
+    std::string recorded;
+    for (const auto word : misses) {
+      recorded += " " + Hex(word);
+    }
+    if (test.bindless_table == TestCase::BindlessTable::HoldsDescriptor) {
+      Require(test.name, "bindless misses", misses[0] == 0u,
+              "a T# in the table was recorded as a miss:" + recorded);
+    } else {
+      std::vector<u32> record(compiled.user_data.begin(), compiled.user_data.begin() + 8);
+      record.push_back(static_cast<u32>(BindlessAbi::ImageClass::Dim2D));
+      Require(test.name, "bindless misses",
+              misses[0] != 0u && std::equal(record.begin(), record.end(), misses.begin() + 1),
+              "the missing T# was not recorded:" + recorded);
+    }
+  }
   if (!test.expected_gds.empty()) {
     const auto gds_actual =
         vulkan->ReadBuffer(test.name, gds_buffer, test.expected_gds.size());
@@ -37742,6 +37896,53 @@ TestCase ImageGetResinfoDmaskMipLevels() {
   return test;
 }
 
+// The T# is the dispatch's own (s[0:7]) with dword 0 offset by a buffer value the host cannot
+// evaluate, so with bindless images the shader looks the image up in the heap; a miss samples
+// the null image and is recorded.
+TestCase BindlessImageSample(bool in_table) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 20, 0x3f200000u);
+  AppendVMovLiteral(&code, 21, 0x3ec00000u);
+  AppendVMovU32(&code, 31, 32);
+  AppendBufferLoadDword(&code, 30, 31);           // v30 = 0, known only to the GPU
+  code.push_back(EncodeVop1(0x02, 40, Vgpr(30))); // v_readfirstlane_b32 s40, v30
+  code.push_back(EncodeSop2(0x00, 16, 0, 40));    // s_add_u32 s16, s0, s40
+  for (u32 dword = 1; dword < 8u; dword++) {
+    code.push_back(EncodeSMovB32(16 + dword, dword));
+  }
+  code.push_back(EncodeMimg0(0x20, 0xf));
+  code.push_back(EncodeMimg1(0, 20, 4)); // image_sample v[0:3], v[20:21], s[16:23], s[0:3]
+  for (u32 i = 0; i < 4u; i++) {
+    AppendStoreVgpr(&code, i, i);
+  }
+  AppendEnd(&code);
+
+  auto image = MakeRgbaImage(4, 4);
+  SetRgbaPixel(&image, 4, 2, 1, 0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u);
+
+  TestCase test;
+  test.name = in_table ? "BindlessImageSampleFindsHeapSlot" : "BindlessImageSampleRecordsMiss";
+  test.code = std::move(code);
+  test.expected = in_table
+                      ? std::vector<u32>{0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u}
+                      : std::vector<u32>(4, 0u);
+  test.initial.assign(16, 0u);
+  test.opcodes = {O::V_MOV_B32,           O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32,
+                  O::S_ADD_U32,           O::S_MOV_B32,         O::IMAGE_SAMPLE,
+                  O::BUFFER_STORE_DWORD,  O::S_ENDPGM};
+  test.sampled_image_rgba = image;
+  test.bindless_table = in_table ? TestCase::BindlessTable::HoldsDescriptor
+                                 : TestCase::BindlessTable::Empty;
+  test.required_spirv = {"bindless_table", "NonUniform"};
+  return test;
+}
+
+TestCase BindlessImageSampleFindsHeapSlot() { return BindlessImageSample(true); }
+
+TestCase BindlessImageSampleRecordsMiss() { return BindlessImageSample(false); }
+
 TestCase ImageSampleAndGather() {
   using O = ShaderOpcode;
 
@@ -43551,6 +43752,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageLoadA16UintCoordsOnGpu);
   AddCase(ImageGetResinfoDmaskWidthHeight);
   AddCase(ImageGetResinfoDmaskMipLevels);
+  AddCase(BindlessImageSampleFindsHeapSlot);
+  AddCase(BindlessImageSampleRecordsMiss);
   AddCase(ImageSampleAndGather);
   AddCase(ImageCubeGradientsPreserveDerivatives);
   AddCase(ImageGatherExplicitLod);
@@ -46275,7 +46478,7 @@ void CheckImageSamplerSpecialization() {
     Require(name, "bounded native material plan",
             plan.capture_specialization_reads && !translated.program.has_address_writes &&
                 MaterializeResources(plan, runtime, snapshot, specialization) &&
-                snapshot.images.size() == count + 1u,
+                snapshot.images.size() == IndirectImageArrayBucket(count + 1u),
             "GPU-selected material descriptors did not expand beyond native root capacity");
     const auto offset = specialization.images[0].indirect_mapping_offset;
     const auto ordinal = [&](u32 byte_offset) {

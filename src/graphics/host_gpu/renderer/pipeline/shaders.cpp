@@ -231,6 +231,18 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+namespace {
+
+// Whether a stage samples bindless images or samplers: its pipeline layout then has the bindless
+// heap as descriptor set 1.
+bool UsesBindlessHeap(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	return std::ranges::any_of(program.info.images, [](const auto& image) { return image.bindless; }) ||
+	       std::ranges::any_of(program.info.samplers,
+	                           [](const auto& sampler) { return sampler.bindless; });
+}
+
+} // namespace
+
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&          rendering,
                             const PipelineVertexInputState&        vertex_input,
@@ -472,9 +484,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const vk::PushConstantRange push_constants {graphics_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 
+	bool bindless = ps_active && UsesBindlessHeap(*ps_input_info->stage.program);
+	for (const auto& stage: vertex_info) {
+		bindless |= UsesBindlessHeap(*stage.stage.program);
+	}
+	EXIT_IF(bindless && graphics.bindless_heap_layout == nullptr);
+	const std::array set_layouts {pipeline.descriptor_set_layout, graphics.bindless_heap_layout};
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount         = 1;
-	pipeline_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
+	pipeline_layout_info.setLayoutCount         = bindless ? 2u : 1u;
+	pipeline_layout_info.pSetLayouts            = set_layouts.data();
 	pipeline_layout_info.pushConstantRangeCount = 1;
 	pipeline_layout_info.pPushConstantRanges    = &push_constants;
 
@@ -607,9 +625,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 
+	const bool bindless = UsesBindlessHeap(*input_info.stage.program);
+	EXIT_IF(bindless && graphics.bindless_heap_layout == nullptr);
+	const std::array set_layouts {pipeline.descriptor_set_layout, graphics.bindless_heap_layout};
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount         = 1;
-	pipeline_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
+	pipeline_layout_info.setLayoutCount         = bindless ? 2u : 1u;
+	pipeline_layout_info.pSetLayouts            = set_layouts.data();
 	pipeline_layout_info.pushConstantRangeCount = 1;
 	pipeline_layout_info.pPushConstantRanges    = &push_constants;
 

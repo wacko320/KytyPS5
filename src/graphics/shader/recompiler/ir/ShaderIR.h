@@ -198,6 +198,8 @@ struct ImageResource {
 	bool                          depth_compare     = false;
 	bool                          cube              = false;
 	bool                          r128              = false;
+	// The T# is known only on the GPU; the image comes from the bindless heap (BindlessImages.h).
+	bool                          bindless          = false;
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
@@ -232,6 +234,8 @@ struct SamplerResource {
 	bool     depth_compare         = false;
 	bool     integer_border        = false;
 	bool     gather_lod            = false;
+	// The S# is known only on the GPU; the sampler comes from the bindless heap.
+	bool     bindless              = false;
 
 	bool operator==(const SamplerResource& other) const = default;
 };
@@ -741,6 +745,9 @@ struct Program: ResourcePlan {
 	uint32_t                      loop_watchdog_limit = 0;
 	// CompileOptions::untracked_writes.
 	bool                          untracked_writes    = false;
+	// CompileOptions::bindless_images and bindless_image_pcs.
+	bool                          bindless_images     = false;
+	std::vector<uint32_t>         bindless_image_pcs;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
 	struct ScalarWrite { uint32_t pc; ScalarReg reg; Value value; };

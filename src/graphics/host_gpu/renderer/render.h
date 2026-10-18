@@ -161,6 +161,10 @@ public:
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
+	// Binds descriptor set 1, the bindless heap, for stages that use it (after CommitBindings).
+	void CommitBindlessHeap(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
+	                        const PipelineCache::Pipeline&     pipeline,
+	                        std::span<PreparedBindings* const> bindings);
 
 private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
@@ -173,6 +177,7 @@ private:
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	void PrepareBindlessImages(PreparedBindings& prepared);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,

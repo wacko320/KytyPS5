@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
+#include "graphics/shader/recompiler/ir/BindlessImages.h"
+
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -19,6 +21,25 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
+// With a bindless fallback, an image table with more distinct candidates is sampled through the
+// bindless heap instead of binding one native descriptor per candidate.
+constexpr uint32_t MaxIndirectImageCandidates = 256u;
+
+// Records the first-use pc of a sampled image root the bindless heap can serve when its table
+// cannot be specialized (MaterializeResources' bindless_fallback_pcs).
+void ReportBindlessFallback(const ResourcePlan& program, uint32_t root,
+                            std::vector<uint32_t>* pcs) {
+	if (pcs == nullptr || root >= program.info.images.size()) {
+		return;
+	}
+	const auto& image = program.info.images[root];
+	if (image.resource_class != ImageResourceClass::Sampled || image.written || image.atomic ||
+	    image.bindless || !Bindless::ClassFor(image.dimension, image.depth_compare) ||
+	    std::ranges::find(*pcs, image.first_use_pc) != pcs->end()) {
+		return;
+	}
+	pcs->push_back(image.first_use_pc);
+}
 
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
@@ -516,7 +537,32 @@ bool ResolveSelectorKeys(const DescriptorSource::IndirectDescriptor& indirect,
 	return true;
 }
 
-template <typename Specialization, typename Normalize>
+// Pads an indirect table's candidates (root and children, appended after children_begin) with
+// null descriptors up to IndirectImageArrayBucket, when can_pad accepts them. Unused slots are
+// never selected: the key mapping only names the real candidates.
+template <typename Specialization, typename CanPad>
+void PadIndirectCandidates(uint32_t resource_index, size_t children_begin, uint32_t dword_count,
+                           std::vector<DescriptorValue>& descriptors,
+                           std::vector<Specialization>& specializations,
+                           const Specialization& root_resource, uint32_t maximum_resources,
+                           CanPad&& can_pad) {
+	if (descriptors.size() == children_begin) return;
+	const auto count = static_cast<uint32_t>(descriptors.size() - children_begin) + 1u;
+	const auto bucket = IndirectImageArrayBucket(count);
+	if (bucket == count ||
+	    !can_pad(descriptors[resource_index],
+	             std::span<const DescriptorValue>(descriptors).subspan(children_begin)))
+		return;
+	const auto padded = std::min<size_t>(descriptors.size() + (bucket - count), maximum_resources);
+	auto child = root_resource;
+	child.indirect_root = resource_index;
+	while (descriptors.size() < padded) {
+		descriptors.push_back({.dword_count = dword_count});
+		specializations.push_back(child);
+	}
+}
+
+template <typename Specialization, typename Normalize, typename CanPad>
 bool MaterializeIndirectDescriptor(const ResourcePlan&                         program,
                                    uint32_t source_index,
                                    uint32_t resource_index, uint32_t dword_count, uint32_t read_dwords,
@@ -524,7 +570,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
                                    ResourceSnapshot&             snapshot,
                                    std::vector<DescriptorValue>& descriptors,
                                    std::vector<Specialization>&  specializations,
-                                   uint32_t maximum_resources, Normalize&& normalize) {
+                                   uint32_t maximum_resources, Normalize&& normalize,
+                                   CanPad&& can_pad) {
 	const auto& indirect = *program.descriptor_sources[source_index].indirect_descriptor;
 	const auto  descriptor_bytes = read_dwords * sizeof(uint32_t);
 	const auto& sources = indirect.sources;
@@ -695,6 +742,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				root.indirect_root = resource_index;
 				root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
 				root.indirect_search_iterations = 0u;
+				PadIndirectCandidates(resource_index, children_begin, dword_count, descriptors,
+				                      specializations, root_resource, maximum_resources, can_pad);
 			}
 			return true;
 		}
@@ -761,6 +810,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		root.indirect_root              = resource_index;
 		root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
 		root.indirect_search_iterations = std::bit_width(key_count);
+		PadIndirectCandidates(resource_index, children_begin, dword_count, descriptors,
+		                      specializations, root_resource, maximum_resources, can_pad);
 	}
 	return true;
 }
@@ -818,10 +869,18 @@ private:
 };
 
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
-                                        ResourceSpecialization& specialization) {
+                                        ResourceSpecialization& specialization,
+                                        std::vector<uint32_t>* bindless_fallback_pcs) {
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
 		const auto& descriptor = snapshot.images[i];
 		auto&       image      = specialization.images[i];
+		// A candidate of an indirect table that cannot be bound fails the table, which the
+		// bindless heap can serve instead.
+		const auto  fallback   = [&]() {
+			if (image.indirect_root != ImageResource::NoIndirectImage) {
+				ReportBindlessFallback(program, image.indirect_root, bindless_fallback_pcs);
+			}
+		};
 		const auto  base_index = i < program.info.images.size() ? i : image.indirect_root;
 		if (base_index >= program.info.images.size()) {
 			return SpecializationFail(fmt::format("image resource {} has an invalid root", i));
@@ -832,6 +891,14 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			return SpecializationFail(fmt::format("image resource {} has an invalid class", i));
 		}
 		image.mip_count = ImageMipCount(base, descriptor);
+		if (base.bindless) {
+			// The heap supplies float views of the instruction's dimension; the per-shader slot
+			// holds a null image of the same type.
+			image.numeric_class = Prospero::TextureNumericClass::Float;
+			image.dimension     = base.dimension;
+			image.cube          = false;
+			continue;
+		}
 		if (NullImageDescriptor(descriptor)) {
 			image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
 			                                  : Prospero::TextureNumericClass::Float;
@@ -841,6 +908,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		}
 		const auto descriptor_dimension = DescriptorDimension(descriptor, base.dimension);
 		if (descriptor_dimension == Decoder::ImageDimension::Unknown) {
+			fallback();
 			return SpecializationFail(fmt::format(
 			    "image descriptor {} has unsupported type {}: {:08x},{:08x},{:08x},{:08x},"
 			    "{:08x},{:08x},{:08x},{:08x}",
@@ -868,6 +936,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    image.indirect_root != ImageResource::NoIndirectImage ||
 			    std::ranges::any_of(program.info.sampled_pairs,
 			                        [&](const auto& pair) { return pair.image == i; })) {
+				fallback();
 				return SpecializationFail("FMASK requires a direct image load");
 			}
 		}
@@ -932,6 +1001,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 					                       indirect.table_source, ordinal, matches, first_offset);
 				}
 			}
+			fallback();
 			return SpecializationFail(message);
 		}
 	}
@@ -947,6 +1017,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    static_cast<size_t>(root.indirect_mapping_offset) + 1u +
 		            static_cast<size_t>(key_count) * (root.indirect_search_iterations == 0u ? 1u : 2u) >
 		        snapshot.flattened_srt.size()) {
+			ReportBindlessFallback(program, root_index, bindless_fallback_pcs);
 			return SpecializationFail("indirect image specialization has an invalid key mapping");
 		}
 		uint32_t exemplar       = ImageResource::NoIndirectImage;
@@ -962,6 +1033,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 		}
 		if (resource_count < 2u || exemplar == ImageResource::NoIndirectImage) {
+			ReportBindlessFallback(program, root_index, bindless_fallback_pcs);
 			return SpecializationFail("indirect image specialization has no typed candidate");
 		}
 		const auto& image_class = specialization.images[exemplar];
@@ -1000,6 +1072,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
 			    (!storage_swizzle && image.shader_swizzle != image_class.shader_swizzle)) {
+				ReportBindlessFallback(program, root_index, bindless_fallback_pcs);
 				return SpecializationFail(
 				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
 				                program.info.images[root_index].first_use_pc));
@@ -1476,8 +1549,19 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          std::vector<uint32_t>* bindless_fallback_pcs) {
 	for (auto& keys: program.selector_keys) keys.resolved = false;
+	if (bindless_fallback_pcs != nullptr && !program.resource_tracking_complete) {
+		// Typically captured table reads that cannot be proven disjoint from the shader's address
+		// writes (ExtractResourcePlan); planned image tables can go bindless instead.
+		for (uint32_t root = 0; root < program.info.images.size(); root++) {
+			const auto* source = Source(program, program.info.images[root].source);
+			if (source != nullptr && source->indirect_descriptor.has_value()) {
+				ReportBindlessFallback(program, root, bindless_fallback_pcs);
+			}
+		}
+	}
 	if (!program.resource_tracking_complete ||
 	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
 	     runtime.read_specialization_memory == nullptr)) {
@@ -1567,6 +1651,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 					        [&](DescriptorValue& value) {
 						        return NormalizeIndirectBuffer(
 						            value, source->indirect_descriptor->indexed, base);
+					        },
+					        [](const DescriptorValue&, std::span<const DescriptorValue>) {
+						        return false;
 					        }))
 						return resource_failed("buffer", i, base.source, snapshot.buffers.size(), UINT32_MAX);
 				}
@@ -1625,16 +1712,29 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 			const auto& indirect = *source->indirect_descriptor;
 			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
+			const auto maximum_images =
+			    bindless_fallback_pcs != nullptr
+			        ? static_cast<uint32_t>(snapshot.images.size()) + MaxIndirectImageCandidates
+			        : UINT32_MAX;
 			if (!MaterializeIndirectDescriptor(
 			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, clean, snapshot, snapshot.images,
-			        specialization.images, UINT32_MAX, [&](DescriptorValue& value) {
+			        specialization.images, maximum_images, [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations.
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
 				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
 					        value.dwords.fill(0u);
 				        return true;
+			        },
+			        [&](const DescriptorValue& root, std::span<const DescriptorValue> children) {
+				        // Single-level candidates share one descriptor array; others are
+				        // selected one by one, where padding would only add switch arms.
+				        const auto single_level = [&](const DescriptorValue& value) {
+					        return NullImageDescriptor(value) || ImageMipCount(image, value) == 1u;
+				        };
+				        return single_level(root) && std::ranges::all_of(children, single_level);
 			        })) {
-				return resource_failed("image", i, image.source, snapshot.images.size(), UINT32_MAX);
+				ReportBindlessFallback(program, i, bindless_fallback_pcs);
+				return resource_failed("image", i, image.source, snapshot.images.size(), maximum_images);
 			}
 		} else {
 			if (!evaluate(image.source, snapshot.images[i], image.written)) {
@@ -1661,7 +1761,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				if ((active.empty() || active[source]) && !MaterializeIndirectDescriptor(
 				        program, source, i, 4u, 4u, observed, clean, snapshot, snapshot.samplers,
 				        specialization.samplers, ShaderInfo::MaxSamplers,
-				        [](DescriptorValue&) { return true; }))
+				        [](DescriptorValue&) { return true; },
+				        [](const DescriptorValue&, std::span<const DescriptorValue>) {
+					        return false;
+				        }))
 					return resource_failed("sampler", i, source, snapshot.samplers.size(), ShaderInfo::MaxSamplers);
 			} else {
 				if (indirect != nullptr) source = indirect->sources[0];
@@ -1680,7 +1783,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization);
+	return BuildResourceSpecialization(program, snapshot, specialization, bindless_fallback_pcs);
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {

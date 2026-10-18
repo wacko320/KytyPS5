@@ -724,6 +724,125 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	if (program.bindings.descriptor_counts[static_cast<size_t>(BindingKind::Gds)] != 0) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
 	}
+	PrepareBindlessImages(prepared);
+}
+
+// The heap's views and samplers for a stage with bindless images or samplers: every known heap
+// entry of the classes it uses, after the null image (or default sampler) at slot 0.
+void RenderExecutor::PrepareBindlessImages(PreparedBindings& prepared) {
+	namespace Bindless  = ShaderRecompiler::IR::Bindless;
+	const auto& program = *prepared.runtime->program;
+	prepared.heap_images.clear();
+	prepared.heap_samplers.clear();
+	prepared.heap_compare_samplers.clear();
+	std::array<bool, Bindless::ClassCount> used {};
+	for (const auto& image: program.info.images) {
+		if (image.bindless) {
+			used[static_cast<uint32_t>(*Bindless::ClassFor(image.dimension, image.depth_compare))] =
+			    true;
+		}
+	}
+	const bool bindless_samplers = std::ranges::any_of(
+	    program.info.samplers,
+	    [](const ShaderRecompiler::IR::SamplerResource& sampler) { return sampler.bindless; });
+	prepared.uses_bindless = bindless_samplers || std::ranges::find(used, true) != used.end();
+	if (!prepared.uses_bindless) {
+		return;
+	}
+	auto& heap = m_context.GetBindlessHeap();
+	// The miss region may wait for an earlier command buffer: pick it while waiting is allowed.
+	heap.Reserve();
+	const auto Add = [&](const ShaderRecompiler::IR::ImageResource&   resource,
+	                     const ShaderRecompiler::IR::DescriptorValue& value, uint32_t image_class) {
+		auto binding = ResolveTexture(resource, value);
+		BindImage(binding.image_id, false);
+		prepared.heap_images.push_back({resource, value, std::move(binding), image_class});
+	};
+	for (uint32_t image_class = 0; image_class < Bindless::ClassCount; image_class++) {
+		if (!used[image_class]) {
+			continue;
+		}
+		const auto type = static_cast<Bindless::ImageClass>(image_class);
+		ShaderRecompiler::IR::ImageResource resource;
+		resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+		resource.numeric_class  = Prospero::TextureNumericClass::Float;
+		resource.dimension      = Bindless::DimensionFor(type);
+		resource.depth_compare  = Bindless::IsCompare(type);
+		resource.read           = true;
+		ShaderRecompiler::IR::DescriptorValue value;
+		value.dword_count = 8;
+		Add(resource, value, image_class);
+		for (const auto& entry: heap.Entries()) {
+			if (entry.image_class == type) {
+				std::copy(entry.descriptor.begin(), entry.descriptor.end(), value.dwords.begin());
+				Add(resource, value, image_class);
+			}
+		}
+	}
+	if (bindless_samplers) {
+		auto& cache = m_context.GetSamplerCache();
+		prepared.heap_samplers.push_back(cache.GetSampler(ShaderSamplerResource {}, false));
+		prepared.heap_compare_samplers.push_back(prepared.heap_samplers.front());
+		for (const auto& entry: heap.Entries()) {
+			const auto image_class = static_cast<uint32_t>(entry.image_class);
+			if (image_class != Bindless::SamplerClass &&
+			    image_class != Bindless::CompareSamplerClass) {
+				continue;
+			}
+			ShaderSamplerResource descriptor;
+			std::copy_n(entry.descriptor.begin(), 4, descriptor.fields);
+			// Only depth-comparison samples compare depth, as the S# says.
+			if (image_class == Bindless::SamplerClass) {
+				descriptor.fields[0] &= ~(0x7u << 12u);
+				prepared.heap_samplers.push_back(cache.GetSampler(descriptor, false));
+			} else {
+				prepared.heap_compare_samplers.push_back(cache.GetSampler(descriptor, false));
+			}
+		}
+	}
+}
+
+void RenderExecutor::CommitBindlessHeap(CommandBuffer&                     buffer,
+                                        vk::PipelineBindPoint              pipeline_bind_point,
+                                        const PipelineCache::Pipeline&     pipeline,
+                                        std::span<PreparedBindings* const> stages) {
+	namespace Bindless = ShaderRecompiler::IR::Bindless;
+	// One heap set serves every stage of a draw. Each stage listed a class's views from the same
+	// heap entries (the null image first), so the stages that use a class agree on its list.
+	std::array<std::vector<vk::DescriptorImageInfo>, Bindless::ClassCount> images;
+	std::vector<vk::DescriptorImageInfo>                                   samplers;
+	std::vector<vk::DescriptorImageInfo>                                   compare_samplers;
+	bool                                                                   uses_bindless = false;
+	for (const auto* bindings: stages) {
+		if (!bindings->uses_bindless) {
+			continue;
+		}
+		uses_bindless = true;
+		std::array<std::vector<vk::DescriptorImageInfo>, Bindless::ClassCount> stage_images;
+		for (const auto& heap_image: bindings->heap_images) {
+			stage_images[heap_image.image_class].push_back(MakeImageInfo(heap_image.binding, 0u));
+		}
+		for (uint32_t image_class = 0; image_class < Bindless::ClassCount; image_class++) {
+			if (images[image_class].empty()) {
+				images[image_class] = std::move(stage_images[image_class]);
+			}
+		}
+		if (samplers.empty()) {
+			for (const auto sampler: bindings->heap_samplers) {
+				samplers.emplace_back(sampler, nullptr, vk::ImageLayout::eUndefined);
+			}
+			for (const auto sampler: bindings->heap_compare_samplers) {
+				compare_samplers.emplace_back(sampler, nullptr, vk::ImageLayout::eUndefined);
+			}
+		}
+	}
+	if (!uses_bindless) {
+		return;
+	}
+	m_context.GetBindlessHeap().Commit(
+	    buffer.Handle(), pipeline.pipeline_layout, pipeline_bind_point,
+	    m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream), images, samplers,
+	    compare_samplers);
 }
 
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
@@ -852,6 +971,20 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
+	}
+	for (auto& heap_image: prepared.heap_images) {
+		// Slot 0 and null T#s are native null descriptors.
+		auto& binding = heap_image.binding;
+		if (!binding.image_id) continue;
+		const auto old_image = texture_cache.m_slot_images.try_get(binding.image_id);
+		if (old_image == nullptr || !old_image->registered || old_image->binding.needs_rebind) {
+			if (old_image != nullptr) {
+				old_image->binding = {};
+			}
+			binding = ResolveTexture(heap_image.resource, heap_image.value);
+			BindImage(binding.image_id, false);
+		}
+		binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
 	}
 }
 
@@ -996,9 +1129,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
 		}
 
-		for (uint32_t i = 0; i < program.info.images.size(); i++) {
-			auto& binding = descriptors.images[i];
-			if (!binding.image_id) continue;
+		const auto transition = [&](TextureBinding& binding) {
+			if (!binding.image_id) return;
 			auto& image = m_context.GetTextureCache().GetImage(binding.image_id);
 			const auto&                 view = binding.desc.view_info;
 			const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
@@ -1037,6 +1169,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				              vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
 			}
 			binding.layout = image.backing.state.layout;
+		};
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			transition(descriptors.images[i]);
+		}
+		for (auto& heap_image: descriptors.heap_images) {
+			transition(heap_image.binding);
 		}
 
 		std::array<size_t, ShaderRecompiler::IR::ImageBindingCount> image_starts {};

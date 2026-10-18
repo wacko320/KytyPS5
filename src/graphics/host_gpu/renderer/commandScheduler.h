@@ -41,6 +41,10 @@ public:
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
+	// The current command buffer ends with a memory barrier to host reads (for shader writes the
+	// host reads once the submission completes, such as bindless miss records). A barrier after
+	// a draw would sit inside its render pass.
+	void                      RequestHostBarrier() noexcept { m_host_barrier_requested = true; }
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
@@ -101,6 +105,7 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	bool                         m_host_barrier_requested = false;
 };
 
 } // namespace Libs::Graphics

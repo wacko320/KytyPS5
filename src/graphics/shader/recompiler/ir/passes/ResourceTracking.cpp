@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/ir/BindlessImages.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -3635,8 +3636,17 @@ private:
 				const auto flags = inst.Flags<MemoryFlags>();
 				const auto& memory = m_program.memory_info[flags.index];
 				const auto plan_handle = [&](Value value, uint32_t width, uint32_t base, bool sampler) {
+					const auto bindless_capable = [&]() {
+						return m_program.bindless_images &&
+						       (sampler || IsBindlessImage(value.Resolve().TryInstruction(),
+						                                   ImageOpcodeInfoOf(inst.GetOpcode()),
+						                                   memory, flags.pc));
+					};
 					auto* handle = value.Resolve().TryInstruction();
 					if (handle == nullptr || FindIndirectDescriptor(*handle) != nullptr) return;
+					// A table materialization could not specialize: Collect samples the image
+					// through the bindless heap instead.
+					if (!sampler && ReportedBindless(*handle) && bindless_capable()) return;
 					DescriptorSource descriptor;
 					MakeSource(*handle, width, sampler, false, base, descriptor, flags.pc);
 					uint32_t bad_dword = 0;
@@ -3661,8 +3671,12 @@ private:
 					                  TryMakeIndirectBuffer(*handle, descriptor, plan)))) {
 						for (const auto& previous: m_indirect_descriptors) {
 							if (plan.reads[0] != nullptr && previous.reads[0] == plan.reads[0] &&
-							    !EquivalentValue(m_program, previous.key, plan.key))
+							    !EquivalentValue(m_program, previous.key, plan.key)) {
+								// Without the plan, a sampled image or its sampler falls back
+								// to the bindless heap in Collect.
+								if (bindless_capable()) return;
 								Fail(flags.pc, "shared descriptor read has incompatible keys");
+							}
 						}
 						m_indirect_descriptors.push_back(std::move(plan));
 					}
@@ -3769,7 +3783,67 @@ private:
 		                           memory.kind == ResourceKind::ScalarBuffer;
 	}
 
-	uint32_t AddImage(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
+	// CompileOptions::bindless_images: a sampled read whose T# dwords are GPU values the host
+	// cannot evaluate, such as a T# indexed by a per-lane material ID. The handle keeps those
+	// dwords for the emitter's heap lookup. Other accesses keep their tracking failure.
+	bool IsBindlessImage(const Inst* handle, const ImageOpcodeInfo& info, const MemoryInfo& memory,
+	                     uint32_t pc) {
+		if (!m_program.bindless_images || handle == nullptr ||
+		    handle->GetOpcode() != ValueOpcode::GetImageResource || handle->NumArgs() != 8u ||
+		    info.resource_class != ImageResourceClass::Sampled || info.access != ImageAccess::Read ||
+		    !Bindless::ClassFor(memory.image_dimension,
+		                        (memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0)) {
+			return false;
+		}
+		return IsBindlessDescriptor(*handle, 8u, false, false, memory.resource * 4u, pc);
+	}
+
+	// Like IsBindlessImage, for the sampler of a sample.
+	bool IsBindlessSampler(Value value, const MemoryInfo& memory, bool sample_adjust, uint32_t pc) {
+		const auto* handle = value.Resolve().TryInstruction();
+		if (!m_program.bindless_images || handle == nullptr ||
+		    handle->GetOpcode() != ValueOpcode::GetSamplerResource || handle->NumArgs() != 4u) {
+			return false;
+		}
+		return IsBindlessDescriptor(*handle, 4u, true, sample_adjust, memory.sampler * 4u, pc);
+	}
+
+	bool IsBindlessDescriptor(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
+	                          uint32_t base_reg, uint32_t pc) {
+		DescriptorSource descriptor;
+		MakeSource(handle, width, sampler, sample_adjust, base_reg, descriptor, pc);
+		uint32_t bad_dword = 0;
+		if (ValidateSource(descriptor, bad_dword)) {
+			return false;
+		}
+		for (uint32_t dword = 0; dword < width; dword++) {
+			if (handle.Arg(dword).Resolve().GetType() != Type::U32) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	// Whether an image instruction using the handle is at a pc in bindless_image_pcs.
+	bool ReportedBindless(const Inst& handle) const {
+		const auto& pcs = m_program.bindless_image_pcs;
+		return !pcs.empty() && std::ranges::any_of(handle.Uses(), [&](const auto& use) {
+			       return ImageOpcodeInfoOf(use.user->GetOpcode()).access != ImageAccess::None &&
+			              std::ranges::find(pcs, use.user->template Flags<MemoryFlags>().pc) !=
+			                  pcs.end();
+		       });
+	}
+
+	// Bindless images and samplers bind a null descriptor in their per-shader slot.
+	uint32_t BindlessSource(uint32_t dwords) {
+		DescriptorSource descriptor;
+		descriptor.dword_count = dwords;
+		descriptor.dwords.fill(Value(0u));
+		return InternSource(descriptor);
+	}
+
+	uint32_t AddImage(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc,
+	                  bool bindless = false) {
 		const auto resource_class = ImageOpcodeInfoOf(op).resource_class;
 		const bool atomic64 = ImageOpcodeInfoOf(op).access == ImageAccess::Atomic &&
 		                      memory.data_bits == 64u;
@@ -3784,7 +3858,7 @@ private:
 			if (image.source == source && image.resource_class == resource_class &&
 			    image.dimension == memory.image_dimension && image.mip_mode == mip &&
 			    image.depth_compare == depth && image.r128 == memory.image_r128 &&
-			    image.atomic64 == atomic64) {
+			    image.atomic64 == atomic64 && image.bindless == bindless) {
 				Merge(image, op, pc);
 				return i;
 			}
@@ -3801,6 +3875,7 @@ private:
 		image.depth_compare  = depth;
 		image.r128           = memory.image_r128;
 		image.atomic64       = atomic64;
+		image.bindless       = bindless;
 		Merge(image, op, pc);
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);
@@ -3817,9 +3892,9 @@ private:
 		image.unfiltered_access_only &= op == ValueOpcode::ImageRead || op == ValueOpcode::ImageWrite;
 	}
 
-	uint32_t AddSampler(uint32_t source, uint32_t pc) {
+	uint32_t AddSampler(uint32_t source, uint32_t pc, bool bindless = false) {
 		for (uint32_t i = 0; i < m_info.samplers.size(); i++) {
-			if (m_info.samplers[i].source == source) {
+			if (m_info.samplers[i].source == source && m_info.samplers[i].bindless == bindless) {
 				m_info.samplers[i].first_use_pc = std::min(m_info.samplers[i].first_use_pc, pc);
 				return i;
 			}
@@ -3827,7 +3902,7 @@ private:
 		if (m_info.samplers.size() >= ShaderInfo::MaxSamplers) {
 			return UINT32_MAX;
 		}
-		m_info.samplers.push_back({source, pc});
+		m_info.samplers.push_back({.source = source, .first_use_pc = pc, .bindless = bindless});
 		const auto root = static_cast<uint32_t>(m_info.samplers.size() - 1);
 		const auto* descriptor = Source(source);
 		if (descriptor != nullptr && descriptor->indirect_descriptor) {
@@ -3995,13 +4070,17 @@ private:
 		}
 		handle               = inst.Arg(0).Resolve().TryInstruction();
 		const auto* indirect = handle != nullptr ? FindIndirectDescriptor(*handle) : nullptr;
+		const bool  bindless =
+		    indirect == nullptr && IsBindlessImage(handle, image_info, memory, flags.pc);
 		if (indirect != nullptr) {
 			source = indirect->source;
+		} else if (bindless) {
+			source = BindlessSource(8u);
 		} else {
 			GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc,
 			          memory.resource * 4u, handle, source);
 		}
-		resource = AddImage(source, memory, op, flags.pc);
+		resource = AddImage(source, memory, op, flags.pc, bindless);
 		if (resource == UINT32_MAX) {
 			Fail(flags.pc, "image resource limit exceeded");
 		}
@@ -4018,13 +4097,18 @@ private:
 			sampler_handle = inst.Arg(1).Resolve().TryInstruction();
 			const auto* selected_sampler = sampler_handle != nullptr
 			    ? FindIndirectDescriptor(*sampler_handle) : nullptr;
+			const bool bindless_sampler =
+			    selected_sampler == nullptr &&
+			    IsBindlessSampler(inst.Arg(1), memory, sample_adjust, flags.pc);
 			if (selected_sampler != nullptr) {
 				sampler_source = selected_sampler->source;
+			} else if (bindless_sampler) {
+				sampler_source = BindlessSource(4u);
 			} else {
 				GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
 				          memory.sampler * 4u, sampler_handle, sampler_source, true, sample_adjust);
 			}
-			sampler = AddSampler(sampler_source, flags.pc);
+			sampler = AddSampler(sampler_source, flags.pc, bindless_sampler);
 			if (sampler == UINT32_MAX) {
 				Fail(flags.pc, "sampler resource limit exceeded");
 			}

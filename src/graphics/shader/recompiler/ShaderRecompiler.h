@@ -34,6 +34,14 @@ struct CompileOptions {
 	// FLAT/GLOBAL addresses. They go through the BDA page table; the host does not learn which
 	// pages they write, so CPU reads may see stale data. Off rejects them.
 	bool                        untracked_writes    = false;
+	// Sampled images and samplers whose T#/S# only the GPU knows are looked up in the bindless
+	// heap (descriptor set 1, BindlessImages.h) instead of failing tracking. A new T# reads as
+	// the null image until the heap has it (from the next dispatch).
+	bool                        bindless_images     = false;
+	// With bindless_images: first-use pcs of sampled images whose indirect descriptor table could
+	// not be specialized (MaterializeResources reported them). Tracking does not plan a table for
+	// them, so they are sampled through the bindless heap instead.
+	std::vector<uint32_t>       bindless_image_pcs;
 };
 
 struct TranslateResult {

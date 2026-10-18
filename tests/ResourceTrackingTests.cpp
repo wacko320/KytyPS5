@@ -7,12 +7,14 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -207,6 +209,19 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, std::span<uint32_t> 
     memory->watched_dwords = values.size();
   }
   return true;
+}
+
+// With CompileOptions::bindless_images, a sampled image or sampler whose descriptor tracking
+// cannot prove is sampled through the bindless heap: no indirect plan, nothing host-selected.
+void CheckBindlessFallback(const Program &program, bool sampler, const char *message) {
+  const auto &info = program.info;
+  const bool image_ok = !info.images.empty() && info.images[0].bindless &&
+                        info.images[0].indirect_root == ImageResource::NoIndirectImage &&
+                        !program.descriptor_sources[info.images[0].source].indirect_descriptor;
+  const bool sampler_ok =
+      !info.samplers.empty() && info.samplers[0].bindless &&
+      !program.descriptor_sources[info.samplers[0].source].indirect_descriptor;
+  Check(program.resource_tracking_complete && (sampler ? sampler_ok : image_ok), message);
 }
 
 std::unique_ptr<Fixture>
@@ -431,6 +446,11 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
              "noncontiguous descriptor DWORDs entered the table plan");
   Check(!malformed->program.resource_tracking_complete && malformed->program.descriptor_sources.empty(),
         "malformed image table tracking was not transactional");
+  auto bindless = MakeIndirectImageFixture(true);
+  bindless->program.bindless_images = true;
+  bindless->PlanAndTrack();
+  CheckBindlessFallback(bindless->program, false,
+                        "noncontiguous descriptor DWORDs were not sampled through the heap");
 }
 
 void TestBoundedImageViewEligibility() {
@@ -608,6 +628,81 @@ void TestExactUnfilteredImageCandidates() {
   Check(merged->program.info.images.size() == 1u &&
             !merged->program.info.images[0].unfiltered_access_only,
         "a later merged query left the unfiltered-use proof intact");
+}
+
+// Tier-2 bindless fallback: a planned image table that MaterializeResources cannot specialize
+// reports its image's first-use pc, and retranslating with that pc samples the image through the
+// bindless heap instead of planning the table.
+void TestBindlessTableFallback() {
+  using Type = Libs::Graphics::Prospero::ImageType;
+  constexpr uint32_t ImagePc = 0x10f0u;
+  const auto descriptor = [](uint32_t identity, Type type) {
+    return std::array<uint32_t, 8>{identity, 75u << 20u, 3u | (3u << 14u),
+        Libs::Graphics::DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(type) << 28u),
+        0u, 0u, 0u, 0u};
+  };
+  // Replaces the table's candidates with explicit descriptors.
+  const auto select = [&](ResourcePlan &plan, uint32_t count, bool mixed) {
+    std::vector<uint32_t> selected;
+    for (uint32_t index = 0; index < count; ++index) {
+      DescriptorSource source;
+      source.dword_count = 8u;
+      const auto value =
+          descriptor(0x30u + index, mixed && index == 1u ? Type::kColor3D : Type::kColor2D);
+      for (uint32_t word = 0; word < value.size(); ++word) source.dwords[word] = Value(value[word]);
+      selected.push_back(static_cast<uint32_t>(plan.descriptor_sources.size()));
+      plan.descriptor_sources.push_back(source);
+    }
+    plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor->sources =
+        std::move(selected);
+  };
+  const std::array<uint32_t, 8> data{0x3000u, 16u << 16u, 1u, 0u, 0x2000u, 48u << 16u, 5u, 0u};
+  LinearTestMemory memory;
+  SrtRuntime runtime{.user_data = data, .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  const auto make_plan = [&](uint32_t count, bool mixed) {
+    auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u);
+    fixture->PlanAndTrack();
+    Check(fixture->program.info.images.size() == 1u &&
+              fixture->program.info.images[0].first_use_pc == ImagePc,
+          "bindless table fixture lost its image");
+    auto plan = ExtractResourcePlan(fixture->program);
+    select(plan, count, mixed);
+    return plan;
+  };
+  for (const auto [count, mixed, message] :
+       {std::tuple{2u, true, "incompatible table candidates did not report the image"},
+        std::tuple{300u, false, "a table above the candidate cap did not report the image"}}) {
+    auto plan = make_plan(count, mixed);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    std::vector<uint32_t> pcs;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization, &pcs) &&
+              pcs == std::vector<uint32_t>{ImagePc},
+          message);
+  }
+  {
+    // Without the fallback the cap does not apply.
+    auto plan = make_plan(300u, false);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "the candidate cap applied without a bindless fallback");
+  }
+  auto retranslated = MakeIndirectImageFixture(false, 48u, 0u, 16u);
+  retranslated->program.bindless_images = true;
+  retranslated->program.bindless_image_pcs = {ImagePc};
+  retranslated->PlanAndTrack();
+  CheckBindlessFallback(retranslated->program, false,
+                        "a reported image pc still planned its table");
+  auto other = MakeIndirectImageFixture(false, 48u, 0u, 16u);
+  other->program.bindless_images = true;
+  other->program.bindless_image_pcs = {ImagePc + 4u};
+  other->PlanAndTrack();
+  Check(!other->program.info.images[0].bindless &&
+            other->program.descriptor_sources[other->program.info.images[0].source]
+                .indirect_descriptor.has_value(),
+        "an unreported image pc lost its table plan");
 }
 
 void TestWaterfallImageTable() {
@@ -1317,7 +1412,8 @@ void TestGuardedDirectImageTable() {
     Finite, FiniteZero, FiniteMissing, FiniteWrong, FiniteSigned, FiniteAdd, FiniteXor,
     FiniteShared, FiniteSharedBypass, FiniteLate
   };
-  const auto make_plan = [](Guard guard, uint32_t operand_order = 0u, bool packed_key = false) {
+  const auto make_plan = [](Guard guard, uint32_t operand_order = 0u, bool packed_key = false,
+                            bool bindless = false) {
     const bool finite = guard >= Guard::Finite;
     const bool bounded = guard >= Guard::Bounded && !finite;
     const bool exec_bound = bounded && guard >= Guard::BoundExec;
@@ -1328,6 +1424,7 @@ void TestGuardedDirectImageTable() {
     const uint32_t table_stride = exec_bound ? 784u : bounded ? 272u : 32u;
     Fixture fixture(bounded || finite ? ShaderType::Compute : ShaderType::Pixel);
     fixture.program.wave_size = 64u;
+    fixture.program.bindless_images = bindless;
     auto *entry = fixture.block;
     auto *middle = fixture.AddBlock();
     auto *before_sample = fixture.AddBlock();
@@ -1594,6 +1691,11 @@ void TestGuardedDirectImageTable() {
       Check(conjunctions == 1u, "EXEC bound retained repeated active-lane conjunctions");
     }
     fixture.PlanAndTrack();
+    if (bindless) {
+      CheckBindlessFallback(fixture.program, false,
+                            "unguarded direct table selector was not sampled through the heap");
+      return ExtractResourcePlan(fixture.program);
+    }
     const auto source = fixture.program.info.images[0].source;
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
     Check(indirect && !indirect->selector.has_value() &&
@@ -1622,6 +1724,7 @@ void TestGuardedDirectImageTable() {
                            Guard::FiniteSharedBypass, Guard::FiniteLate}) {
     CheckFatal([&] { make_plan(guard); }, "not a valid runtime value",
                "direct table accepted a selector without a dominating range guard");
+    make_plan(guard, 0u, false, true);
   }
   LinearTestMemory memory;
   constexpr uint64_t table = 0x1800u + 344u;
@@ -1815,7 +1918,7 @@ void TestBoundedComputeImageLoop() {
   };
   const auto make_plan = [](Variant variant, bool material = false, uint32_t first = 0u,
                             Clamp clamp = Clamp::None, PostTest post = PostTest::None,
-                            uint32_t post_bound = 6u) {
+                            uint32_t post_bound = 6u, bool bindless = false) {
     const bool post_test = post != PostTest::None;
     const bool diamond = variant >= Variant::GuardedDiamond;
     Fixture fixture(diamond ? ShaderType::Vertex : ShaderType::Compute);
@@ -2121,7 +2224,13 @@ void TestBoundedComputeImageLoop() {
       fixture.Emit(ValueOpcode::ImageWrite, {output, fixture.ImageAddress(), texel, Value(true)},
                    fixture.AddMemory(sample, 0x2a0));
     }
+    fixture.program.bindless_images = bindless;
     fixture.PlanAndTrack();
+    if (bindless) {
+      CheckBindlessFallback(fixture.program, false,
+                            "unproven compute image loop was not sampled through the heap");
+      return ExtractResourcePlan(fixture.program);
+    }
     const auto source = fixture.program.info.images[0].source;
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
     Check(indirect && indirect->selector.has_value() == material &&
@@ -2198,6 +2307,16 @@ void TestBoundedComputeImageLoop() {
                "post-tested image loop accepted a nonzero or wrapping initial value");
   CheckFatal([&] { post_test_plan(PostTest::Signed, 6u, 0u, Variant::WrongStep); },
              "not a valid runtime value", "post-tested image loop accepted a two-step induction");
+  for (const auto variant : {Variant::IncrementBypass, Variant::PreviousBound,
+                             Variant::ForwardedJoin, Variant::ForwardedBranch,
+                             Variant::ForwardedIncrementBypass, Variant::MaskedWrongGuard,
+                             Variant::MaskResurrection, Variant::StatusOverwrite,
+                             Variant::GuardedDiamondBypass, Variant::WrongGuard,
+                             Variant::EntryBypass, Variant::ExitBypass, Variant::GuardBlock,
+                             Variant::WrongStep, Variant::DivergentBound, Variant::DivergentKey,
+                             Variant::Disjunction, Variant::WrongPolarity}) {
+    make_plan(variant, false, 0u, Clamp::None, PostTest::None, 6u, true);
+  }
 
   LinearTestMemory memory;
   const auto table = 0x1800u + 0x6b0u;
@@ -2239,6 +2358,49 @@ void TestBoundedComputeImageLoop() {
               snapshot.images.back().dwords[0] == 0x100u + count - 1u,
           "compute image table did not refresh for a changed loop bound");
   }
+  // A growing table keeps its descriptor array size, and so its permutation, within a bucket:
+  // above 16 candidates the array pads with null descriptors that no key selects.
+  Check(IndirectImageArrayBucket(16u) == 16u && IndirectImageArrayBucket(17u) == 32u &&
+            IndirectImageArrayBucket(123u) == 128u && IndirectImageArrayBucket(125u) == 128u &&
+            IndirectImageArrayBucket(129u) == 160u && IndirectImageArrayBucket(170u) == 192u,
+        "indirect image array buckets changed");
+  for (uint32_t key = 0; key < 40u; ++key) {
+    const auto word = (table - memory.base) / 4u + key * 8u;
+    memory.words[word] = 0x100u + key;
+    memory.words[word + 1u] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    memory.words[word + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  }
+  std::optional<ResourceSpecialization> bucket_specialization;
+  // 17-31 keys also keep the key search depth (bit_width 5).
+  for (const uint32_t count : {17u, 20u, 31u}) {
+    user_data[2] = count;
+    const bool materialized = MaterializeResources(plan, runtime, snapshot, specialization);
+    const auto padding_null = std::all_of(
+        snapshot.images.begin() + std::min<size_t>(count, snapshot.images.size()),
+        snapshot.images.end(), [](const auto &image) {
+          return std::ranges::all_of(image.dwords, [](uint32_t word) { return word == 0u; });
+        });
+    Check(materialized && snapshot.images.size() == 32u &&
+              specialization.images.size() == 32u &&
+              snapshot.flattened_srt[
+                  specialization.images[0].indirect_mapping_offset] == count &&
+              snapshot.images[count - 1u].dwords[0] == 0x100u + count - 1u && padding_null &&
+              std::ranges::all_of(specialization.images, [&](const auto &image) {
+                return image.indirect_root == 0u &&
+                       image.dimension == specialization.images[0].dimension &&
+                       image.numeric_class == specialization.images[0].numeric_class;
+              }),
+          "growing compute image table did not pad its candidates to the bucket");
+    if (!bucket_specialization) bucket_specialization = specialization;
+    Check(specialization == *bucket_specialization,
+          "image table growth within a bucket changed the specialization");
+  }
+  user_data[2] = 33u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 48u && specialization != *bucket_specialization,
+        "image table growth past a bucket kept the old specialization");
   for (const uint32_t count : {0u, UINT32_MAX}) {
     user_data[2] = count;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
@@ -2683,7 +2845,7 @@ void TestUniformizedMaterialImageKeys() {
     PackedWrongGuard, PackedSparseOffset, PackedWrongField,
     PackedMerged, PackedUnboundedMerge, PackedCyclicMerge
   };
-  const auto make_plan = [](Variant variant) {
+  const auto make_plan = [](Variant variant, bool bindless = false) {
     Fixture fixture;
     fixture.program.wave_size = 64u;
     const bool first_lane = variant >= Variant::FirstLane;
@@ -3007,7 +3169,13 @@ void TestUniformizedMaterialImageKeys() {
                  {output, Value(0u), Value(0u), Value(0u),
                   Value(1u), Value(true)},
                  fixture.AddMemory(output_memory, 0x1b00u), done);
+    fixture.program.bindless_images = bindless;
     fixture.PlanAndTrack();
+    if (bindless) {
+      CheckBindlessFallback(fixture.program, false,
+                            "unproven material key was not sampled through the heap");
+      return ExtractResourcePlan(fixture.program);
+    }
     const auto source = fixture.program.info.images[0].source;
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
     if (packed)
@@ -3162,6 +3330,13 @@ void TestUniformizedMaterialImageKeys() {
                              Variant::PackedCyclicMerge})
     CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
                "packed selector accepted an unproved OR guard, offset domain, or field extraction");
+  for (const auto variant : {Variant::WrongUpdate, Variant::WrongEquality, Variant::WrongExit,
+                             Variant::WrongCarry, Variant::WrongBackedge,
+                             Variant::EmptyFirstEntry, Variant::WrongFirstBackedge,
+                             Variant::WideningFirstEntry, Variant::WideningFirstBackedge,
+                             Variant::WrongFirstLoadMask}) {
+    make_plan(variant, true);
+  }
 }
 
 void TestImageDescriptorFields() {
@@ -5078,6 +5253,9 @@ void TestSampleAdjustSamplerScratch() {
 
     CheckFatal([&] { rejected.PlanAndTrack(); },
                "not a valid runtime value", message);
+    rejected.program.bindless_images = true;
+    rejected.PlanAndTrack();
+    CheckBindlessFallback(rejected.program, true, message);
   };
   CheckRejected(0u, 12u,
                 "ordinary sampling accepted SampleAdjust reserved scratch");
@@ -6868,7 +7046,7 @@ void TestPackedScalarBufferSelection() {
 
 ResourcePlan ConditionalSamplerPlan(bool diamond, bool reverse, bool reverse_phi,
                                     bool nonuniform = false,
-                                    bool writable = false) {
+                                    bool writable = false, bool bindless = false) {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   Fixture fixture(ShaderType::Pixel);
   auto *entry = fixture.block;
@@ -6962,7 +7140,13 @@ ResourcePlan ConditionalSamplerPlan(bool diamond, bool reverse, bool reverse_phi
                  {fixture.Emit(ValueOpcode::CompositeExtractU32x4,
                                {result, Value(0u)})});
   }
+  fixture.program.bindless_images = bindless;
   fixture.PlanAndTrack();
+  if (bindless) {
+    CheckBindlessFallback(fixture.program, true,
+                          "unproven sampler selection was not sampled through the heap");
+    return ExtractResourcePlan(fixture.program);
+  }
   Check(std::ranges::count_if(fixture.program.value_storage, [](const Inst &inst) {
           return inst.GetOpcode() == ValueOpcode::SelectU32;
         }) == 4,
@@ -7025,6 +7209,8 @@ void TestConditionalSamplerPhi() {
         [&] { ConditionalSamplerPlan(diamond, false, false, false, true); },
         "not a valid runtime value",
         "shader-written sampler predicate was accepted");
+    ConditionalSamplerPlan(diamond, false, false, true, false, true);
+    ConditionalSamplerPlan(diamond, false, false, false, true, true);
   }
 }
 
@@ -8325,6 +8511,7 @@ int main() {
     Run("unbounded material image keys", [] { TestInvariantIndirectImageMaterialization(false); });
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
     Run("exact unfiltered image candidates", TestExactUnfilteredImageCandidates);
+    Run("bindless table fallback", TestBindlessTableFallback);
     Run("waterfall image table", TestWaterfallImageTable);
     Run("nested pointer image table", TestNestedPointerImageTable);
     Run("indexed pointer image table", TestIndexedPointerImageTable);

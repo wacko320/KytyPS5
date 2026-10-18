@@ -837,7 +837,143 @@ std::array<ImageSampler, 2> LoadImageSamplers(ValueEmitContext& ctx, const IR::I
 	return result;
 }
 
+uint32_t LoadBindlessWord(EmitterState& state, uint32_t variable, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          variable, ConstantU32(state, 0), index);
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	return value;
+}
+
+// Looks a handle's T# or S# up in the bindless table (see BindlessImages.h), without branches. A
+// miss is remembered for the report at return and reads slot 0, a null image or default sampler.
+uint32_t BindlessSlot(ValueEmitContext& ctx, const IR::Inst& inst, IR::Value handle_value,
+                      uint32_t dwords, uint32_t class_id) {
+	namespace Bindless = IR::Bindless;
+	auto&       state  = ctx.state;
+	const auto* handle = handle_value.ResolveInstruction();
+	if (handle == nullptr || handle->NumArgs() != dwords || state.bindless_table_variable == 0) {
+		ctx.Fail(inst, "has no bindless descriptor");
+	}
+	const auto u32  = TypeU32(state);
+	const auto Bool = [&](spv::Op op, uint32_t lhs, uint32_t rhs) {
+		return Binary(state, op, TypeBool(state), lhs, rhs);
+	};
+	std::array<uint32_t, 8> words {};
+	for (uint32_t dword = 0; dword < words.size(); dword++) {
+		words[dword] = dword < dwords ? ctx.Def(handle->Arg(dword)) : ConstantU32(state, 0);
+	}
+	auto hash = ConstantU32(state, 0x811c9dc5u ^ class_id);
+	for (const auto word: words) {
+		hash = Binary(state, spv::OpIMul, u32, Binary(state, spv::OpBitwiseXor, u32, hash, word),
+		              ConstantU32(state, 0x01000193u));
+	}
+	hash = Binary(state, spv::OpBitwiseXor, u32, hash,
+	              Binary(state, spv::OpShiftRightLogical, u32, hash, ConstantU32(state, 15)));
+	const auto mask = Binary(state, spv::OpISub, u32,
+	                         LoadBindlessWord(state, state.bindless_table_variable,
+	                                          ConstantU32(state, 0)),
+	                         ConstantU32(state, 1));
+	// The first probe whose hash matches is the only candidate; its key is then verified.
+	auto base  = ConstantU32(state, 0);
+	auto found = ConstantBool(state, false);
+	for (uint32_t probe = 0; probe < Bindless::MaxProbes; probe++) {
+		const auto index = Binary(state, spv::OpBitwiseAnd, u32,
+		                          Binary(state, spv::OpIAdd, u32, hash, ConstantU32(state, probe)),
+		                          mask);
+		const auto entry = Binary(state, spv::OpIAdd, u32, ConstantU32(state, 1),
+		                          Binary(state, spv::OpIMul, u32, index,
+		                                 ConstantU32(state, Bindless::EntryDwords)));
+		const auto tag   = LoadBindlessWord(state, state.bindless_table_variable, entry);
+		const auto hit   = Bool(spv::OpLogicalAnd, Bool(spv::OpIEqual, tag, hash),
+		                        Unary(state, spv::OpLogicalNot, TypeBool(state), found));
+		base  = Select(state, u32, hit, entry, base);
+		found = Bool(spv::OpLogicalOr, found, hit);
+	}
+	const auto Entry = [&](uint32_t dword) {
+		return LoadBindlessWord(state, state.bindless_table_variable,
+		                        Binary(state, spv::OpIAdd, u32, base, ConstantU32(state, dword)));
+	};
+	// base is 0 when nothing matched: dword 0 is the capacity, never a slot, so the reads stay
+	// inside the table and the match fails.
+	auto match = Bool(spv::OpLogicalAnd, found,
+	                  Bool(spv::OpIEqual, Entry(9), ConstantU32(state, class_id)));
+	for (uint32_t dword = 0; dword < words.size(); dword++) {
+		match = Bool(spv::OpLogicalAnd, match, Bool(spv::OpIEqual, Entry(1u + dword), words[dword]));
+	}
+	const auto value = Entry(10);
+	found = Bool(spv::OpLogicalAnd, match, Bool(spv::OpINotEqual, value, ConstantU32(state, 0)));
+	const auto slot = Select(state, u32, found,
+	                         Binary(state, spv::OpISub, u32, value, ConstantU32(state, 1)),
+	                         ConstantU32(state, 0));
+	const auto missed = Unary(state, spv::OpLogicalNot, TypeBool(state), found);
+	for (uint32_t dword = 0; dword <= words.size(); dword++) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain,
+		                          TypePointer(state, spv::StorageClassPrivate, u32), pointer,
+		                          state.bindless_miss_record_variable, ConstantU32(state, dword));
+		const auto previous = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, u32, previous, pointer);
+		// The last dword holds the class + 1; 0 marks no miss.
+		const auto recorded =
+		    dword < words.size() ? words[dword] : ConstantU32(state, class_id + 1u);
+		state.builder.AddFunction(spv::OpStore, pointer,
+		                          Select(state, u32, missed, recorded, previous));
+	}
+	return slot;
+}
+
 } // namespace
+
+void EmitBindlessMissReport(EmitterState& state) {
+	namespace Bindless = IR::Bindless;
+	if (state.bindless_miss_record_variable == 0) {
+		return;
+	}
+	const auto u32  = TypeU32(state);
+	const auto Word = [&](uint32_t dword) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain,
+		                          TypePointer(state, spv::StorageClassPrivate, u32), pointer,
+		                          state.bindless_miss_record_variable, ConstantU32(state, dword));
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, u32, value, pointer);
+		return value;
+	};
+	const auto tagged_class = Word(Bindless::MissDwords - 1u);
+	EmitIfCondition(
+	    state, Binary(state, spv::OpINotEqual, TypeBool(state), tagged_class, ConstantU32(state, 0)),
+	    [&]() {
+		    const auto count_pointer = state.builder.AllocateId();
+		    state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                              count_pointer, state.bindless_miss_variable,
+		                              ConstantU32(state, 0), ConstantU32(state, 0));
+		    const auto record = state.builder.AllocateId();
+		    state.builder.AddFunction(spv::OpAtomicIAdd, u32, record, count_pointer,
+		                              ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0),
+		                              ConstantU32(state, 1));
+		    const auto room = Binary(state, spv::OpULessThan, TypeBool(state), record,
+		                             ConstantU32(state, Bindless::MaxMisses));
+		    EmitIfCondition(state, room, [&]() {
+			    const auto base = Binary(state, spv::OpIAdd, u32, ConstantU32(state, 1),
+			                             Binary(state, spv::OpIMul, u32, record,
+			                                    ConstantU32(state, Bindless::MissDwords)));
+			    for (uint32_t dword = 0; dword < Bindless::MissDwords; dword++) {
+				    const auto pointer = state.builder.AllocateId();
+				    state.builder.AddFunction(
+				        spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+				        state.bindless_miss_variable, ConstantU32(state, 0),
+				        Binary(state, spv::OpIAdd, u32, base, ConstantU32(state, dword)));
+				    const auto value =
+				        dword + 1u < Bindless::MissDwords
+				            ? Word(dword)
+				            : Binary(state, spv::OpISub, u32, tagged_class, ConstantU32(state, 1));
+				    state.builder.AddFunction(spv::OpStore, pointer, value);
+			    }
+		    });
+	    });
+}
 
 void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto op         = inst.GetOpcode();
@@ -848,6 +984,20 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	ctx.ResourceIndex(image_arg, IR::ValueOpcode::GetImageResource);
 	const auto& image   = state.program.info.images.at(mem.resource);
 	const auto* address = ctx.ImageAddress(inst.Arg(image_info.needs_sampler ? 2 : 1));
+	if (image.bindless) {
+		const auto image_class = IR::Bindless::ClassFor(image.dimension, image.depth_compare);
+		EXIT_IF(!image_class.has_value());
+		state.bindless_slot =
+		    BindlessSlot(ctx, inst, inst.Arg(0), 8u, static_cast<uint32_t>(*image_class));
+	}
+	if (image_info.needs_sampler && mem.sampler < state.program.info.samplers.size() &&
+	    state.program.info.samplers[mem.sampler].bindless) {
+		state.bindless_sampler_compare = HasFlag(mem, Decoder::ImageSampleFlagCompare);
+		state.bindless_sampler_slot    = BindlessSlot(ctx, inst, inst.Arg(1), 4u,
+		                                              state.bindless_sampler_compare
+		                                                  ? IR::Bindless::CompareSamplerClass
+		                                                  : IR::Bindless::SamplerClass);
+	}
 	if (op == IR::ValueOpcode::ImageQueryDimensions) {
 		state.builder.RequireCapability(spv::CapabilityImageQuery);
 		ctx.Define(inst, QueryDimensions(ctx, mem, *address));

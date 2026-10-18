@@ -46,6 +46,19 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	vk::DescriptorBufferInfo              shared_memory;
 	std::vector<uint32_t>                 shader_data;
+
+	// Bindless heap views for the stage, per class in slot order with the null image at slot 0,
+	// and its samplers (BindlessHeap).
+	struct HeapImage {
+		ShaderRecompiler::IR::ImageResource   resource;
+		ShaderRecompiler::IR::DescriptorValue value;
+		TextureBinding                        binding;
+		uint32_t                              image_class = 0;
+	};
+	std::vector<HeapImage>   heap_images;
+	std::vector<vk::Sampler> heap_samplers;
+	std::vector<vk::Sampler> heap_compare_samplers;
+	bool                     uses_bindless = false;
 };
 
 [[nodiscard]] vk::DescriptorType

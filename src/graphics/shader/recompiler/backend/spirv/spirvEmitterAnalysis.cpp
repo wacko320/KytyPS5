@@ -144,10 +144,37 @@ void DecorateNonUniformDescriptor(EmitterState& state, uint32_t id, spv::Capabil
 	state.builder.RequireCapability(capability);
 	state.builder.AddAnnotation(spv::OpDecorate, id, spv::DecorationNonUniform);
 }
+
+// A bindless image or sampler: the heap array element at the instruction's slot (EmitImage looks
+// it up). The slot differs per lane.
+uint32_t LoadBindlessDescriptor(EmitterState& state, uint32_t variable, uint32_t type,
+                                uint32_t slot, spv::Capability capability) {
+	EXIT_IF(variable == 0 || slot == 0);
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain,
+	                          TypePointer(state, spv::StorageClassUniformConstant, type), pointer,
+	                          variable, slot);
+	DecorateNonUniformDescriptor(state, pointer, capability);
+	const auto descriptor = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, type, descriptor, pointer);
+	DecorateNonUniformDescriptor(state, descriptor, capability);
+	return descriptor;
+}
 } // namespace
 
 uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip,
                              uint32_t array_index) {
+	const auto& image_resource = state.program.info.images.at(resource);
+	if (image_resource.bindless) {
+		EXIT_IF(image_resource.resource_class != IR::ImageResourceClass::Sampled || mip != 0);
+		const auto image_class =
+		    IR::Bindless::ClassFor(image_resource.dimension, image_resource.depth_compare);
+		EXIT_IF(!image_class.has_value());
+		return LoadBindlessDescriptor(
+		    state, state.bindless_image_variables[static_cast<uint32_t>(*image_class)],
+		    ImageType(state, image_resource), state.bindless_slot,
+		    spv::CapabilitySampledImageArrayNonUniformIndexing);
+	}
 	const auto pointer = ImageDescriptorPointer(state, resource, mip, array_index);
 	const auto image = state.builder.AllocateId();
 	const auto kind = *IR::DescriptorBindingForImage(state.program.info.images[resource]);
@@ -166,6 +193,15 @@ uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler, uint32_t a
 	if (sampler >= state.program.info.samplers.size()) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Samplers, sampler,
 		                             "sampler resource index is out of range");
+	}
+	if (state.program.info.samplers[sampler].bindless) {
+		return LoadBindlessDescriptor(state,
+		                              state.bindless_sampler_compare
+		                                  ? state.bindless_compare_sampler_variable
+		                                  : state.bindless_sampler_variable,
+		                              state.builder.Type(spv::OpTypeSampler),
+		                              state.bindless_sampler_slot,
+		                              spv::CapabilitySampledImageArrayNonUniformIndexing);
 	}
 	const auto pointer = DescriptorElementPointer(
 	    state, state.sampler_pointer_type, state.sampler_variable,
@@ -191,8 +227,12 @@ uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampl
 		    spv::OpTypeSampledImage, state.images[IR::ImageBindingIndex(kind)].type);
 	}
 	state.builder.AddFunction(spv::OpSampledImage, sampled_type, sampled_image, image, sampler_id);
-	if (array_index != 0u || sampler_dynamic) {
-		DecorateNonUniformDescriptor(state, sampled_image, spv::CapabilitySampledImageArrayNonUniformIndexing);
+	// A heap-sourced sampler anywhere in the program may be the one passed in.
+	if (array_index != 0u || sampler_dynamic || image_resource.bindless ||
+	    std::ranges::any_of(state.program.info.samplers,
+	                        [](const auto& sampler) { return sampler.bindless; })) {
+		DecorateNonUniformDescriptor(state, sampled_image,
+		                             spv::CapabilitySampledImageArrayNonUniformIndexing);
 	}
 	return sampled_image;
 }

@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
+#include "graphics/shader/recompiler/ir/BindlessImages.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
@@ -124,6 +125,18 @@ struct EmitterState {
 	// reported to the fault buffer at return.
 	uint32_t                                         bda_read_pointer_function = 0;
 	uint32_t                                         bda_missing_page_variable = 0;
+	// The bindless heap in descriptor set 1 (BindlessImages.h), and the invocation's last miss.
+	uint32_t                                         bindless_table_variable = 0;
+	uint32_t                                         bindless_miss_variable  = 0;
+	uint32_t                                         bindless_miss_record_variable = 0;
+	std::array<uint32_t, IR::Bindless::ClassCount>   bindless_image_variables {};
+	uint32_t                                         bindless_sampler_variable = 0;
+	uint32_t                                         bindless_compare_sampler_variable = 0;
+	// Heap slots of the bindless image and sampler the current image instruction reads, and
+	// whether that sampler compares depth.
+	uint32_t                                         bindless_slot = 0;
+	uint32_t                                         bindless_sampler_slot = 0;
+	bool                                             bindless_sampler_compare = false;
 	uint32_t                                         bvh_intersect_function  = 0;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
@@ -560,6 +573,8 @@ uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
 // A miss is recorded when record is true and reported at return (EmitBdaFaultReport).
 uint32_t GetBdaReadPointer(EmitterState& state, uint32_t address, uint32_t record);
 void     EmitBdaFaultReport(EmitterState& state);
+// Records the invocation's remembered bindless miss in the heap's miss list; emitted at return.
+void     EmitBindlessMissReport(EmitterState& state);
 
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>
