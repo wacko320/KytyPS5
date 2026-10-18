@@ -352,17 +352,21 @@ struct TextureCacheTestAccess {
     return count;
   }
 
+  // Direct page-index edits bypass registration, so they also drop remembered
+  // region queries.
   static void AddPageOwner(TextureCache &cache, uint64_t address, ImageId id) {
     std::lock_guard lock(cache.m_lock);
     cache
         .m_image_page_table[static_cast<size_t>(
             address >> TextureCache::ImagePageTable::kPageBits)]
         .push_back(id);
+    cache.m_registration_generation++;
   }
 
   static bool RemovePageOwner(TextureCache &cache, uint64_t address,
                               ImageId id) {
     std::lock_guard lock(cache.m_lock);
+    cache.m_registration_generation++;
     auto *owners = cache.m_image_page_table.Find(static_cast<size_t>(
         address >> TextureCache::ImagePageTable::kPageBits));
     return owners != nullptr && owners->Erase(id);
@@ -371,6 +375,12 @@ struct TextureCacheTestAccess {
   static void SetQueryEpoch(TextureCache &cache, uint32_t epoch) {
     std::lock_guard lock(cache.m_lock);
     cache.m_image_query_epoch = epoch;
+    cache.m_registration_generation++;
+  }
+
+  static uint64_t ResolveEpoch(TextureCache &cache) {
+    std::lock_guard lock(cache.m_lock);
+    return cache.m_resolve_epoch;
   }
 
   static uint32_t QueryEpoch(TextureCache &cache) {
@@ -436,6 +446,10 @@ struct TextureCacheTestAccess {
 };
 
 struct RenderExecutorTestAccess {
+  static uint64_t FullTextureResolves(const RenderExecutor &executor) {
+    return executor.m_full_texture_resolves;
+  }
+
   static void DrawIndex(RenderExecutor &executor, CommandBuffer &command,
                         const DrawIndexArgs &args) {
     executor.DrawIndex(0, command, args);
@@ -6145,6 +6159,11 @@ public:
                   std::find(shared_results.begin(), shared_results.end(),
                             shared_second) != shared_results.end(),
               "two registered owners were not retained in one coarse page");
+      Require(name, "remembered coarse-page query",
+              TextureCacheTestAccess::FindImages(
+                  texture_cache, shared_info.data.address,
+                  shared_info.data.size, false) == shared_results,
+              "a repeated region query changed its answer");
       TextureCacheTestAccess::DeleteImage(texture_cache, shared_first);
       const auto shared_survivor = TextureCacheTestAccess::FindImages(
           texture_cache, shared_info.data.address, shared_info.data.size,
@@ -13602,6 +13621,272 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "fixed-clear direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A repeated T# reuses its resolved image until the texture cache's resolve epoch moves; CPU
+  // writes, render-target writes and image deletion must still show through it.
+  void CheckTextureResolveCache() {
+    constexpr const char *name = "TextureResolveCache";
+    constexpr uintptr_t base = 0x0000000204800000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "texture allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "texture mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      // PPSA03541's single-texel RGBA16F target, padded to a 128x64 block.
+      registers.SetColorBase(0, {.addr = base});
+      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k16_16_16_16,
+                                 .channel_type = Prospero::ChannelType::kFloat,
+                                 .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = 0, .width = 0, .num_mip_levels = 0});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                    .dimension = 1,
+                                    .metadata_pipe_aligned = true});
+      registers.SetRenderTargetMask(0x0f);
+      scheduler.Begin(registers, user_config, shaders);
+      auto &cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      context.MapMemory(base, allocation_size);
+
+      ShaderTextureResource descriptor{{
+          static_cast<uint32_t>(base >> 8u),
+          static_cast<uint32_t>(Prospero::BufferFormat::k16_16_16_16Float) << 20u, 0,
+          DstSel(4, 5, 6, 7) |
+              (static_cast<uint32_t>(Prospero::TileMode::kRenderTarget) << 20u) |
+              (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+          0, 0x00700000u, 0, 0}};
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy_n(descriptor.fields, 8, value.dwords.begin());
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      const auto sample = [&] {
+        RenderExecutorTestAccess::ResetBindings(executor);
+        auto binding = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+        Require(name, "sampled view",
+                cache.FindTexture(binding.image_id, binding.desc) != nullptr,
+                "the resolved texture produced no view");
+        return binding;
+      };
+
+      const auto first = sample();
+      Require(name, "first sample", ReadCachedTexel(name, context, first.image_id) ==
+                                         std::vector<u32>{0, 0},
+              "the first resolve did not upload the zeroed guest texel");
+      const auto epoch = TextureCacheTestAccess::ResolveEpoch(cache);
+      const auto full_resolves = RenderExecutorTestAccess::FullTextureResolves(executor);
+      const auto repeated = sample();
+      Require(name, "repeated resolve",
+              repeated.image_id == first.image_id &&
+                  repeated.desc.view_info == first.desc.view_info &&
+                  TextureCacheTestAccess::ResolveEpoch(cache) == epoch &&
+                  RenderExecutorTestAccess::FullTextureResolves(executor) == full_resolves,
+              "a repeated descriptor did not reuse its resolved image and view");
+
+      // A CPU write keeps the resolved image; binding refreshes it.
+      Require(name, "cpu write range", context.InvalidateMemory(base, allocation_size),
+              "the CPU write is outside the mapped allocation");
+      const std::vector<uint32_t> ones(allocation_size / sizeof(uint32_t), 0x3c003c00u);
+      LibKernel::Memory::WriteBacking(base, ones.data(), allocation_size);
+      const auto updated = sample();
+      Require(name, "cpu-updated texture",
+              updated.image_id == first.image_id &&
+                  TextureCacheTestAccess::ResolveEpoch(cache) == epoch &&
+                  RenderExecutorTestAccess::FullTextureResolves(executor) == full_resolves &&
+                  ReadCachedTexel(name, context, updated.image_id) ==
+                      std::vector<u32>{0x3c003c00u, 0x3c003c00u},
+              "a reused resolve sampled stale bytes after a CPU write");
+
+      // Deleting the image moves the epoch: the next resolve must not return the freed id.
+      TextureCacheTestAccess::DeleteImage(cache, updated.image_id);
+      const auto remapped = sample();
+      Require(name, "deleted image",
+              TextureCacheTestAccess::ResolveEpoch(cache) != epoch &&
+                  !TextureCacheTestAccess::Contains(cache, updated.image_id) &&
+                  TextureCacheTestAccess::Contains(cache, remapped.image_id) &&
+                  ReadCachedTexel(name, context, remapped.image_id) ==
+                      std::vector<u32>{0x3c003c00u, 0x3c003c00u},
+              "a resolve returned an image the texture cache had deleted");
+
+      // A render-target write to the same memory shows through the reused resolve.
+      const auto remapped_epoch = TextureCacheTestAccess::ResolveEpoch(cache);
+      const auto remapped_resolves = RenderExecutorTestAccess::FullTextureResolves(executor);
+      RenderColorInfo color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), color,
+                                                         0);
+      (void)cache.FindRenderTarget(color.image_id, color.desc);
+      RenderDepthInfo no_depth{};
+      const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &color, 1, no_depth);
+      scheduler.Current().BeginRendering(rendering);
+      scheduler.Current().EndRendering();
+      vk::ClearValue clear{};
+      clear.color.float32 = std::array{1.0f, 0.0f, 1.0f, 1.0f};
+      TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), color.image_id,
+                                         {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+      const auto rendered = sample();
+      Require(name, "render-target write reuses the resolve",
+              color.image_id == remapped.image_id && rendered.image_id == remapped.image_id &&
+                  TextureCacheTestAccess::ResolveEpoch(cache) == remapped_epoch &&
+                  RenderExecutorTestAccess::FullTextureResolves(executor) ==
+                      remapped_resolves,
+              "the render target or the repeated texture took a fresh resolve");
+      Require(name, "render-target write",
+              rendered.image_id == color.image_id &&
+                  ReadCachedTexel(name, context, rendered.image_id) ==
+                      std::vector<u32>{0x00003c00u, 0x3c003c00u},
+              "a reused resolve missed the render target's GPU-written texel");
+
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "texture mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "texture allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A T# that resolves to a layer of a larger image keeps that placement on a reused resolve,
+  // and the larger image's registration remaps a resolve made before it.
+  void CheckTextureResolveTopology() {
+    constexpr const char *name = "TextureResolveTopology";
+    constexpr uintptr_t base = 0x0000000204900000ull;
+    constexpr uint64_t layer_size = 0x10000;
+    constexpr uint64_t allocation_size = 4 * layer_size;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "texture allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "texture mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      context.MapMemory(base, allocation_size);
+
+      // Single-texel RGBA16F render-target layers, each padded to a 128x64 block.
+      const auto make_value = [](uint64_t address, uint32_t layers) {
+        ShaderTextureResource descriptor{{
+            static_cast<uint32_t>(address >> 8u),
+            static_cast<uint32_t>(Prospero::BufferFormat::k16_16_16_16Float) << 20u, 0,
+            DstSel(4, 5, 6, 7) |
+                (static_cast<uint32_t>(Prospero::TileMode::kRenderTarget) << 20u) |
+                (static_cast<uint32_t>(layers > 1 ? Prospero::ImageType::kColor2DArray
+                                                  : Prospero::ImageType::kColor2D)
+                 << 28u),
+            layers - 1u, 0x00700000u, 0, 0}};
+        ShaderRecompiler::IR::DescriptorValue value{};
+        value.dword_count = 8;
+        std::copy_n(descriptor.fields, 8, value.dwords.begin());
+        return value;
+      };
+      const auto layer_value = make_value(base + layer_size, 1);
+      const auto array_value = make_value(base, 2);
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      auto array_resource = resource;
+      array_resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+      const auto sample = [&](const ShaderRecompiler::IR::ImageResource &sampled,
+                              const ShaderRecompiler::IR::DescriptorValue &value) {
+        RenderExecutorTestAccess::ResetBindings(executor);
+        auto binding = RenderExecutorTestAccess::ResolveTexture(executor, sampled, value);
+        Require(name, "sampled view",
+                cache.FindTexture(binding.image_id, binding.desc) != nullptr,
+                "the resolved texture produced no view");
+        return binding;
+      };
+
+      const auto alone = sample(resource, layer_value);
+      Require(name, "layer footprint",
+              alone.desc.info.data.size == layer_size &&
+                  alone.desc.view_info.base_layer == 0,
+              "the single-layer descriptor decoded an unexpected footprint");
+
+      // An image registered elsewhere moves the epoch but leaves this range's answer standing.
+      const auto unrelated_value = make_value(base + 2 * layer_size, 1);
+      const auto unrelated_epoch = TextureCacheTestAccess::ResolveEpoch(cache);
+      const auto unrelated = sample(resource, unrelated_value);
+      const auto unrelated_resolves = RenderExecutorTestAccess::FullTextureResolves(executor);
+      const auto kept = sample(resource, layer_value);
+      Require(name, "unrelated registration",
+              unrelated.image_id != alone.image_id &&
+                  TextureCacheTestAccess::ResolveEpoch(cache) != unrelated_epoch &&
+                  kept.image_id == alone.image_id &&
+                  RenderExecutorTestAccess::FullTextureResolves(executor) ==
+                      unrelated_resolves,
+              "an image registered at another range invalidated this resolve");
+
+      // The array covers the cached layer: it replaces the layer's image and moves the epoch.
+      const auto array = sample(array_resource, array_value);
+      const auto array_epoch = TextureCacheTestAccess::ResolveEpoch(cache);
+      const auto remapped = sample(resource, layer_value);
+      Require(name, "remapped into the array",
+              !TextureCacheTestAccess::Contains(cache, alone.image_id) &&
+                  remapped.image_id == array.image_id &&
+                  remapped.desc.view_info.base_layer == 1 &&
+                  remapped.desc.view_info.base_level == 0,
+              "the cached layer resolve survived the covering array's registration");
+
+      const auto full_resolves = RenderExecutorTestAccess::FullTextureResolves(executor);
+      const auto repeated = sample(resource, layer_value);
+      Require(name, "reused layer placement",
+              repeated.image_id == array.image_id &&
+                  repeated.desc.view_info == remapped.desc.view_info &&
+                  TextureCacheTestAccess::ResolveEpoch(cache) == array_epoch &&
+                  RenderExecutorTestAccess::FullTextureResolves(executor) == full_resolves,
+              "a reused resolve lost the layer placement within the array");
+
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "texture mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "texture allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -52199,6 +52484,8 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
+    vulkan.CheckTextureResolveCache();
+    vulkan.CheckTextureResolveTopology();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckUnifiedTextureCacheFlow();
@@ -52245,6 +52532,8 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
+    vulkan.CheckTextureResolveCache();
+    vulkan.CheckTextureResolveTopology();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
   }
@@ -52522,6 +52811,8 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
+    vulkan.CheckTextureResolveCache();
+    vulkan.CheckTextureResolveTopology();
     vulkan.CheckRenderExecutorColorStandardTileDiscovery();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();

@@ -145,12 +145,18 @@ struct GuestBackingView {
 };
 [[nodiscard]] bool     GetGuestBackingView(uint64_t vaddr, uint64_t size, GuestBackingView* out);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// GPU thread (or no GPU): the backing store's view of a range no GPU write has made stale (no
+// GPU-dirty buffer bytes, no GPU-written image), or nullptr.
+[[nodiscard]] const uint8_t* TryViewGpuCleanBacking(uint64_t vaddr, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 // Bytes from vaddr to the end of the one committed mapping holding it (0 when unmapped), without
 // continuing into adjacent mappings as ClampRangeSize does.
 [[nodiscard]] uint64_t MappingBytesFrom(uint64_t vaddr);
+// Changes whenever a guest mapping does; ClampRangeSize and MappingBytesFrom answers computed
+// after reading it stay valid while it holds.
+[[nodiscard]] uint64_t MappingGeneration();
 // Exits when part of the range has no backing; `site` names the caller in the report.
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size,
                   std::source_location site = std::source_location::current()) noexcept;

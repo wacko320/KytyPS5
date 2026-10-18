@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/indirectThreadDispatch.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -31,12 +32,14 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cinttypes>
 #include <cstdio>
 #include <fmt/format.h>
 #include <limits>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -483,21 +486,56 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	return false;
 }
 
-TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
-	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
-		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
-	}
-	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
-	const bool storage = resource.written;
-	if (storage) {
-		ValidateStorageImageResource(resource);
-	}
+namespace {
 
-	auto& texture_cache = m_context.GetTextureCache();
-	if (descriptor.IsNull()) {
-		return {.layout = vk::ImageLayout::eGeneral};
-	}
+// A texture binding's decoding: a pure function of the image resource and its T#.
+struct DecodedTexture {
+	TextureCache::ImageDesc desc;
+	vk::Format              pixel_format      = vk::Format::eUndefined;
+	vk::Format              view_format       = vk::Format::eUndefined;
+	bool                    shader_conversion = false;
+};
+
+// Every resource field the decoding may read; the rest (source, indirection) never matters.
+struct DecodedTextureKey {
+	ShaderRecompiler::IR::DescriptorValue     value;
+	ShaderRecompiler::IR::ImageResourceClass  resource_class    = {};
+	Prospero::TextureNumericClass             numeric_class     = {};
+	ShaderRecompiler::Decoder::ImageDimension dimension         = {};
+	ShaderRecompiler::IR::ImageMipMode        mip_mode          = {};
+	uint32_t                                  mip_count         = 0;
+	Prospero::BufferFormat                    conversion_format = {};
+	uint32_t                                  shader_swizzle    = 0;
+	bool                                      read              = false;
+	bool                                      written           = false;
+	bool                                      atomic            = false;
+	bool                                      atomic64          = false;
+	bool                                      depth_compare     = false;
+	bool                                      cube              = false;
+	bool                                      r128              = false;
+
+	DecodedTextureKey(const ShaderRecompiler::IR::ImageResource&   resource,
+	                  const ShaderRecompiler::IR::DescriptorValue& descriptor)
+	    : value(descriptor), resource_class(resource.resource_class),
+	      numeric_class(resource.numeric_class), dimension(resource.dimension),
+	      mip_mode(resource.mip_mode), mip_count(resource.mip_count),
+	      conversion_format(resource.conversion_format), shader_swizzle(resource.shader_swizzle),
+	      read(resource.read), written(resource.written), atomic(resource.atomic),
+	      atomic64(resource.atomic64), depth_compare(resource.depth_compare), cube(resource.cube),
+	      r128(resource.r128) {}
+
+	bool operator==(const DecodedTextureKey& other) const = default;
+};
+
+// A new ImageResource field may change the decoding: add it to the key above, then update this.
+static_assert(sizeof(ShaderRecompiler::IR::ImageResource) ==
+              64 + sizeof(std::vector<uint32_t>));
+
+// Decodes the T# into the desc FindImage takes; exits on descriptors the renderer does not
+// support, as the binding would.
+DecodedTexture DecodeTexture(const ShaderRecompiler::IR::ImageResource& resource,
+                             const ShaderTextureResource&               descriptor) {
+	const bool storage = resource.written;
 
 	const auto address         = descriptor.Base40();
 	const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
@@ -618,8 +656,155 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                 view_levels, desc.info.resources.layers);
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+	return {std::move(desc), pixel_format, view_format, shader_conversion};
+}
 
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
+} // namespace
+
+// Draws bind the same textures over and over. Per texture key this keeps the decoding (tiling
+// layouts, mip chains) and the texture cache's answer for it, which holds while the answer's
+// resolve stamp does. Open-addressed with a short probe; per render executor.
+class TextureResolveCache {
+public:
+	struct Entry {
+		DecodedTextureKey key {{}, {}};
+		DecodedTexture    decoded;
+		// FindImage's answer, the image it binds (the answer or its depth association), and
+		// the view placement FindImage chose within it. A zero stamp epoch: no answer yet.
+		ImageId                    found_id;
+		ImageId                    image_id;
+		uint32_t                   view_base_level = 0;
+		uint32_t                   view_base_layer = 0;
+		TextureCache::ResolveStamp stamp;
+		bool                       valid = false;
+	};
+
+	Entry& Find(const ShaderRecompiler::IR::ImageResource&   resource,
+	            const ShaderRecompiler::IR::DescriptorValue& value,
+	            const ShaderTextureResource&                 descriptor) {
+		DecodedTextureKey key(resource, value);
+		const auto        home   = Slot(key);
+		Entry*            vacant = nullptr;
+		for (size_t probe = 0; probe < PROBE_LIMIT; probe++) {
+			auto& entry = m_slots[(home + probe) % SLOT_COUNT];
+			if (!entry.valid) {
+				vacant = vacant != nullptr ? vacant : &entry;
+			} else if (entry.key == key) {
+				return entry;
+			}
+		}
+		if (vacant == nullptr) {
+			vacant        = &m_slots[(home + m_next_victim) % SLOT_COUNT];
+			m_next_victim = (m_next_victim + 1) % PROBE_LIMIT;
+		}
+		*vacant         = {};
+		vacant->decoded = DecodeTexture(resource, descriptor);
+		vacant->key     = key;
+		vacant->valid   = true;
+		return *vacant;
+	}
+
+private:
+	static constexpr size_t SLOT_COUNT  = 4096;
+	static constexpr size_t PROBE_LIMIT = 8;
+
+	static size_t Slot(const DecodedTextureKey& key) {
+		uint64_t hash = key.value.dword_count;
+		for (const auto dword: key.value.dwords) {
+			hash = (hash ^ dword) * 0x100000001b3ull;
+		}
+		hash ^= static_cast<uint64_t>(key.written) |
+		        (static_cast<uint64_t>(key.resource_class) << 8u) |
+		        (static_cast<uint64_t>(key.dimension) << 16u);
+		hash *= 0xff51afd7ed558ccdull;
+		return static_cast<size_t>(hash >> 52u) % SLOT_COUNT;
+	}
+
+	std::array<Entry, SLOT_COUNT> m_slots {};
+	size_t                        m_next_victim = 0;
+};
+
+// Samplers never change once created, so the GPU thread keeps recent ones without the sampler
+// cache's lock. Direct-mapped.
+class SamplerFrontTable {
+public:
+	vk::Sampler Get(SamplerCache& cache, const ShaderSamplerResource& descriptor,
+	                bool integer_border) {
+		uint64_t hash = integer_border ? 1u : 0u;
+		for (const auto field: descriptor.fields) {
+			hash = (hash ^ field) * 0x100000001b3ull;
+		}
+		hash *= 0xff51afd7ed558ccdull;
+		auto& entry = m_slots[static_cast<size_t>(hash >> 56u) % SLOT_COUNT];
+		if (entry.sampler == nullptr || entry.integer_border != integer_border ||
+		    !std::equal(std::begin(entry.fields), std::end(entry.fields),
+		                std::begin(descriptor.fields))) {
+			entry.sampler        = cache.GetSampler(descriptor, integer_border);
+			entry.integer_border = integer_border;
+			std::copy(std::begin(descriptor.fields), std::end(descriptor.fields),
+			          std::begin(entry.fields));
+		}
+		return entry.sampler;
+	}
+
+private:
+	static constexpr size_t SLOT_COUNT = 256;
+
+	struct Entry {
+		uint32_t    fields[4]      = {};
+		bool        integer_border = false;
+		vk::Sampler sampler        = nullptr;
+	};
+
+	std::array<Entry, SLOT_COUNT> m_slots {};
+};
+
+RenderExecutor::RenderExecutor(RenderContext& context)
+    : m_context(context), m_texture_resolves(std::make_unique<TextureResolveCache>()),
+      m_samplers(std::make_unique<SamplerFrontTable>()) {}
+
+RenderExecutor::~RenderExecutor() = default;
+
+TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
+		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
+	}
+	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	const bool storage = resource.written;
+	if (storage) {
+		ValidateStorageImageResource(resource);
+	}
+
+	auto& texture_cache = m_context.GetTextureCache();
+	if (descriptor.IsNull()) {
+		return {.layout = vk::ImageLayout::eGeneral};
+	}
+
+	auto&       entry   = m_texture_resolves->Find(resource, value, descriptor);
+	const auto& decoded = entry.decoded;
+	auto        desc    = decoded.desc;
+	if (entry.stamp.epoch != 0) {
+		desc.view_info.base_level = entry.view_base_level;
+		desc.view_info.base_layer = entry.view_base_layer;
+		if (texture_cache.ReuseImage(entry.found_id, desc, decoded.desc.view_info.base_layer,
+		                             entry.stamp)) {
+			if (entry.image_id != entry.found_id) {
+				// Touches the depth association, as the full path's GetImage does.
+				(void)texture_cache.GetImage(entry.image_id);
+			}
+			return {entry.image_id, nullptr, std::move(desc)};
+		}
+		desc.view_info.base_level = decoded.desc.view_info.base_level;
+		desc.view_info.base_layer = decoded.desc.view_info.base_layer;
+	}
+	m_full_texture_resolves++;
+	const auto pixel_format = decoded.pixel_format;
+	const auto view_format  = decoded.view_format;
+	auto       stamp        = TextureCache::ResolveStamp {};
+	const auto found_id     = texture_cache.FindImage(desc, decoded.shader_conversion, &stamp);
+
+	auto       id                  = found_id;
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -637,13 +822,18 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
+	entry.found_id        = found_id;
+	entry.image_id        = id;
+	entry.view_base_level = desc.view_info.base_level;
+	entry.view_base_layer = desc.view_info.base_layer;
+	entry.stamp           = stamp;
 	return {id, nullptr, std::move(desc)};
 }
 
-static vk::Sampler NativeSampler(RenderContext&                       context,
+static vk::Sampler NativeSampler(RenderContext& context, SamplerFrontTable& samplers,
                                  const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                                 uint32_t index,
-                                 const ShaderRecompiler::IR::DescriptorValue& value) {
+                                 uint32_t                                        index,
+                                 const ShaderRecompiler::IR::DescriptorValue&    value) {
 	auto        descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
 	const auto& sampler = program.info.samplers[index];
 	if (!sampler.depth_compare) {
@@ -652,7 +842,7 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 	if (sampler.force_point_filtering) {
 		descriptor.SetPointFiltering();
 	}
-	return context.GetSamplerCache().GetSampler(descriptor, sampler.integer_border);
+	return samplers.Get(context.GetSamplerCache(), descriptor, sampler.integer_border);
 }
 
 static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
@@ -716,8 +906,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-		prepared.samplers.push_back(NativeSampler(
-		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+		prepared.samplers.push_back(
+		    NativeSampler(m_context, *m_samplers, program, i,
+		                  snapshot.samplers[program.info.samplers[i].snapshot_index]));
 	}
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.info.user_data_registers) {
@@ -784,7 +975,7 @@ void RenderExecutor::PrepareBindlessImages(PreparedBindings& prepared) {
 	}
 	if (bindless_samplers) {
 		auto& cache = m_context.GetSamplerCache();
-		prepared.heap_samplers.push_back(cache.GetSampler(ShaderSamplerResource {}, false));
+		prepared.heap_samplers.push_back(m_samplers->Get(cache, ShaderSamplerResource {}, false));
 		prepared.heap_compare_samplers.push_back(prepared.heap_samplers.front());
 		for (const auto& entry: heap.Entries()) {
 			const auto image_class = static_cast<uint32_t>(entry.image_class);
@@ -797,9 +988,9 @@ void RenderExecutor::PrepareBindlessImages(PreparedBindings& prepared) {
 			// Only depth-comparison samples compare depth, as the S# says.
 			if (image_class == Bindless::SamplerClass) {
 				descriptor.fields[0] &= ~(0x7u << 12u);
-				prepared.heap_samplers.push_back(cache.GetSampler(descriptor, false));
+				prepared.heap_samplers.push_back(m_samplers->Get(cache, descriptor, false));
 			} else {
-				prepared.heap_compare_samplers.push_back(cache.GetSampler(descriptor, false));
+				prepared.heap_compare_samplers.push_back(m_samplers->Get(cache, descriptor, false));
 			}
 		}
 	}
@@ -848,6 +1039,45 @@ void RenderExecutor::CommitBindlessHeap(CommandBuffer&                     buffe
 	    compare_samplers);
 }
 
+static uint64_t ClampBufferRangeUncached(uint64_t address, uint64_t size, bool dynamic_extent) {
+	auto clamped = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+	if (dynamic_extent) {
+		// A placeholder extent can span gigabytes of neighbouring mappings, and every bind
+		// synchronizes (and marks written) the whole range.
+		clamped = std::min(clamped, Libs::LibKernel::Memory::MappingBytesFrom(address));
+	}
+	return clamped;
+}
+
+// Every draw clamps the same buffer ranges against the guest mappings, which take a kernel lock;
+// the answers hold until a mapping changes.
+static uint64_t ClampBufferRange(uint64_t address, uint64_t size, bool dynamic_extent) {
+	struct ClampedRange {
+		uint64_t address        = 0;
+		uint64_t size           = 0;
+		uint64_t generation     = 0;
+		uint64_t clamped        = 0;
+		bool     dynamic_extent = false;
+	};
+	constexpr size_t ClampedRangeCount = 256;
+	thread_local std::unique_ptr<std::array<ClampedRange, ClampedRangeCount>> ranges;
+	if (ranges == nullptr) {
+		ranges = std::make_unique<std::array<ClampedRange, ClampedRangeCount>>();
+	}
+	// Read first: an edit racing the clamp below leaves the record stale.
+	const auto generation = Libs::LibKernel::Memory::MappingGeneration() + 1;
+	const auto hash =
+	    (address ^ (size * 0x9e3779b97f4a7c15ull) ^ static_cast<uint64_t>(dynamic_extent)) *
+	    0xff51afd7ed558ccdull;
+	auto& range = (*ranges)[(hash >> 56u) % ClampedRangeCount];
+	if (range.generation != generation || range.address != address || range.size != size ||
+	    range.dynamic_extent != dynamic_extent) {
+		range = {address, size, generation, ClampBufferRangeUncached(address, size, dynamic_extent),
+		         dynamic_extent};
+	}
+	return range.clamped;
+}
+
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
 	auto& cache = m_context.GetBufferCache();
@@ -892,7 +1122,8 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 					size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
 				}
 			}
-			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+			// The sentinel extent also stops at the end of its own mapping.
+			size = ClampBufferRange(address, size, descriptor.NumRecords() == UINT32_MAX);
 			source = {address, size, cache.FindBuffer(address, size)};
 		}
 	}

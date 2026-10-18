@@ -146,6 +146,8 @@ private:
 };
 
 class IndirectThreadDispatch;
+class TextureResolveCache;
+class SamplerFrontTable;
 
 class RenderExecutor {
 public:
@@ -224,6 +226,10 @@ private:
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::unique_ptr<IndirectThreadDispatch> m_indirect_threads;
+	std::unique_ptr<TextureResolveCache>    m_texture_resolves;
+	std::unique_ptr<SamplerFrontTable>      m_samplers;
+	// Texture resolves the resolve cache could not answer; tests check that repeats hit.
+	uint64_t m_full_texture_resolves = 0;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

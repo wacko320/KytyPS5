@@ -108,11 +108,59 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
+// Materialization reads descriptors a word at a time, and each checked read costs locks and an
+// image lookup. Within one materialization on the GPU thread nothing makes memory GPU-dirty, so
+// each 4 KiB page is checked once and later words come straight from its backing view.
+struct CheckedReadPages {
+	static constexpr size_t          Ways   = 8;
+	bool                             active = false;
+	std::array<uint64_t, Ways>       tags {};  // page | 1, 0 = empty
+	std::array<const uint8_t*, Ways> views {}; // nullptr: not clean as a whole page
+	size_t                           next = 0;
+};
+thread_local CheckedReadPages t_checked_pages;
+
+struct CheckedReadScope {
+	CheckedReadScope() {
+		t_checked_pages.active = true;
+		t_checked_pages.tags.fill(0);
+		t_checked_pages.next = 0;
+	}
+	~CheckedReadScope() { t_checked_pages.active = false; }
+	KYTY_CLASS_NO_COPY(CheckedReadScope);
+};
+
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+	if (values.empty()) {
+		return false;
+	}
+	const auto bytes = values.size_bytes();
+	auto&      pages = t_checked_pages;
+	const auto page  = address & ~uint64_t {4095};
+	if (pages.active && address + bytes <= page + 4096) {
+		const uint8_t* view  = nullptr;
+		bool           found = false;
+		for (size_t i = 0; i < CheckedReadPages::Ways; i++) {
+			if (pages.tags[i] == (page | 1u)) {
+				view  = pages.views[i];
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			view              = Libs::LibKernel::Memory::TryViewGpuCleanBacking(page, 4096);
+			const auto slot   = pages.next++ % CheckedReadPages::Ways;
+			pages.tags[slot]  = page | 1u;
+			pages.views[slot] = view;
+		}
+		if (view != nullptr) {
+			std::memcpy(values.data(), view + (address - page), bytes);
+			return true;
+		}
+	}
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
-	return !values.empty() &&
-	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+	return Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), bytes);
 }
 
 // Ordinary (unchecked) SRT reads try the checked reader first: on the GPU thread it reads back only
@@ -287,6 +335,7 @@ struct PipelineCache::ProgramCache {
 		// runtime, its image is added to bindless_pcs and false is returned: the program must be
 		// translated again (with CompileOptions::bindless_image_pcs) and its plan extracted again.
 		bool Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime) {
+			const CheckedReadScope checked_reads;
 			std::vector<uint32_t> pcs;
 			if (ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
 			                                               specialization, &pcs)) {

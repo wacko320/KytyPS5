@@ -217,6 +217,8 @@ void TextureCache::RegisterImage(ImageId id) {
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
+	m_registration_generation++;
+	MoveResolveEpoch(image.info.data);
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
@@ -243,6 +245,8 @@ void TextureCache::UnregisterImage(ImageId id) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
 	});
+	m_registration_generation++;
+	MoveResolveEpoch(image.info.data);
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
@@ -423,6 +427,18 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 		return {};
 	}
 
+	const auto hash = (address ^ (size * 0x9e3779b97f4a7c15ull) ^ static_cast<uint64_t>(page_overlap)) *
+	                  0xff51afd7ed558ccdull;
+	auto&      query = m_region_queries[(hash >> 58u) % REGION_QUERY_COUNT];
+	if (query.generation == m_registration_generation && query.address == address &&
+	    query.size == size && query.page_overlap == page_overlap) {
+		ImageIds result;
+		for (uint32_t i = 0; i < query.count; i++) {
+			result.push_back(query.ids[i]);
+		}
+		return result;
+	}
+
 	uint32_t query_epoch = ++m_image_query_epoch;
 	if (query_epoch == 0) {
 		m_slot_images.ForEach([](ImageId, const Image& image) { image.query_epoch = 0; });
@@ -449,6 +465,12 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 			}
 		});
 	});
+	if (result.size() <= query.ids.size()) {
+		query = {address, size, m_registration_generation, page_overlap,
+		         static_cast<uint32_t>(result.size())};
+		uint32_t index = 0;
+		result.ForEach([&](ImageId id) { query.ids[index++] = id; });
+	}
 	return result;
 }
 
@@ -800,6 +822,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const auto current_tick = m_scheduler.CurrentTick();
 	const bool safe_to_delete =
 	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval;
+	const uint64_t free_tick = cached.tick_accessed_last + NumFramesBeforeRemoval + 1;
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
@@ -820,9 +843,10 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			                        left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
 			                        left.surface_z == right.surface_z;
 		                 }))) {
-			if (safe_to_delete) {
-				FreeImage(cached_id);
+			if (!safe_to_delete) {
+				return {.image = merged_id, .free_tick = free_tick};
 			}
+			FreeImage(cached_id);
 			return {merged_id};
 		}
 		if (requested.GetColorTransform() != cached.info.GetColorTransform()) {
@@ -905,7 +929,10 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		FreeImage(cached_id);
 		return {merged_id};
 	}
-	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
+	if (requested.data.address >= cached.info.data.address) {
+		if (!safe_to_delete) {
+			return {.image = merged_id, .free_tick = free_tick};
+		}
 		FreeImage(cached_id);
 	}
 	return {merged_id};
@@ -1071,7 +1098,10 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	const auto range = desc.info.metadata.range;
 	{
 		std::scoped_lock lock {m_lock};
-		auto& image         = m_slot_images[id];
+		auto& image = m_slot_images[id];
+		if (image.info.HasMetadata() != desc.info.HasMetadata()) {
+			MoveResolveEpoch(image.info.data);
+		}
 		image.info.metadata = desc.info.metadata;
 		// Native color metadata must not retain a reused HTile clear flag.
 		m_surface_metas.erase(range.address);
@@ -1214,12 +1244,13 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		record.info                 = plane;
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
+		MoveResolveEpoch(record.info.data);
 	}
 
 	return association;
 }
 
-ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, ResolveStamp* stamp) {
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
@@ -1258,14 +1289,17 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 
-		int32_t view_mip   = -1;
-		int32_t view_layer = -1;
+		int32_t  view_mip    = -1;
+		int32_t  view_layer  = -1;
+		uint64_t expiry_tick = UINT64_MAX;
 		if (!result) {
 			for (const auto candidate: candidates) {
 				view_mip                = -1;
 				view_layer              = -1;
 				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
 				const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
+				// Once a spared candidate may go, this lookup would free it: the answer lapses.
+				expiry_tick = std::min(expiry_tick, overlap.free_tick);
 				if (overlap.image) {
 					result     = overlap.image;
 					view_mip   = overlap.mip;
@@ -1309,6 +1343,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
+		if (stamp != nullptr) {
+			*stamp = {.epoch = m_resolve_epoch, .expiry_tick = expiry_tick};
+		}
 	}
 	MaterializeColorClear(result, desc, metadata_base_layer);
 	if (desc.type == BindingType::VideoOut &&
@@ -1324,6 +1361,41 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 	}
 	return result;
+}
+
+void TextureCache::MoveResolveEpoch(GuestRange range) {
+	m_resolve_epoch++;
+	m_resolve_log[m_resolve_epoch % RESOLVE_LOG_SIZE] = range;
+}
+
+bool TextureCache::ReuseImage(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer,
+                              ResolveStamp& stamp) {
+	{
+		std::scoped_lock lock {m_lock};
+		if (m_scheduler.CurrentTick() >= stamp.expiry_tick) {
+			return false;
+		}
+		// Only images overlapping the desc's range are FindImage candidates, so a move made
+		// for an image elsewhere leaves the answer standing.
+		if (m_resolve_epoch - stamp.epoch > RESOLVE_LOG_SIZE) {
+			return false;
+		}
+		const auto& range = desc.info.data;
+		for (auto epoch = stamp.epoch + 1; epoch <= m_resolve_epoch; epoch++) {
+			const auto& moved = m_resolve_log[epoch % RESOLVE_LOG_SIZE];
+			if (moved.size == 0 || (moved.address < range.address + range.size &&
+			                        range.address < moved.address + moved.size)) {
+				return false;
+			}
+		}
+		stamp.epoch              = m_resolve_epoch;
+		auto& image              = m_slot_images[id];
+		image.tick_accessed_last = m_scheduler.CurrentTick();
+		TouchImage(image);
+	}
+	// Metadata bytes are guest memory, outside the epoch: a later fast clear still lands.
+	MaterializeColorClear(id, desc, metadata_base_layer);
+	return true;
 }
 
 void TextureCache::UpdateImage(ImageId id) {
@@ -1445,9 +1517,17 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		const auto offset     = desc.info.data.address - image.info.data.address;
 		EXIT_IF(slice_size == 0 || offset % slice_size != 0 || offset / slice_size >= layers ||
 		        desc.info.resources.layers > layers - offset / slice_size);
-		image.stencil_subresources = {0, desc.info.resources.levels,
-		                             static_cast<uint32_t>(offset / slice_size),
-		                             desc.info.resources.layers};
+		const decltype(image.stencil_subresources) subresources {
+		    0, desc.info.resources.levels, static_cast<uint32_t>(offset / slice_size),
+		    desc.info.resources.layers};
+		if (image.stencil_subresources != subresources) {
+			MoveResolveEpoch(image.info.data);
+		}
+		image.stencil_subresources = subresources;
+	}
+	if (image.info.stencil != desc.info.stencil ||
+	    image.info.HasMetadata() != desc.info.HasMetadata()) {
+		MoveResolveEpoch(image.info.data);
 	}
 	image.info.stencil = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;

@@ -38,27 +38,28 @@ public:
 	KYTY_CLASS_NO_COPY(SlotVector);
 
 	[[nodiscard]] T& operator[](SlotId id) noexcept {
-		EXIT_IF(!is_allocated(id));
-		return *m_values[id.index].value;
+		auto* slot = Find(id);
+		EXIT_IF(slot == nullptr);
+		return *slot->value;
 	}
 
 	[[nodiscard]] const T& operator[](SlotId id) const noexcept {
-		EXIT_IF(!is_allocated(id));
-		return *m_values[id.index].value;
+		const auto* slot = Find(id);
+		EXIT_IF(slot == nullptr);
+		return *slot->value;
 	}
 
 	[[nodiscard]] T* try_get(SlotId id) noexcept {
-		return is_allocated(id) ? &*m_values[id.index].value : nullptr;
+		auto* slot = Find(id);
+		return slot != nullptr ? &*slot->value : nullptr;
 	}
 
 	[[nodiscard]] const T* try_get(SlotId id) const noexcept {
-		return is_allocated(id) ? &*m_values[id.index].value : nullptr;
+		const auto* slot = Find(id);
+		return slot != nullptr ? &*slot->value : nullptr;
 	}
 
-	[[nodiscard]] bool is_allocated(SlotId id) const noexcept {
-		return id && id.index < m_values.size() &&
-		       m_values[id.index].generation == id.generation && m_values[id.index].value.has_value();
-	}
+	[[nodiscard]] bool is_allocated(SlotId id) const noexcept { return Find(id) != nullptr; }
 
 	template <typename... Args>
 	[[nodiscard]] SlotId insert(Args&&... args) {
@@ -66,6 +67,7 @@ public:
 		if (m_free_list.empty()) {
 			index = static_cast<uint32_t>(m_values.size());
 			m_values.emplace_back();
+			m_slots.push_back(&m_values.back());
 			m_values.back().value.emplace(std::forward<Args>(args)...);
 		} else {
 			index = m_free_list.back();
@@ -115,7 +117,17 @@ private:
 		uint32_t         generation = 1;
 	};
 
+	// The live slot `id` names, or null. One indexed load: the deque only keeps addresses stable.
+	[[nodiscard]] Slot* Find(SlotId id) const noexcept {
+		if (id.index >= m_slots.size()) {
+			return nullptr;
+		}
+		auto* slot = m_slots[id.index];
+		return slot->generation == id.generation && slot->value.has_value() ? slot : nullptr;
+	}
+
 	std::deque<Slot>             m_values;
+	std::vector<Slot*>           m_slots;
 	std::vector<uint32_t>        m_free_list;
 	size_t                       m_size = 0;
 };

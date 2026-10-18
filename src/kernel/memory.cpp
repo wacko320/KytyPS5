@@ -226,6 +226,16 @@ static bool g_test_fail_next_range_replace = false;
 
 class VirtualRanges {
 public:
+	VirtualRanges() { s_generation.fetch_add(1, std::memory_order_acq_rel); }
+	~VirtualRanges() { s_generation.fetch_add(1, std::memory_order_acq_rel); }
+	KYTY_CLASS_NO_COPY(VirtualRanges);
+
+	// Counts edits, across instances: an answer computed after reading a generation holds while
+	// it is unchanged.
+	[[nodiscard]] static uint64_t Generation() noexcept {
+		return s_generation.load(std::memory_order_acquire);
+	}
+
 	struct Range {
 		uint64_t         start          = 0;
 		uint64_t         size           = 0;
@@ -240,6 +250,7 @@ public:
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		const EditScope edit;
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -270,6 +281,7 @@ public:
 
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		const EditScope edit;
 
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size) {
@@ -299,6 +311,7 @@ public:
 
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		const EditScope edit;
 
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size &&
@@ -312,6 +325,7 @@ public:
 	                 int protection, int memory_type, VirtualRangeType type, const char* name,
 	                 bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		const EditScope edit;
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -358,6 +372,7 @@ public:
 
 	void Rename(uint64_t start, uint64_t size, const char* name) {
 		Common::LockGuard lock(m_mutex);
+		const EditScope edit;
 
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size) {
@@ -370,6 +385,7 @@ public:
 
 	void Protect(uint64_t start, uint64_t size, int protection) {
 		Common::LockGuard lock(m_mutex);
+		const EditScope edit;
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
 	}
@@ -491,6 +507,14 @@ public:
 	}
 
 private:
+	// Bumps the generation when an edit ends, still under the lock declared before it.
+	class EditScope {
+	public:
+		EditScope() = default;
+		~EditScope() { s_generation.fetch_add(1, std::memory_order_acq_rel); }
+		KYTY_CLASS_NO_COPY(EditScope);
+	};
+
 	static uint64_t End(uint64_t start, uint64_t size) {
 		return (UINT64_MAX - start < size ? UINT64_MAX : start + size);
 	}
@@ -660,6 +684,8 @@ private:
 		}
 		return nullptr;
 	}
+
+	inline static std::atomic<uint64_t> s_generation {0};
 
 	RangeMap      m_ranges;
 	Common::Mutex m_mutex;
@@ -918,9 +944,25 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+const uint8_t* TryViewGpuCleanBacking(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+		if (!Graphics::GuestGpu::IsGpuThread() ||
+		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
+		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+			return nullptr;
+		}
+	}
+	GuestBackingView view {};
+	return GetGuestBackingView(vaddr, size, &view) ? view.pointer : nullptr;
+}
+
 uint64_t MappingBytesFrom(uint64_t vaddr) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 	return g_virtual_ranges->MappingBytesFrom(vaddr);
+}
+
+uint64_t MappingGeneration() {
+	return VirtualRanges::Generation();
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {

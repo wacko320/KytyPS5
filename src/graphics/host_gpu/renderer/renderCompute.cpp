@@ -476,9 +476,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ResetBindings();
 }
 
-RenderExecutor::RenderExecutor(RenderContext& context): m_context(context) {}
-
-RenderExecutor::~RenderExecutor() = default;
 
 IndirectThreadDispatch& RenderExecutor::IndirectThreads() {
 	if (m_indirect_threads == nullptr) {

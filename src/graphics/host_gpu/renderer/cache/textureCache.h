@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <bitset>
+#include <array>
 #include <atomic>
 #include <map>
 #include <type_traits>
@@ -51,7 +52,22 @@ public:
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
-	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// How long a FindImage answer holds: while no resolve epoch move since epoch touched the
+	// desc's guest range, and before the tick at which an overlapping image the lookup spared as
+	// recently used may be freed. epoch 0: never.
+	struct ResolveStamp {
+		uint64_t epoch       = 0;
+		uint64_t expiry_tick = UINT64_MAX;
+	};
+
+	// stamp receives how long this answer holds (see ReuseImage).
+	[[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_format = false,
+	                                ResolveStamp* stamp = nullptr);
+	// Repeats FindImage's answer id for the desc it adjusted, without the lookup, while the
+	// answer's stamp holds, and advances the stamp past epoch moves elsewhere. False once it
+	// lapsed: the caller asks FindImage again.
+	[[nodiscard]] bool ReuseImage(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer,
+	                              ResolveStamp& stamp);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -100,6 +116,8 @@ private:
 		ImageId image;
 		int32_t mip   = -1;
 		int32_t layer = -1;
+		// The candidate was kept only as recently used: from this tick a lookup frees it.
+		uint64_t free_tick = UINT64_MAX;
 	};
 
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
@@ -149,6 +167,7 @@ private:
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
+	void                        MoveResolveEpoch(GuestRange range);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
@@ -192,6 +211,27 @@ private:
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
+	// Recent FindImagesInRegion answers. The page index changes only when an image registers or
+	// unregisters, and every draw asks about the same textures again.
+	struct RegionQuery {
+		uint64_t                address      = 0;
+		uint64_t                size         = 0;
+		uint64_t                generation   = 0;
+		bool                    page_overlap = false;
+		uint32_t                count        = 0;
+		std::array<ImageId, 16> ids {};
+	};
+	static constexpr size_t                             REGION_QUERY_COUNT = 64;
+	mutable std::array<RegionQuery, REGION_QUERY_COUNT> m_region_queries {};
+	// Starts past the zero of unused queries.
+	uint64_t m_registration_generation = 1;
+	// Moves whenever FindImage could answer an unchanged desc differently: an image registers or
+	// unregisters, or an image changes its stencil association, stencil range or subresources, or
+	// metadata presence. Dirty state is not part of it; binding refreshes images on its own. The
+	// log keeps the image range of each recent move, so answers for other ranges outlive it.
+	static constexpr size_t                  RESOLVE_LOG_SIZE = 256;
+	uint64_t                                 m_resolve_epoch  = 1;
+	std::array<GuestRange, RESOLVE_LOG_SIZE> m_resolve_log {};
 	bool             m_readback_linear_images = false;
 
 	friend struct TextureCacheTestAccess;
