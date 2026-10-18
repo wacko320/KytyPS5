@@ -925,6 +925,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				// tick alone (submitting the open command buffer when the writer is in it), not
 				// for a download behind everything recorded since.
 				profile.NoteDirect(direct, 0);
+				if (profile.t0 != 0) {
+					FrameProfiler::Add(direct == DirectReadback::Untracked
+					                       ? FrameProfiler::Counter::ReadbackDirectWaitedUntracked
+					                       : FrameProfiler::Counter::ReadbackDirectWaitedWriter);
+				}
 				m_scheduler.Wait(blocking_tick, WaitSite::ReadbackGpuThread);
 				direct = TryReadDirect(m_slot_buffers[FindBuffer(vaddr, size)], vaddr, size,
 				                       direct_bytes);
@@ -970,8 +975,15 @@ BufferCache::DirectReadback BufferCache::TryReadDirect(Buffer& buffer, uint64_t 
 	const auto begin = std::max(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE), buffer_begin);
 	const auto end   = std::min(Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE),
 	                            buffer_begin + buffer.Size());
-	// Stores through GPU-selected V#s and addresses may have written any byte.
-	if (!m_scheduler.IsFree(m_untracked_write_tick)) {
+	// Stores through GPU-selected V#s and addresses may have written any byte their program
+	// reaches: any byte while one of its programs was never reported, otherwise a byte of a
+	// buffer reported stores landed in. A read outside that reach is noted, to be checked against
+	// the pages the stores turn out to write (NoteUntrackedWritten).
+	constexpr size_t MaxUngatedReads = 16384;
+	const bool       ungated         = !m_scheduler.IsFree(m_untracked_write_tick);
+	if (ungated && (!m_scheduler.IsFree(m_unknown_untracked_tick) ||
+	                m_untracked_reach.Intersects(begin, end - begin) ||
+	                m_ungated_reads.size() >= MaxUngatedReads)) {
 		if (blocking_tick != nullptr) {
 			*blocking_tick = m_untracked_write_tick;
 		}
@@ -1052,6 +1064,10 @@ BufferCache::DirectReadback BufferCache::TryReadDirect(Buffer& buffer, uint64_t 
 	m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
 	(void)PageManager::SetLazyRelease(lazy);
 	m_direct_readbacks.fetch_add(1, std::memory_order_relaxed);
+	if (ungated) {
+		m_ungated_reads.push_back({begin, end, m_ungated_serial++});
+		FrameProfiler::Add(FrameProfiler::Counter::UntrackedGateSkips);
+	}
 	copied = bytes;
 	return DirectReadback::Copied;
 }
@@ -1106,12 +1122,85 @@ const RangeSet& BufferCache::OpenWrites() {
 	return m_open_written;
 }
 
-void BufferCache::NoteUntrackedWrites() {
+void BufferCache::NoteUntrackedWrites(uint64_t program) {
 	if (!m_unchanged.empty()) {
 		NoteUnchangedWrite(m_unchanged_begin, m_unchanged_end - m_unchanged_begin, true);
 	}
 	m_untracked_write_tick = m_scheduler.CurrentTick();
+	if (!m_untracked_known.contains(program)) {
+		m_unknown_untracked_tick = m_untracked_write_tick;
+		if (std::ranges::find(m_untracked_unreported, program) == m_untracked_unreported.end()) {
+			m_untracked_unreported.push_back(program);
+		}
+	}
 	m_scheduler.RequestHostBarrier();
+	m_fault_manager.NoteUntrackedWrites();
+}
+
+BufferCache::UntrackedReport BufferCache::BeginUntrackedReport() {
+	UntrackedReport report;
+	report.programs.swap(m_untracked_unreported);
+	m_untracked_reporting += report.programs.size();
+	report.read_serial = m_ungated_serial;
+	return report;
+}
+
+void BufferCache::NoteUntrackedWritten(const RangeSet& pages, UntrackedReport report,
+                                       bool complete) {
+	m_untracked_reporting -= std::min(m_untracked_reporting, report.programs.size());
+	// The buffers the stores landed in: a store through the page table reaches only a page a
+	// buffer holds (get_bda_write_pointer drops the others).
+	pages.ForEach([&](uint64_t begin, uint64_t end) {
+		for (auto page = begin; page < end;) {
+			const auto* owner = m_page_table.Find(page >> CACHING_PAGEBITS);
+			if (owner == nullptr || !*owner || IsBufferInvalid(*owner)) {
+				m_untracked_reach.Add(page, CACHING_PAGESIZE);
+				page += CACHING_PAGESIZE;
+				continue;
+			}
+			const auto& buffer = m_slot_buffers[*owner];
+			m_untracked_reach.Add(buffer.CpuAddress(), buffer.Size());
+			page = std::max(page + CACHING_PAGESIZE, buffer.CpuAddress() + buffer.Size());
+		}
+	});
+	// Direct reads that did not wait for these stores. A read noted after the pass was recorded
+	// may still have overlapped a store recorded before it: every noted read is checked, and a
+	// read noted before the pass was recorded is covered once a complete report has been checked.
+	uint64_t hazards = 0;
+	for (const auto& read: m_ungated_reads) {
+		if (!pages.Intersects(read.begin, read.end - read.begin)) {
+			continue;
+		}
+		hazards++;
+		pages.ForEachInRange(read.begin, read.end - read.begin, [&](uint64_t first, uint64_t last) {
+			ForEachMappedPart(first, last, [&](uint64_t start, uint64_t stop) {
+				(void)ObtainBuffer(start, stop - start, true);
+			});
+		});
+	}
+	if (hazards != 0) {
+		FrameProfiler::Add(FrameProfiler::Counter::UntrackedGateHazards, hazards);
+		static uint64_t logged = 0;
+		if (logged++ < 16) {
+			LOGF("BufferCache: %" PRIu64 " direct readbacks did not wait for untracked stores that "
+			     "landed in their pages, outside the known reach (now taken as written)\n",
+			     hazards);
+		}
+	}
+	if (!complete) {
+		// The rest of the pages follow in a later pass: so does the confirmation.
+		m_untracked_unreported.insert(m_untracked_unreported.end(), report.programs.begin(),
+		                              report.programs.end());
+		return;
+	}
+	std::erase_if(m_ungated_reads,
+	              [&](const UngatedRead& read) { return read.serial < report.read_serial; });
+	m_untracked_known.insert(report.programs.begin(), report.programs.end());
+}
+
+bool BufferCache::MayHoldUntrackedWrites(uint64_t vaddr, uint64_t size) const {
+	return !m_untracked_unreported.empty() || m_untracked_reporting != 0 ||
+	       m_untracked_reach.Intersects(vaddr, size);
 }
 
 void BufferCache::ReadMemoryFromGuestThread(uint64_t vaddr, uint64_t size, bool is_write) {

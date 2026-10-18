@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <bit>
 #include <cinttypes>
 #include <cstring>
@@ -17,8 +18,17 @@ namespace Libs::Graphics {
 
 namespace {
 
+constexpr size_t BitmapBytes = BufferCache::CACHING_NUMPAGES / 8;
+static_assert(BufferCache::BDA_WRITTEN_BITMAP_WORD * sizeof(uint32_t) == BitmapBytes);
+static_assert(BufferCache::FAULT_BUFFER_SIZE == 2 * BitmapBytes);
+// Each download area holds the list of faulting pages, then the list of pages untracked stores
+// wrote; each list is a count, then the pages (fault_buffer_process.comp). A list that fills
+// keeps the pages it has no room for in the bitmap, for the next pass.
 constexpr size_t MaxPageFaults    = 1024;
-constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(uint64_t);
+constexpr size_t MaxWrittenPages  = 16384;
+constexpr size_t FaultListBytes   = MaxPageFaults * sizeof(uint64_t);
+constexpr size_t WrittenListBytes = MaxWrittenPages * sizeof(uint64_t);
+constexpr size_t PageFaultAreaSize = FaultListBytes + WrittenListBytes;
 
 } // namespace
 
@@ -26,7 +36,7 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
                            BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                     BufferCache::CACHING_NUMPAGES / 8),
+                     BufferCache::FAULT_BUFFER_SIZE),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
                         MaxPendingFaults * PageFaultAreaSize) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
@@ -82,8 +92,14 @@ void FaultManager::ProcessFaultBuffer() {
 
 	const auto offset = m_current_area * PageFaultAreaSize;
 	auto*      mapped = m_download_buffer.Mapped().data() + offset;
-	std::memset(mapped, 0, PageFaultAreaSize);
+	// Only the counts: the pass writes the entries it counts.
+	std::memset(mapped, 0, sizeof(uint64_t));
+	std::memset(mapped + FaultListBytes, 0, sizeof(uint64_t));
 	m_download_buffer.Flush(offset, PageFaultAreaSize);
+	// The written pages are reported only after a command that may write them, or after a pass
+	// that had no room for all of them.
+	const bool written_pass = m_written_pass_due;
+	m_written_pass_due      = false;
 
 	vk::BufferMemoryBarrier2 pre_barrier {};
 	pre_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -100,8 +116,8 @@ void FaultManager::ProcessFaultBuffer() {
 	post_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderWrite;
 
 	const vk::DescriptorBufferInfo infos[] {
-	    {m_fault_buffer.Handle(), 0, m_fault_buffer.Size()},
-	    {m_download_buffer.Handle(), offset, PageFaultAreaSize},
+	    {m_fault_buffer.Handle(), 0, BitmapBytes},
+	    {m_download_buffer.Handle(), offset, FaultListBytes},
 	};
 	std::array<vk::WriteDescriptorSet, 2> writes {};
 	for (uint32_t index = 0; index < writes.size(); ++index) {
@@ -124,16 +140,32 @@ void FaultManager::ProcessFaultBuffer() {
 	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;
 	const auto num_workgroups = (num_threads + 63) / 64;
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
+	if (written_pass) {
+		// The same compaction of the written-page bitmap into its own list.
+		const vk::DescriptorBufferInfo written_infos[] {
+		    {m_fault_buffer.Handle(), BitmapBytes, BitmapBytes},
+		    {m_download_buffer.Handle(), offset + FaultListBytes, WrittenListBytes},
+		};
+		for (uint32_t index = 0; index < writes.size(); ++index) {
+			writes[index].pBufferInfo = &written_infos[index];
+		}
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
+		                             m_fault_process_pipeline_layout, 0, writes);
+		command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
+	}
 	dependency.pBufferMemoryBarriers = &post_barrier;
 	command.pipelineBarrier2(dependency);
 
 	const auto area = m_current_area;
-	m_scheduler.DeferOperation([this, mapped, offset, area] {
+	auto report = written_pass ? m_buffer_cache.BeginUntrackedReport() : BufferCache::UntrackedReport {};
+	m_scheduler.DeferOperation([this, mapped, offset, area, written_pass,
+	                            report = std::move(report)]() mutable {
 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
-		const auto  count  = static_cast<uint32_t>(faults[0]);
-		for (uint32_t index = 1; index <= count; ++index) {
+		const auto  count =
+		    std::min<uint64_t>(static_cast<uint32_t>(faults[0]), MaxPageFaults - 1u);
+		for (uint64_t index = 1; index <= count; ++index) {
 			// --shader-loop-limit reports tripped loops as faults on the never-mapped low pages
 			// (word = 1 + shader hash % 1024, bit = loop header id % 32).
 			// The first 32 pages hold no watchdog words: a fault there is a near-null guest pointer,
@@ -157,6 +189,22 @@ void FaultManager::ProcessFaultBuffer() {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
 			(void)m_buffer_cache.FindBuffer(start, end - start);
 		});
+		if (written_pass) {
+			const auto* written = std::bit_cast<const uint64_t*>(mapped + FaultListBytes);
+			const auto  reported = static_cast<uint32_t>(written[0]);
+			// A list that filled left the rest in the bitmap, for the next pass.
+			const bool complete = reported < MaxWrittenPages;
+			if (!complete) {
+				m_written_pass_due = true;
+			}
+			RangeSet written_ranges;
+			for (uint64_t index = 1; index <= std::min<uint64_t>(reported, MaxWrittenPages - 1u);
+			     ++index) {
+				written_ranges.Add(BufferCache::GuestAddress(written[index]),
+				                   BufferCache::CACHING_PAGESIZE);
+			}
+			m_buffer_cache.NoteUntrackedWritten(written_ranges, std::move(report), complete);
+		}
 		m_fault_areas[area] = 0;
 	});
 

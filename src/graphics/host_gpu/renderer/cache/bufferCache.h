@@ -46,6 +46,11 @@ public:
 	static constexpr uint64_t BDA_ZERO_ENTRY = CACHING_NUMPAGES;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    (CACHING_NUMPAGES + 1u) * sizeof(vk::DeviceAddress);
+	// The fault buffer holds the fault bitmap (one bit per page), then the bitmap of pages that
+	// stores and atomics through the page table wrote (GPU-selected V#s and addresses, which the
+	// host does not track), from this dword on. The fault pass reports both (FaultManager).
+	static constexpr uint64_t BDA_WRITTEN_BITMAP_WORD = CACHING_NUMPAGES / 32u;
+	static constexpr uint64_t FAULT_BUFFER_SIZE       = 2u * (CACHING_NUMPAGES / 8u);
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -103,9 +108,31 @@ public:
 	// are copied back (hot pages only) at the end of the submit that holds the write, not of one
 	// a stream-buffer wrap made between the binding and the command.
 	void CommitWrittenRanges();
-	// Called once a command that may store through GPU-selected V#s (untracked writes) is
-	// recorded: no GPU-thread readback reads buffer memory directly until it has completed.
-	void NoteUntrackedWrites();
+	// Called once a command of shader `program` that may store through GPU-selected V#s or
+	// addresses (untracked writes) is recorded, before the command. Until it has completed, a
+	// GPU-thread readback does not read buffer memory directly where its stores may have landed
+	// (TryReadDirect): anywhere while the program's stores were never reported, otherwise in the
+	// buffers untracked stores were reported to reach (NoteUntrackedWritten).
+	void NoteUntrackedWrites(uint64_t program);
+	// The untracked writes a fault pass reports: the programs recorded before it, and the serial
+	// of the first direct read noted after it (NoteUntrackedWritten).
+	struct UntrackedReport {
+		std::vector<uint64_t> programs;
+		uint64_t              read_serial = 0;
+	};
+	// GPU thread, as a fault pass that reports the written-page bitmap is recorded.
+	[[nodiscard]] UntrackedReport BeginUntrackedReport();
+	// GPU thread, once that pass has completed: `pages` are those untracked stores wrote since
+	// the previous report (all of them when `complete`; otherwise more follow in a later pass).
+	// The buffers holding them join the reach. A direct read that skipped the wait for untracked
+	// writes and overlaps them is a hazard: counted, logged, and its pages taken as written so
+	// the CPU reads them back again.
+	void NoteUntrackedWritten(const RangeSet& pages, UntrackedReport report, bool complete);
+	// GPU thread: whether untracked stores may have written bytes of the range that guest memory
+	// does not hold, since they are not tracked as GPU-dirty: the range is in the reach, or a
+	// program whose stores were never reported has been recorded and no complete report covers
+	// it yet. A CPU read of the backing store is then not trusted (the command reads on the GPU).
+	[[nodiscard]] bool MayHoldUntrackedWrites(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
@@ -417,6 +444,25 @@ private:
 	uint64_t                                          m_write_ticks_pruned = 0;
 	// The tick of the last command buffer that recorded a command with untracked writes.
 	uint64_t                                          m_untracked_write_tick = 0;
+	// The tick of the last command buffer that recorded untracked writes of a program whose
+	// stores were never reported (NoteUntrackedWrites), the programs reported so far, and those
+	// recorded since the last report began.
+	uint64_t                                          m_unknown_untracked_tick = 0;
+	std::unordered_set<uint64_t>                      m_untracked_known;
+	std::vector<uint64_t>                             m_untracked_unreported;
+	// The extents of the buffers that held pages untracked stores were reported to write.
+	RangeSet                                          m_untracked_reach;
+	// Direct reads made while untracked writes outside the reach ran, by serial, until a report
+	// covering them has completed.
+	struct UngatedRead {
+		uint64_t begin  = 0;
+		uint64_t end    = 0;
+		uint64_t serial = 0;
+	};
+	std::vector<UngatedRead>                          m_ungated_reads;
+	// Programs of reports begun (BeginUntrackedReport) and not yet completed.
+	size_t                                            m_untracked_reporting = 0;
+	uint64_t                                          m_ungated_serial = 0;
 	// Whether new buffers are made host-readable (Buffer::HostReadableSupported).
 	bool                                              m_host_readable_buffers = false;
 	// Aligned staging for direct readbacks (TryReadDirect).

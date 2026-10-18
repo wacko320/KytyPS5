@@ -168,7 +168,11 @@ bool RenderContext::TryWriteGpuOrdered(uint64_t vaddr, const void* data, uint64_
 }
 
 bool RenderContext::IsGpuWrittenUnread(uint64_t vaddr, uint64_t size) {
-	return GuestGpu::IsGpuThread() && m_buffer_cache.HasGpuDirtyBytes(vaddr, size) &&
+	// A download that took the bytes (a guest thread's readback) leaves guest memory stale until
+	// it publishes them, though they are no longer GPU-dirty.
+	return GuestGpu::IsGpuThread() &&
+	       (m_buffer_cache.HasGpuDirtyBytes(vaddr, size) ||
+	        m_buffer_cache.HasPendingGuestWrite(vaddr, size)) &&
 	       !m_texture_cache.IsRegionGpuModified(vaddr, size);
 }
 

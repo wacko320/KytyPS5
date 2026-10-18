@@ -205,6 +205,9 @@ private:
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
+// GPU thread: whether one materialization's compiled SRT walker may load [address, address + size)
+// through the guest pointer (the raw_table_reads check, in a fresh checked-read scope).
+[[nodiscard]] bool CanLoadSrtTableRaw(uint64_t address, uint64_t size);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&          rendering,
                             const PipelineVertexInputState&        vertex_input,

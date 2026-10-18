@@ -968,8 +968,11 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 
 const uint8_t* TryViewGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
-		if (!Graphics::GuestGpu::IsGpuThread() ||
-		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
+		// A download still on its way to the backing store (pending guest write) took the bytes
+		// off the GPU-dirty set already.
+		auto& buffers = GetGpuResources().GetBufferCache();
+		if (!Graphics::GuestGpu::IsGpuThread() || buffers.HasGpuDirtyBytes(vaddr, size) ||
+		    buffers.HasPendingGuestWrite(vaddr, size) ||
 		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
 			return nullptr;
 		}

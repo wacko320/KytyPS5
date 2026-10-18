@@ -266,7 +266,8 @@ uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint3
 // A store of bits (8, 16 or 32) through a guest pointer; stores to missing pages are dropped. An
 // aligned dword is a plain store; a subword or unaligned dword updates its containing dwords with
 // an atomic AND and OR each, so racing writes to the other bytes of a dword are kept, as on
-// hardware. The host does not track the written range.
+// hardware. The host does not track the written range; it learns the written pages
+// (GetBdaWritePointer).
 void StoreBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t bits,
               uint32_t data) {
 	auto&      state = ctx.state;
@@ -285,7 +286,7 @@ void StoreBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t
 	const auto is_aligned = Binary(state, spv::OpIEqual, TypeBool(state), byte, ConstantU32(state, 0));
 	if (bits == 32u) {
 		EmitIfCondition(state, AndCondition(state, active, is_aligned), [&]() {
-			const auto host = GetBdaPointer(state, address);
+			const auto host = GetBdaWritePointer(state, address);
 			EmitIfCondition(state, present(host), [&]() {
 				state.builder.AddFunction(spv::OpStore, pointer_to(host), data,
 				                          spv::MemoryAccessAlignedMask, uint32_t {4});
@@ -320,7 +321,7 @@ void StoreBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t
 			const auto value = part(data64);
 			EmitIfCondition(
 			    state, Binary(state, spv::OpINotEqual, TypeBool(state), mask, ConstantU32(state, 0)), [&]() {
-				    const auto host = GetBdaPointer(
+				    const auto host = GetBdaWritePointer(
 				        state, Binary(state, spv::OpIAdd, u64, aligned, ConstantU64(state, 4u * dword)));
 				    EmitIfCondition(state, present(host), [&]() {
 					    const auto pointer = pointer_to(host);
@@ -1401,7 +1402,7 @@ uint32_t AtomicIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 		    Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format, ConstantU32(state, 0)),
 		    IndirectBufferInBounds(state, buffer, 0u, ConstantU32(state, 4u), false));
 		return EmitValueOrZeroIfCondition(state, in_bounds, [&]() {
-			const auto host = GetBdaPointer(
+			const auto host = GetBdaWritePointer(
 			    state, Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
 			                  ConstantU64(state, ~uint64_t {3})));
 			return EmitValueOrZeroIfCondition(
@@ -1523,6 +1524,16 @@ uint32_t GetBdaPointer(EmitterState& state, uint32_t address) {
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpFunctionCall, TypeU64(state), result,
 	                          state.bda_pointer_function, address);
+	return result;
+}
+
+uint32_t GetBdaWritePointer(EmitterState& state, uint32_t address) {
+	if (state.bda_write_pointer_function == 0) {
+		return GetBdaPointer(state, address);
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFunctionCall, TypeU64(state), result,
+	                          state.bda_write_pointer_function, address);
 	return result;
 }
 
@@ -1881,6 +1892,53 @@ void DefineGetBdaPointer(EmitterState& state) {
 		state.builder.AddFunction(spv::OpPhi, type, result, ConstantU64(state, 0), entry_label,
 		                          looked_up, merge_label);
 		state.builder.AddFunction(spv::OpReturnValue, result);
+		state.builder.AddFunction(spv::OpFunctionEnd);
+	}
+
+	// get_bda_write_pointer(address): get_bda_pointer for a store or atomic. The host does not
+	// track these writes, so a later CPU write to the page would not download it first and the
+	// page's next upload would overwrite them: the page is set in the written-page bitmap
+	// (BufferCache::BDA_WRITTEN_BITMAP_WORD), which the host collects with the faults. A plain
+	// load first keeps the atomic to the first store per page and collection. Only a program
+	// that stores through the page table defines it.
+	if (state.fault_buffer_variable != 0 && state.program.has_address_writes) {
+		const auto function_type         = state.builder.Type(spv::OpTypeFunction, type, type);
+		state.bda_write_pointer_function = state.builder.AllocateId();
+		const auto address               = state.builder.AllocateId();
+		state.builder.AddName(state.bda_write_pointer_function, "get_bda_write_pointer");
+		state.builder.AddFunction(spv::OpFunction, type, state.bda_write_pointer_function,
+		                          spv::FunctionControlMaskNone, function_type);
+		state.builder.AddFunction(spv::OpFunctionParameter, type, address);
+		EmitLabel(state, state.builder.AllocateId());
+		const auto host = GetBdaPointer(state, address);
+		// A present page lies inside the table.
+		const auto present =
+		    Binary(state, spv::OpINotEqual, TypeBool(state), host, ConstantU64(state, 0));
+		EmitIfCondition(state, present, [&]() {
+			const auto page = page_of(address).first;
+			const auto word = Binary(
+			    state, spv::OpIAdd, TypeU32(state),
+			    ConstantU32(state, static_cast<uint32_t>(BufferCache::BDA_WRITTEN_BITMAP_WORD)),
+			    Binary(state, spv::OpShiftRightLogical, TypeU32(state), page,
+			           ConstantU32(state, 5)));
+			const auto bit = Binary(
+			    state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
+			    Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
+			const auto pointer = FaultElementPointer(state, word);
+			const auto current = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, TypeU32(state), current, pointer);
+			const auto unset =
+			    Binary(state, spv::OpIEqual, TypeBool(state),
+			           Binary(state, spv::OpBitwiseAnd, TypeU32(state), current, bit),
+			           ConstantU32(state, 0));
+			EmitIfCondition(state, unset, [&]() {
+				state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state),
+				                          state.builder.AllocateId(), pointer,
+				                          ConstantU32(state, spv::ScopeDevice),
+				                          ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
+			});
+		});
+		state.builder.AddFunction(spv::OpReturnValue, host);
 		state.builder.AddFunction(spv::OpFunctionEnd);
 	}
 

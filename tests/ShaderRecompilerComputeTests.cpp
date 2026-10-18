@@ -214,6 +214,10 @@ struct BufferCacheTestAccess {
     uint64_t copied = 0;
     return cache.TryReadDirect(buffer, address, size, copied);
   }
+  // Whether the buffers untracked stores were reported to reach cover the range.
+  static bool InUntrackedReach(const BufferCache &cache, uint64_t address, uint64_t size) {
+    return cache.m_untracked_reach.Intersects(address, size);
+  }
   static bool IsCpuDirty(BufferCache &cache, uint64_t address, uint64_t size) {
     return cache.m_memory_tracker.IsRegionCpuModified(address, size);
   }
@@ -13215,6 +13219,268 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  enum class UntrackedReachCase {
+    // A store program reported once stores again, held in flight, into another buffer: a
+    // GPU-thread readback of a completed writer's dword reads the mapping without waiting.
+    OutOfReach,
+    // As OutOfReach, reading a GPU-dirty dword of the buffer the stores reach: it waits for them.
+    InReach,
+    // The held store lands on the read's page, outside the reach: the read did not wait. Once
+    // the fault pass reports the page, the page is GPU-written again and a readback returns the
+    // store.
+    Hazard,
+  };
+
+  // GPU-thread direct readbacks while stores through GPU-selected addresses run (untracked
+  // writes, BufferCache::NoteUntrackedWrites): once a program's stores were reported, only reads
+  // of the buffers they were seen to land in wait for them.
+  void CheckUntrackedReach(UntrackedReachCase variant) {
+    using Case = UntrackedReachCase;
+    const char *name = variant == Case::OutOfReach ? "UntrackedReachOut"
+                       : variant == Case::InReach  ? "UntrackedReachIn"
+                                                   : "UntrackedReachHazard";
+    const uintptr_t base = 0x0000000213000000ull + static_cast<uint64_t>(variant) * 0x200000ull;
+    constexpr uint64_t size = 0x100000;
+    const uint64_t first = base + 0x10100;
+    const uint64_t beside = base + 0x10140;
+    const uint64_t output = base + 0x80000;
+    // In the output's buffer, which the reported store reaches.
+    const uint64_t elsewhere = base + 0x80100;
+    constexpr u32 first_value = 0x7eac0001u;
+    constexpr u32 reported_value = 0x7eac0002u;
+    constexpr u32 held_value = 0x7eac0003u;
+    static const std::vector<u32> writer = [] {
+      std::vector<u32> code;
+      code.push_back(EncodeVop1(0x01u, 1, 4)); // v_mov_b32 v1, s4
+      code.push_back(EncodeMubuf0(0x1cu, 0, false, false)); // buffer_store_dword v1, off, s[0:3]
+      code.push_back(EncodeMubuf1(1, 0, 0));
+      AppendEnd(&code);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+      return code;
+    }();
+    const auto &copy = EpochCopyShader();
+    const auto &bda_store = EpochBdaStoreShader();
+    const auto store = [](uint64_t address, u32 word) {
+      return std::vector<u32>{KYTY_PM4(5, Pm4::IT_SET_SH_REG, Pm4::R_ZERO),
+                              Pm4::COMPUTE_USER_DATA_0, static_cast<u32>(address),
+                              static_cast<u32>(address >> 32u), word,
+                              KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u,
+                              0x41u};
+    };
+    const auto read = [](uint64_t address) {
+      u32 word = 0;
+      (void)LibKernel::Memory::TryReadBacking(address, &word, sizeof(word));
+      return word;
+    };
+    EnsureRuntimeContext();
+    if (!Libs::Graphics::Buffer::HostReadableSupported(m_runtime_context)) {
+      std::printf("[gpu]     %-32s no host-readable device memory: skipped\n", name);
+      return;
+    }
+
+    vk::Event gate{};
+    const vk::EventCreateInfo gate_info{};
+    RequireVk(name, "event", m_device.createEvent(&gate_info, nullptr, &gate), "createEvent");
+    std::mutex gate_mutex;
+    bool gate_set = false;
+    const auto release = [&] {
+      std::lock_guard lock(gate_mutex);
+      if (!gate_set) {
+        gate_set = true;
+        (void)m_device.setEvent(gate);
+      }
+    };
+    std::promise<void> released;
+    // The GPU wait is bounded: the gate opens after the timeout whatever the test does.
+    std::thread watchdog([&release, done = released.get_future()] {
+      if (done.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+        release();
+      }
+    });
+    std::thread opener;
+
+    RunEpochFixture(
+        name, base, size, [] {},
+        [&](RenderContext &context, CommandProcessor &processor) {
+          auto &cache = context.GetBufferCache();
+          auto &scheduler = context.GetCommandScheduler();
+          // One cached buffer over the first pages, another over the output.
+          std::vector<u32> read_all;
+          AppendEpochCopy(read_all, base, 0x40000, output);
+          RunEpochSlice(name, processor, copy, 8, read_all);
+          FinishWithCompletions(scheduler);
+          Require(name, "two buffers",
+                  BufferCacheTestAccess::PageOwner(cache, first) !=
+                      BufferCacheTestAccess::PageOwner(cache, output),
+                  "one buffer holds both the first dword and the output");
+          // The writer of the first dword, completed.
+          const auto out = EpochDwordBuffer(first, sizeof(u32));
+          RunEpochSlice(name, processor, writer, 5,
+                        {KYTY_PM4(7, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+                         out.fields[0], out.fields[1], out.fields[2], out.fields[3], first_value,
+                         KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u, 0x41u});
+          // The store program runs once and the fault pass reports where it stored.
+          RunEpochSlice(name, processor, bda_store, 3, store(elsewhere, reported_value));
+          context.RunGarbageCollector();
+          FinishWithCompletions(scheduler);
+          Require(name, "reach",
+                  BufferCacheTestAccess::InUntrackedReach(cache, elsewhere, sizeof(u32)) &&
+                      !BufferCacheTestAccess::InUntrackedReach(cache, first, sizeof(u32)),
+                  "the reported store's buffer is not the reach");
+          Require(name, "fixture",
+                  cache.HasGpuDirtyBytes(first, sizeof(u32)) &&
+                      cache.HasGpuDirtyBytes(output, sizeof(u32)),
+                  "the writes did not leave their pages GPU-owned");
+
+          // The program again, held behind the gate.
+          auto &command = scheduler.Current();
+          command.EndRendering();
+          command.Handle().waitEvents(1, &gate, vk::PipelineStageFlagBits::eHost,
+                                      vk::PipelineStageFlagBits::eAllCommands, 0, nullptr, 0,
+                                      nullptr, 0, nullptr);
+          RunEpochSlice(name, processor, bda_store, 3,
+                        store(variant == Case::Hazard ? beside : elsewhere, held_value));
+          scheduler.Flush();
+          const auto held = scheduler.CurrentTick() - 1;
+          Require(name, "in flight", !scheduler.IsFree(held),
+                  "the held store completed before the read");
+
+          const auto read_at = variant == Case::InReach ? output : first;
+          if (variant == Case::InReach) {
+            const auto outcome = BufferCacheTestAccess::ProbeDirectReadback(cache, read_at,
+                                                                            sizeof(u32));
+            Require(name, "blocked",
+                    outcome == BufferCacheTestAccess::DirectReadback::Untracked,
+                    "the direct read was refused for reason " +
+                        std::to_string(static_cast<int>(outcome)) + ", expected untracked");
+            opener = std::thread([&release] {
+              std::this_thread::sleep_for(std::chrono::milliseconds(300));
+              release();
+            });
+          }
+          const auto tick = scheduler.CurrentTick();
+          const auto direct_before = BufferCacheTestAccess::DirectReadbacks(cache);
+          cache.ReadMemory(read_at, sizeof(u32));
+          const auto direct = BufferCacheTestAccess::DirectReadbacks(cache) - direct_before;
+          Require(name, "direct", direct == 1u,
+                  "expected one direct read, got " + std::to_string(direct));
+          Require(name, "handed back",
+                  !cache.IsRegionGpuModified(read_at, sizeof(u32)) &&
+                      !cache.HasGpuDirtyBytes(read_at, sizeof(u32)),
+                  "the read returned with its page still GPU-owned");
+          if (variant == Case::InReach) {
+            Require(name, "waited", scheduler.IsFree(held),
+                    "the read in reach returned before the held store completed");
+            release();
+            return;
+          }
+          Require(name, "no wait", !scheduler.IsFree(held) && scheduler.CurrentTick() == tick,
+                  "the read out of reach waited for the held store or submitted");
+          Require(name, "value", read(first) == first_value,
+                  "the read returned " + Hex(read(first)) + ", expected " + Hex(first_value));
+          release();
+          FinishWithCompletions(scheduler);
+          context.RunGarbageCollector();
+          FinishWithCompletions(scheduler);
+          if (variant == Case::OutOfReach) {
+            Require(name, "no hazard", !cache.IsRegionGpuModified(first, sizeof(u32)),
+                    "a store out of the read's pages took them as written");
+            return;
+          }
+          // The store landed on the read's page: it is the GPU's again, and reads back.
+          Require(name, "hazard taken as written", cache.IsRegionGpuModified(beside, sizeof(u32)),
+                  "the page the read skipped the store for is not GPU-written");
+          Require(name, "store read back", ReadEpochDword(name, context, beside) == held_value,
+                  "the held store's dword read back as " + Hex(read(beside)));
+          Require(name, "first kept", ReadEpochDword(name, context, first) == first_value,
+                  "the first dword read back as " + Hex(read(first)));
+          Require(name, "reach grown",
+                  BufferCacheTestAccess::InUntrackedReach(cache, first, sizeof(u32)),
+                  "the store's new buffer did not join the reach");
+        });
+    release();
+    released.set_value();
+    watchdog.join();
+    if (opener.joinable()) {
+      opener.join();
+    }
+    m_device.destroyEvent(gate, nullptr);
+  }
+
+  // An indirect dispatch whose arguments a store through a GPU-selected address wrote (an
+  // untracked write: not GPU-dirty, and guest memory still reads x = 0) is not skipped as empty
+  // on the CPU's copy: the GPU reads the stored arguments. `reported`: the fault pass has
+  // reported the store, so the arguments are in the untracked reach; otherwise the program's
+  // stores were never reported.
+  void CheckUntrackedIndirectArgs(bool reported) {
+    const char *name = reported ? "UntrackedIndirectArgsReach" : "UntrackedIndirectArgsUnreported";
+    const uintptr_t base = 0x0000000213800000ull + (reported ? 0x200000ull : 0u);
+    constexpr uint64_t size = 0x100000;
+    const uint64_t args = base + 0x20000;
+    const uint64_t output = base + 0x80000;
+    constexpr u32 value = 0x7eac0d15u;
+    static const std::vector<u32> writer = [] {
+      std::vector<u32> code;
+      code.push_back(EncodeVop1(0x01u, 1, 4)); // v_mov_b32 v1, s4
+      code.push_back(EncodeMubuf0(0x1cu, 0, false, false)); // buffer_store_dword v1, off, s[0:3]
+      code.push_back(EncodeMubuf1(1, 0, 0));
+      AppendEnd(&code);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+      return code;
+    }();
+    const auto &copy = EpochCopyShader();
+    const auto &bda_store = EpochBdaStoreShader();
+    RunEpochFixture(
+        name, base, size,
+        [&] {
+          // Guest memory holds empty arguments.
+          constexpr std::array<u32, 3> empty{0u, 1u, 1u};
+          std::memcpy(reinterpret_cast<void *>(args), empty.data(), sizeof(empty));
+        },
+        [&](RenderContext &context, CommandProcessor &processor) {
+          auto &cache = context.GetBufferCache();
+          auto &scheduler = context.GetCommandScheduler();
+          // A cached buffer over the arguments, which the store reaches through the page table.
+          std::vector<u32> read_all;
+          AppendEpochCopy(read_all, base, 0x40000, output);
+          RunEpochSlice(name, processor, copy, 8, read_all);
+          FinishWithCompletions(scheduler);
+          // The store of x = 1.
+          RunEpochSlice(name, processor, bda_store, 3,
+                        {KYTY_PM4(5, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+                         static_cast<u32>(args), static_cast<u32>(args >> 32u), 1u,
+                         KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u, 0x41u});
+          if (reported) {
+            context.RunGarbageCollector();
+          }
+          FinishWithCompletions(scheduler);
+          u32 backing = 1;
+          Require(name, "fixture",
+                  !cache.HasGpuDirtyBytes(args, 3 * sizeof(u32)) &&
+                      BufferCacheTestAccess::InUntrackedReach(cache, args, 3 * sizeof(u32)) ==
+                          reported &&
+                      LibKernel::Memory::TryReadBacking(args, &backing, sizeof(backing)) &&
+                      backing == 0u,
+                  "the untracked store left its arguments GPU-dirty, in guest memory, or "
+                  "outside the expected reach");
+          // The indirect dispatch writes `value` to the output.
+          const auto out = EpochDwordBuffer(output, sizeof(u32));
+          RunEpochSlice(name, processor, writer, 5,
+                        {KYTY_PM4(7, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+                         out.fields[0], out.fields[1], out.fields[2], out.fields[3], value});
+          processor.DispatchIndirect(args, 0x41u);
+          FinishWithCompletions(scheduler);
+          const auto seen = ReadEpochDword(name, context, output);
+          Require(name, "dispatched", seen == value,
+                  "the dispatch was skipped on guest memory's empty arguments (output " +
+                      Hex(seen) + ")");
+        });
+  }
+
   void CheckNativeIndirectDispatch() {
     constexpr const char *name = "NativeIndirectDispatch";
     constexpr uintptr_t base = 0x0000000204600000ull;
@@ -15313,6 +15579,147 @@ public:
         Require(name, "unmapped table", read(output) == 0u,
                 "a dispatch reading an unmapped table did not read zeros");
       }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A guest thread's readback records a download of a GPU-written page and goes on: the bytes
+  // stop being GPU-dirty before the publish lands in guest memory. A dispatch prepared in that
+  // window reads the dword through a flat SRT slot: it must not take the stale backing (GTA V
+  // built BVHs from a stale node count this way, and their refits looped).
+  void CheckGpuFlatCopyPendingDownload() {
+    constexpr const char *name = "GpuFlatCopyPendingDownload";
+    constexpr uintptr_t base = 0x0000000204d00000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t produced = base + 0x1000;
+    constexpr uint64_t output = base + 0x2000;
+    constexpr u32 value = 0x5e1f0a2bu;
+    std::vector<u32> writer;
+    writer.push_back(EncodeVop1(0x01u, 1, 4)); // v_mov_b32 v1, s4
+    writer.push_back(EncodeMubuf0(0x1cu, 0, false, false)); // buffer_store_dword v1, off, s[0:3]
+    writer.push_back(EncodeMubuf1(1, 0, 0));
+    AppendEnd(&writer);
+    std::vector<u32> reader;
+    reader.push_back(EncodeSmem0(0x00, 8, 0)); // s_load_dword s8, s[0:1], 0
+    reader.push_back(EncodeSmem1(0, 0x7d));
+    reader.push_back(EncodeVop1(0x01u, 1, 8)); // v_mov_b32 v1, s8
+    reader.push_back(EncodeMubuf0(0x1cu, 0, false, false)); // buffer_store_dword v1, off, s[4:7]
+    reader.push_back(EncodeMubuf1(1, 1, 0));
+    AppendEnd(&reader);
+    for (const auto *code : {&writer, &reader}) {
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code->data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<uint32_t>(code->size() * sizeof(u32))});
+    }
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "mapping failed");
+    // The guest's copy of the produced dword stays 0 until the download publishes.
+    std::memset(mapped, 0, allocation_size);
+    const auto descriptor = [](uint64_t address) {
+      ShaderBufferResource resource{};
+      resource.UpdateAddress48(address);
+      resource.fields[2] = 4;
+      resource.fields[3] = DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      return resource;
+    };
+    const auto produced_vsharp = descriptor(produced);
+    const auto output_vsharp = descriptor(output);
+    const std::vector<u32> write_commands {
+        KYTY_PM4(7, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+        produced_vsharp.fields[0], produced_vsharp.fields[1], produced_vsharp.fields[2],
+        produced_vsharp.fields[3], value,
+        KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u, 0x41u};
+    const std::vector<u32> read_commands {
+        KYTY_PM4(10, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+        static_cast<u32>(produced), static_cast<u32>(produced >> 32u), 0u, 0u,
+        output_vsharp.fields[0], output_vsharp.fields[1], output_vsharp.fields[2],
+        output_vsharp.fields[3],
+        KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u, 0x41u};
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      GraphicsInitJmpTables();
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const auto run = [&](const std::vector<u32> &code, u32 sgprs,
+                           const std::vector<u32> &commands) {
+        processor.GetShCtx().SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                                          .num_thread_x = 1, .num_thread_y = 1,
+                                          .num_thread_z = 1, .wave_size = 64,
+                                          .user_sgpr = static_cast<uint8_t>(sgprs)});
+        Pm4Execution execution;
+        Require(name, "command stream",
+                processor.Process(execution, commands) == Pm4ProcessResult::Complete,
+                "a dispatch stream did not complete");
+      };
+      run(writer, 5, write_commands);
+      Require(name, "written", cache.HasGpuDirtyBytes(produced, sizeof(u32)),
+              "the first dispatch's store did not leave its dword GPU-dirty");
+      // As a guest thread's readback does (ReadMemoryFromGuestThread): the download is recorded
+      // in the open command buffer, so its publish is still to come.
+      Require(name, "pending download",
+              BufferCacheTestAccess::RecordDownload(cache, produced & ~uint64_t{4095}, 4096) &&
+                  !cache.HasGpuDirtyBytes(produced, sizeof(u32)) &&
+                  cache.HasPendingGuestWrite(produced, sizeof(u32)),
+              "recording the download left the dword GPU-dirty or noted no pending write");
+      // A data-only slot over the bytes is left to a GPU copy...
+      Require(name, "GPU-written while publishing",
+              LibKernel::Memory::IsGpuWrittenUnread(produced, sizeof(u32)),
+              "bytes a download has yet to publish read as clean guest memory");
+      // ...and any other read of them waits for the publish instead of taking the page's view.
+      Require(name, "no stale view",
+              LibKernel::Memory::TryViewGpuCleanBacking(produced & ~uint64_t{4095}, 4096) ==
+                  nullptr,
+              "a page whose download has yet to publish was served from guest memory");
+      // ...which includes the compiled SRT walker's raw table loads (raw_table_reads).
+      Require(name, "no raw table load",
+              !CanLoadSrtTableRaw(produced, sizeof(u32)),
+              "the compiled SRT walker may load a table a download has yet to publish");
+      run(reader, 8, read_commands);
+      const auto read = [&](uint64_t address) {
+        cache.ReadMemory(address, sizeof(u32));
+        u32 word = 0;
+        Require(name, "readback",
+                LibKernel::Memory::TryReadBacking(address, &word, sizeof(word)),
+                "a dword could not be read back");
+        return word;
+      };
+      const auto seen = read(output);
+      Require(name, "dependency", seen == value,
+              "the second dispatch read " + Hex(seen) + " instead of the GPU's " + Hex(value));
+      Require(name, "producer", read(produced) == value,
+              "the download did not publish the GPU's dword");
+      Require(name, "raw table load once published", CanLoadSrtTableRaw(produced, sizeof(u32)),
+              "the compiled SRT walker may not load a published, GPU-clean table");
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     });
@@ -56415,6 +56822,14 @@ int main(int argc, char **argv) {
           Case::UntrackedInFlight, Case::PrunedInFlight, Case::UntrackedIndirect}) {
       vulkan.CheckDirectReadback(variant);
     }
+    for (const auto variant :
+         {VulkanHarness::UntrackedReachCase::OutOfReach, VulkanHarness::UntrackedReachCase::InReach,
+          VulkanHarness::UntrackedReachCase::Hazard}) {
+      vulkan.CheckUntrackedReach(variant);
+    }
+    for (const bool reported : {true, false}) {
+      vulkan.CheckUntrackedIndirectArgs(reported);
+    }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--writeback-only") == 0) {
@@ -56836,6 +57251,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--gpu-flat-copy-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuFlatCopyDependency();
+    vulkan.CheckGpuFlatCopyPendingDownload();
     vulkan.CheckMaterializeReadbackConsumers();
     return 0;
   }
@@ -57204,6 +57620,14 @@ int main(int argc, char **argv) {
         VulkanHarness::DirectReadbackCase::PrunedInFlight,
         VulkanHarness::DirectReadbackCase::UntrackedIndirect}) {
     vulkan.CheckDirectReadback(variant);
+  }
+  for (const auto variant :
+       {VulkanHarness::UntrackedReachCase::OutOfReach, VulkanHarness::UntrackedReachCase::InReach,
+        VulkanHarness::UntrackedReachCase::Hazard}) {
+    vulkan.CheckUntrackedReach(variant);
+  }
+  for (const bool reported : {true, false}) {
+    vulkan.CheckUntrackedIndirectArgs(reported);
   }
   CheckGpuThreadGuestWritesRouted();
   vulkan.CheckEpochGpuThreadWrites();

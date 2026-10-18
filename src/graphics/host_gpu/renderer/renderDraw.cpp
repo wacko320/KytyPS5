@@ -1336,12 +1336,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 	// Stores through GPU-selected V#s and addresses are no binding. Noted before the draw is
 	// recorded, after the last submit the bindings above may make.
-	const bool untracked_writes =
-	    std::any_of(vertex_stages.begin(), vertex_stages.end(),
-	                [](const auto& stage) { return stage.stage.program->has_address_writes; }) ||
-	    (state.ps_active && state.ps_input_info.stage.program->has_address_writes);
-	if (untracked_writes) {
-		m_context.GetBufferCache().NoteUntrackedWrites();
+	for (const auto& stage: vertex_stages) {
+		if (stage.stage.program->has_address_writes) {
+			m_context.GetBufferCache().NoteUntrackedWrites(stage.stage.program->shader_hash);
+		}
+	}
+	if (state.ps_active && state.ps_input_info.stage.program->has_address_writes) {
+		m_context.GetBufferCache().NoteUntrackedWrites(
+		    state.ps_input_info.stage.program->shader_hash);
 	}
 	vk::PipelineStageFlags shader_write_stages = {};
 	for (const auto& stage: vertex_stages) {

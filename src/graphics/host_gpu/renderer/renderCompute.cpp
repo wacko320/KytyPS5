@@ -499,7 +499,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	// Before the dispatch is recorded: a readback in between must not take it for unwritten.
 	if (program.has_address_writes) {
-		m_context.GetBufferCache().NoteUntrackedWrites();
+		m_context.GetBufferCache().NoteUntrackedWrites(program.shader_hash);
 	}
 	// No barrier of its own: the guest's synchronisation orders dispatches (CommandScheduler::
 	// RequestGuestBarrier), as the hardware overlaps the dispatches between its syncs.
@@ -654,8 +654,12 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
 	Common::LockGuard lock(m_context.GetMutex());
+	// Arguments that untracked stores (GPU-selected V#s and addresses) may have written are not
+	// GPU-dirty, but guest memory does not hold them either: those take the GPU path.
 	vk::DispatchIndirectCommand args {};
-	if (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
+	auto&                       cache = m_context.GetBufferCache();
+	if (!cache.HasGpuDirtyBytes(args_addr, sizeof(args)) &&
+	    !cache.MayHoldUntrackedWrites(args_addr, sizeof(args)) &&
 	    LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args)) &&
 	    (args.x == 0 || args.y == 0 || args.z == 0)) {
 		return;
@@ -733,7 +737,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto vk_buffer = buffer.Handle();
 	// Before the dispatch is recorded: a readback in between must not take it for unwritten.
 	if (program.has_address_writes) {
-		m_context.GetBufferCache().NoteUntrackedWrites();
+		m_context.GetBufferCache().NoteUntrackedWrites(program.shader_hash);
 	}
 	// No barrier of its own, for the arguments either: GPU work that produced them is ordered
 	// by the guest's synchronisation before this packet (the barrier includes indirect reads),

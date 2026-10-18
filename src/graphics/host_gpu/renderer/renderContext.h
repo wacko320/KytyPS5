@@ -64,7 +64,7 @@ public:
 	// image, or waiting for a download or other deferred write to publish it.
 	[[nodiscard]] bool IsGpuSettled(uint64_t vaddr, uint64_t size);
 	// GPU thread only (false elsewhere): buffer bytes the GPU wrote and the CPU has not read
-	// back, with no GPU-written image over them.
+	// back, or whose readback has yet to publish them, with no GPU-written image over them.
 	[[nodiscard]] bool IsGpuWrittenUnread(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	// GPU thread: see BufferCache::TryWriteGpuOrdered. False when the caller must write guest

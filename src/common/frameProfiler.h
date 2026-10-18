@@ -195,6 +195,10 @@ enum class Kind : uint8_t { Sum, Max };
 	X(ReadbackDirectBlockedUnmapped, Count, Sum, "direct readback: buffer not host-readable")      \
 	X(ReadbackDirectBlockedSize, Count, Sum, "direct readback: request over a page")               \
 	X(ReadbackDirectBlockedTime, Ticks, Sum, "direct readback: not eligible, download time")       \
+	X(ReadbackDirectWaitedWriter, Count, Sum, "direct readback: waited for the writer first")      \
+	X(ReadbackDirectWaitedUntracked, Count, Sum, "direct readback: waited for untracked writes")   \
+	X(UntrackedGateSkips, Count, Sum, "direct readback: untracked writes running out of reach")    \
+	X(UntrackedGateHazards, Count, Sum, "direct readback: skipped untracked writes hit its pages") \
 	X(MaterializeReadbacks, Count, Sum, "materialize readback: readbacks")                         \
 	X(MaterializeReadbackTimeRemovable, Ticks, Sum, "materialize readback: only read V#s")         \
 	X(MaterializeReadbackTimeBufferRead, Ticks, Sum, "materialize readback: a read V#")            \

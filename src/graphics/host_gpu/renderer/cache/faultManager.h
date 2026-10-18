@@ -21,6 +21,9 @@ public:
 
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return &m_fault_buffer; }
 	void                  ProcessFaultBuffer();
+	// A command that may store through GPU-selected V#s is recorded: the next pass also reports
+	// the written-page bitmap (BufferCache::BDA_WRITTEN_BITMAP_WORD).
+	void                  NoteUntrackedWrites() noexcept { m_written_pass_due = true; }
 
 private:
 	GraphicContext&                            m_graphics;
@@ -30,6 +33,7 @@ private:
 	Buffer                                     m_download_buffer;
 	std::array<uint64_t, MaxPendingFaults>      m_fault_areas {};
 	uint32_t                                   m_current_area = 0;
+	bool                                       m_written_pass_due = false;
 	vk::DescriptorSetLayout                    m_fault_process_desc_layout = nullptr;
 	vk::Pipeline                               m_fault_process_pipeline = nullptr;
 	vk::PipelineLayout                         m_fault_process_pipeline_layout = nullptr;

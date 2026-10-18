@@ -476,6 +476,11 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 
 } // namespace
 
+bool CanLoadSrtTableRaw(uint64_t address, uint64_t size) {
+	CheckedReadScope scope;
+	return CanLoadGuestTableRaw(nullptr, address, size);
+}
+
 std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPipelineKey& key) const {
 	std::size_t hash = 0;
 	PipelineKeyHash::Mix(hash, key.rendering.color_count);

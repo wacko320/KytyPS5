@@ -121,6 +121,8 @@ struct EmitterState {
 	uint32_t                                         indirect_format_function = 0;
 	uint32_t                                         indirect_format_geometry_function = 0;
 	std::map<std::array<uint32_t, 3>, uint32_t>        indirect_buffer_load_functions;
+	// get_bda_write_pointer (GetBdaWritePointer), or 0 without a fault buffer.
+	uint32_t                                         bda_write_pointer_function = 0;
 	// get_bda_read_pointer, and the page its last recorded miss hit (UINT32_MAX for none),
 	// reported to the fault buffer at return.
 	uint32_t                                         bda_read_pointer_function = 0;
@@ -576,6 +578,9 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx);
 void DefineIndirectBufferLoads(ValueEmitContext& ctx);
 void DefineBvhIntersect(EmitterState& state);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
+// GetBdaPointer for a store or atomic: the host does not track writes through the page table, so
+// the written page is recorded for it (BufferCache::BDA_WRITTEN_BITMAP_WORD).
+uint32_t GetBdaWritePointer(EmitterState& state, uint32_t address);
 // Never null: a missing or out-of-range page reads the zeroed page at BufferCache::BDA_ZERO_ENTRY.
 // A miss is recorded when record is true and reported at return (EmitBdaFaultReport).
 uint32_t GetBdaReadPointer(EmitterState& state, uint32_t address, uint32_t record);
