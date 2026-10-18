@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/indirectDrawArgs.h"
 #include "graphics/host_gpu/renderer/indirectThreadDispatch.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -142,7 +143,7 @@ public:
 	void EndRendering() const;
 	[[nodiscard]] bool IsRendering() const noexcept { return m_rendering; }
 
-	[[nodiscard]] vk::CommandBuffer Handle() const;
+	[[nodiscard]] CommandRecorder Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
@@ -163,6 +164,8 @@ private:
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
 	vk::CommandBuffer   m_buffer          = nullptr;
+	// Instead of m_buffer, while the commands are logged for the submit thread.
+	CommandLog*         m_log             = nullptr;
 	uint32_t            m_debug_op        = 0;
 	uint64_t            m_debug_submit_id = 0;
 	uint32_t            m_debug_arg0      = 0;
@@ -236,7 +239,7 @@ private:
 	                      uint64_t indirect_args = 0);
 	// Dispatches carry no barrier of their own, but every LDS-storage dispatch uses the same
 	// bytes: one after another LDS dispatch with no global barrier between waits for it.
-	void OrderSharedMemory(vk::CommandBuffer command, const PreparedBindings& bindings);
+	void OrderSharedMemory(CommandRecorder command, const PreparedBindings& bindings);
 	void NoteSharedMemoryDispatch(const PreparedBindings& bindings);
 	// Records batch.requests' conversions (IndirectThreadDispatch::ConvertBatch), after the
 	// guest barrier the dispatch would take, and sets batch.serial.

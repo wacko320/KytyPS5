@@ -226,7 +226,7 @@ void BindlessHeap::Reserve() {
 }
 
 void BindlessHeap::Commit(
-    vk::CommandBuffer command, vk::PipelineLayout layout, vk::PipelineBindPoint bind_point,
+    CommandRecorder command, vk::PipelineLayout layout, vk::PipelineBindPoint bind_point,
     StreamBuffer& upload,
     const std::array<std::vector<vk::DescriptorImageInfo>, Bindless::ClassCount>& images,
     std::span<const vk::DescriptorImageInfo> samplers,

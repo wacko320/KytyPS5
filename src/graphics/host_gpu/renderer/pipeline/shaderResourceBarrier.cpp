@@ -95,8 +95,8 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	return has_writes;
 }
 
-void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
-	EXIT_IF(vk_buffer == nullptr || !source_stages);
+void ShaderWriteBarrier(CommandRecorder vk_buffer, vk::PipelineStageFlags source_stages) {
+	EXIT_IF(!vk_buffer || !source_stages);
 	const auto barrier = MakeShaderWriteDependency();
 	vk_buffer.pipelineBarrier(source_stages,
 	                          vk::PipelineStageFlagBits::eComputeShader |

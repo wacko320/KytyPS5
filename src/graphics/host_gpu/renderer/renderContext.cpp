@@ -209,6 +209,8 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
+		// The upload helper may still copy from the range's backing.
+		m_buffer_cache.WaitUploads();
 		// Check cache ownership on the GPU thread. Another lane's work, or a deferred write to
 		// guest memory (registered by the buffer and texture download publishes), may still use
 		// the range. The drain (a full GPU idle) is skipped for ranges no buffer, image, download
@@ -260,13 +262,14 @@ void RenderContext::PrepareBda() {
 	// Buffers already hold every CPU write the GPU may see: the epoch's acquire uploaded them
 	// (CoherenceEpoch), and new buffers upload when created. Shader stores through BDA are not
 	// tracked, though: a page the CPU wrote since the acquire would be uploaded whole over them
-	// at the next one. Synchronize what was queued since the acquire before them.
+	// at the next one. Upload what was queued since the acquire before them, in one batch whose
+	// pages the upload helper protects and copies (per-range synchronization protects each range
+	// on this thread).
 	m_buffer_cache.EnsureBdaZeroEntry();
 	{
 		const Common::FrameProfiler::ScopedUploadSource source(
 		    Common::FrameProfiler::UploadSource::Bda);
-		std::shared_lock lock(m_mapped_ranges_mutex);
-		m_buffer_cache.SynchronizeBda(m_mapped_ranges);
+		m_buffer_cache.Epoch().UploadPending();
 	}
 	m_fault_process_pending = true;
 }

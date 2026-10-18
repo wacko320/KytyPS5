@@ -267,7 +267,7 @@ void RenderExecutor::BindSharedMemory(ShaderComputeInputInfo& input, PreparedBin
 	bindings.shared_memory = {m_lds_storage->Handle(), 0, size};
 }
 
-void RenderExecutor::OrderSharedMemory(vk::CommandBuffer command, const PreparedBindings& bindings) {
+void RenderExecutor::OrderSharedMemory(CommandRecorder command, const PreparedBindings& bindings) {
 	if (bindings.shared_memory.buffer == nullptr || !m_lds_unordered ||
 	    m_context.GetCommandScheduler().GlobalBarrierCount() != m_lds_global_barriers) {
 		return;

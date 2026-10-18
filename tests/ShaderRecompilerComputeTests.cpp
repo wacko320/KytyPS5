@@ -85,6 +85,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <condition_variable>
 #include <functional>
 #include <future>
 #include <cstdint>
@@ -287,6 +288,15 @@ struct CommandSchedulerTestAccess {
   }
   static void ResetFeedMinWork(CommandScheduler &scheduler) {
     scheduler.m_feed_min_work = CommandScheduler::FeedMinWork;
+  }
+  // The command buffer the scheduler's last submit ran, once every handed-over one is submitted.
+  static vk::CommandBuffer LastSubmitted(CommandScheduler &scheduler) {
+    scheduler.DrainSubmits();
+    return scheduler.m_last_submitted_buffer.load(std::memory_order_acquire);
+  }
+  static size_t PoolSize(CommandScheduler &scheduler) {
+    scheduler.DrainSubmits();
+    return scheduler.m_command_pool.Size();
   }
 };
 
@@ -2802,12 +2812,12 @@ public:
     constexpr size_t blocked_submission_count = 6;
     std::array<vk::CommandBuffer, blocked_submission_count> blocked_handles{};
     for (size_t i = 0; i < blocked_submission_count; ++i) {
-      blocked_handles[i] = scheduler.Current().Handle();
       if (i == 0) {
         scheduler.Flush(external_wait);
       } else {
         scheduler.Flush();
       }
+      blocked_handles[i] = CommandSchedulerTestAccess::LastSubmitted(scheduler);
     }
     bool distinct_handles = true;
     for (size_t i = 0; i < blocked_handles.size(); ++i) {
@@ -2832,13 +2842,18 @@ public:
             "failed to signal the external timeline semaphore");
     scheduler.Wait(last_blocked_tick);
     m_runtime_context.device.destroySemaphore(external_timeline, nullptr);
+    // Once the timeline moves, completed command buffers serve later submits: the pool grows
+    // no more.
     scheduler.Flush();
-    scheduler.Flush();
-    Require(
-        "SchedulerTimeline", "timeline pool reuse",
-        std::ranges::find(blocked_handles, scheduler.Current().Handle()) !=
-            blocked_handles.end(),
-        "completed command buffers were not reused after timeline progress");
+    scheduler.Wait(scheduler.CurrentTick() - 1);
+    const auto pool_size = CommandSchedulerTestAccess::PoolSize(scheduler);
+    for (int i = 0; i < 8; i++) {
+      scheduler.Flush();
+      scheduler.Wait(scheduler.CurrentTick() - 1);
+    }
+    Require("SchedulerTimeline", "timeline pool reuse",
+            CommandSchedulerTestAccess::PoolSize(scheduler) == pool_size,
+            "completed command buffers were not reused after timeline progress");
     scheduler.Shutdown();
 
     CommandScheduler draining(Renderer(), m_runtime_context);
@@ -15042,6 +15057,63 @@ public:
 
   // The draw-argument conversion: an indexed draw's index count clamped to the limit, every
   // other dword copied bit for bit, and a non-indexed draw's copied whole.
+  // The main scheduler hands each ended command buffer to its submit thread: the recording
+  // thread goes on while the submit waits for the host writes the command buffer needs (the
+  // submit-wait hook, given the mark taken when it ended), a queued tick is not submitted yet,
+  // and a host wait for it returns once it is submitted and done.
+  void CheckSubmitThread() {
+    constexpr const char *name = "SubmitThread";
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    std::mutex mutex;
+    std::condition_variable opened;
+    bool open = false;
+    uint64_t marks = 0;
+    std::vector<uint64_t> waited;
+    scheduler.SetSubmitWaitHook(
+        [&] {
+          std::lock_guard lock(mutex);
+          return ++marks;
+        },
+        [&](uint64_t mark) {
+          std::unique_lock lock(mutex);
+          // Bounded: a submit made on the recording thread would otherwise never return.
+          (void)opened.wait_for(lock, std::chrono::seconds(5), [&] { return open; });
+          waited.push_back(mark);
+        });
+    const auto first = scheduler.CurrentTick();
+    const auto start = std::chrono::steady_clock::now();
+    scheduler.Flush();
+    scheduler.Flush();
+    const auto handed = std::chrono::steady_clock::now() - start;
+    Require(name, "handed over",
+            handed < std::chrono::seconds(2) && scheduler.CurrentTick() == first + 2 &&
+                !scheduler.IsSubmitted(first),
+            "the recording thread waited for the submit-wait hook");
+    {
+      std::lock_guard lock(mutex);
+      open = true;
+    }
+    opened.notify_all();
+    scheduler.Wait(first + 1);
+    Require(name, "queued wait", scheduler.IsSubmitted(first + 1),
+            "a wait for a queued tick returned before it was submitted");
+    scheduler.DrainSubmits();
+    {
+      std::lock_guard lock(mutex);
+      Require(name, "marks", waited == std::vector<uint64_t>{1, 2},
+              "the submits did not wait with their own marks, in order");
+    }
+    scheduler.SetSubmitWaitHook({}, {});
+    scheduler.Finish();
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckDrawArgsConvertClamp() {
     constexpr const char *name = "DrawArgsConvertClamp";
     EnsureRuntimeContext();
@@ -56392,6 +56464,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--gpu-flat-copy-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuFlatCopyDependency();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--submit-thread-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSubmitThread();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-draw-args-only") == 0) {

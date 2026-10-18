@@ -39,7 +39,7 @@ GpuTimestamps::~GpuTimestamps() {
 	}
 }
 
-void GpuTimestamps::Begin(vk::CommandBuffer command) {
+void GpuTimestamps::Begin(CommandRecorder command) {
 	EXIT_IF(m_current != nullptr);
 	if (!m_enabled) {
 		return;
@@ -75,7 +75,7 @@ void GpuTimestamps::Begin(vk::CommandBuffer command) {
 	command.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, m_current->pool, 0);
 }
 
-void GpuTimestamps::BeginRegion(vk::CommandBuffer command, GpuRegion region) {
+void GpuTimestamps::BeginRegion(CommandRecorder command, GpuRegion region) {
 	if (m_current == nullptr) {
 		return;
 	}
@@ -91,7 +91,7 @@ void GpuTimestamps::BeginRegion(vk::CommandBuffer command, GpuRegion region) {
 	m_current->region_open               = true;
 }
 
-void GpuTimestamps::EndRegion(vk::CommandBuffer command, GpuRegion region) {
+void GpuTimestamps::EndRegion(CommandRecorder command, GpuRegion region) {
 	if (m_current == nullptr || !m_current->region_open ||
 	    m_current->regions[m_current->spans] != region) {
 		return;
@@ -102,7 +102,7 @@ void GpuTimestamps::EndRegion(vk::CommandBuffer command, GpuRegion region) {
 	m_current->region_open = false;
 }
 
-uint32_t GpuTimestamps::End(vk::CommandBuffer command) {
+uint32_t GpuTimestamps::End(CommandRecorder command) {
 	if (m_current == nullptr) {
 		return 0;
 	}

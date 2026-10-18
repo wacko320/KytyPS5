@@ -18,6 +18,11 @@
 #include <mutex>
 #include <shared_mutex>
 #include <span>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -73,6 +78,14 @@ public:
 	// on; this thread waits for it, then a second short command hands back the pages no GPU
 	// write or pending publish has touched since.
 	void                   ReadMemoryFromGuestThread(uint64_t vaddr, uint64_t size, bool is_write);
+	// GPU thread: waits until the upload helper has protected and copied every walk handed to
+	// it (before a submit reads the staging copies, and before guest memory is unmapped).
+	void                   WaitUploads();
+	// GPU thread: before it stores to guest memory itself, an ordered write an earlier upload
+	// must not take: waits for the helper's copies from the range.
+	void                   WaitUploadsFrom(uint64_t vaddr, uint64_t size);
+	// Any thread: waits until the helper has done the first `queued` uploads handed to it.
+	void                   WaitUploadsUntil(uint64_t queued);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -226,6 +239,8 @@ private:
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Uploads the CPU-dirty pages of the buffers over the ranges in one batch (CoherenceEpoch).
 	void UploadCpuPending(const RangeSet& pending);
+	// The upload helper: protects a walk's pages, then copies their bytes into staging.
+	void UploadThread(std::stop_token stop);
 	// Notes the tracker pages over the range pending, holding the epoch's upload (HoldPending).
 	[[nodiscard]] CoherenceEpoch::Hold HoldCpuWritten(uint64_t vaddr, uint64_t size);
 	// Marks a range CPU-dirty, and so writable, under HoldCpuWritten.
@@ -322,6 +337,32 @@ private:
 	CoherenceEpoch                                    m_epoch {*this};
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
+	// Upload walks hand the helper their deferred protection, then the staging copies to make
+	// after it (UploadCpuPending): the GPU thread records the copy commands meanwhile, and the
+	// submit that runs them waits for the helper (WaitUploads).
+	struct UploadCopy {
+		uint8_t*       staging = nullptr;
+		const uint8_t* source  = nullptr;
+		uint64_t       size    = 0;
+	};
+	struct UploadJob {
+		std::vector<GuestRange> protect;
+		std::vector<UploadCopy> copies;
+	};
+	PageManager&                                      m_page_manager;
+	std::mutex                                        m_upload_mutex;
+	std::condition_variable                           m_upload_ready;
+	std::condition_variable                           m_upload_done;
+	std::deque<UploadJob>                             m_upload_jobs;
+	uint64_t                                          m_uploads_queued = 0;
+	uint64_t                                          m_uploads_done   = 0;
+	// GPU thread: the guest ranges of queued copies, by job serial.
+	struct UploadSource {
+		uint64_t serial  = 0;
+		uint64_t address = 0;
+		uint64_t size    = 0;
+	};
+	std::vector<UploadSource>                         m_upload_sources;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
@@ -404,6 +445,8 @@ private:
 	uint64_t                                          m_unchanged_end     = 0;
 	uint64_t                                          m_unchanged_largest = 0;
 	uint64_t                                          m_change_serial     = 0;
+	// Started last and stopped first: it runs the upload jobs above.
+	std::jthread m_upload_thread;
 };
 
 } // namespace Libs::Graphics

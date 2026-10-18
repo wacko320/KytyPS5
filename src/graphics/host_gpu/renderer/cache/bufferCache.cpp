@@ -690,11 +690,19 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                       CACHING_PAGESIZE + 256u),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
+      m_page_manager(page_manager),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
 	m_scheduler.SetPreSubmitHook([this] { RecordWritebacks(); });
+	m_scheduler.SetSubmitWaitHook(
+	    [this] {
+		    std::lock_guard lock(m_upload_mutex);
+		    return m_uploads_queued;
+	    },
+	    [this](uint64_t queued) { WaitUploadsUntil(queued); });
+	m_upload_thread = std::jthread([this](std::stop_token stop) { UploadThread(stop); });
 	m_host_readable_buffers = Buffer::HostReadableSupported(graphics);
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
@@ -720,6 +728,12 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 
 BufferCache::~BufferCache() {
 	m_scheduler.SetPreSubmitHook({});
+	m_scheduler.DrainSubmits();
+	m_scheduler.SetSubmitWaitHook({}, {});
+	WaitUploads();
+	m_upload_thread.request_stop();
+	m_upload_ready.notify_all();
+	m_upload_thread.join();
 	ApplyResolvedWritebacks();
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
@@ -2022,7 +2036,27 @@ void BufferCache::UploadCpuPending(const RangeSet& pending) {
 	const uint64_t profile_t0     = FrameProfiler::Start();
 	const uint64_t protect_calls0 = FrameProfiler::t_protect_calls;
 	const uint64_t protect_ticks0 = FrameProfiler::t_protect_ticks;
+	// With coherent staging, the pages the walk cleans are protected, and then copied, by the
+	// upload helper: a CPU write before its protection lands before its copy.
+	const bool              deferred = m_staging_buffer.IsCoherent();
+	std::vector<GuestRange> protect;
+	if (deferred) {
+		(void)PageManager::SetDeferredWriteWatches(&protect);
+	}
 	pending.ForEach([&](uint64_t start, uint64_t end) { ForEachMappedPart(start, end, collect); });
+	if (deferred) {
+		(void)PageManager::SetDeferredWriteWatches(nullptr);
+	}
+	bool       protecting  = deferred;
+	const auto protect_now = [&] {
+		if (!protecting) {
+			return;
+		}
+		for (const auto& range: protect) {
+			m_page_manager.ApplyProtection(range.address, range.size);
+		}
+		protecting = false;
+	};
 	if (profile_t0 != 0) {
 		using FrameProfiler::Counter;
 		using FrameProfiler::UploadCounter;
@@ -2041,6 +2075,7 @@ void BufferCache::UploadCpuPending(const RangeSet& pending) {
 		}
 	}
 	if (copies.empty()) {
+		protect_now();
 		FrameProfiler::AddSince(FrameProfiler::Counter::UploadTime, profile_t0);
 		return;
 	}
@@ -2058,13 +2093,57 @@ void BufferCache::UploadCpuPending(const RangeSet& pending) {
 		staging        = temporary->Mapped().data();
 		staging_offset = 0;
 	}
-	for (const auto& upload: uploads) {
-		for (size_t i = upload.first; i < upload.first + upload.count; i++) {
-			auto& copy = copies[i];
-			std::memcpy(staging + copy.srcOffset,
-			            reinterpret_cast<const void*>(upload.buffer->CpuAddress() + copy.dstOffset),
-			            copy.size);
+	// The helper copies from the backing store: by then a page may be GPU-written and
+	// read-protected at its guest address.
+	UploadJob job;
+	if (protecting && temporary == nullptr) {
+		job.copies.reserve(copies.size());
+		for (const auto& upload: uploads) {
+			for (size_t i = upload.first; i < upload.first + upload.count; i++) {
+				const auto&                               copy = copies[i];
+				Libs::LibKernel::Memory::GuestBackingView view {};
+				if (!Libs::LibKernel::Memory::GetGuestBackingView(
+				        upload.buffer->CpuAddress() + copy.dstOffset, copy.size, &view)) {
+					job.copies.clear();
+					break;
+				}
+				job.copies.push_back({staging + copy.srcOffset, view.pointer, copy.size});
+			}
+			if (job.copies.empty()) {
+				break;
+			}
+		}
+	}
+	if (!job.copies.empty()) {
+		job.protect = std::move(protect);
+		{
+			std::lock_guard lock(m_upload_mutex);
+			m_upload_jobs.push_back(std::move(job));
+			m_uploads_queued++;
+		}
+		for (const auto& upload: uploads) {
+			const auto& first = copies[upload.first];
+			const auto& last  = copies[upload.first + upload.count - 1];
+			const auto  begin = upload.buffer->CpuAddress() + first.dstOffset;
+			const auto  end   = upload.buffer->CpuAddress() + last.dstOffset + last.size;
+			m_upload_sources.push_back({m_uploads_queued, begin, end - begin});
+		}
+		m_upload_ready.notify_one();
+		protecting = false;
+		FrameProfiler::Add(FrameProfiler::Counter::UploadHelperJobs);
+		for (auto& copy: copies) {
 			copy.srcOffset += staging_offset;
+		}
+	} else {
+		protect_now();
+		for (const auto& upload: uploads) {
+			for (size_t i = upload.first; i < upload.first + upload.count; i++) {
+				auto& copy = copies[i];
+				std::memcpy(staging + copy.srcOffset,
+				            reinterpret_cast<const void*>(upload.buffer->CpuAddress() + copy.dstOffset),
+				            copy.size);
+				copy.srcOffset += staging_offset;
+			}
 		}
 	}
 	FrameProfiler::AddSince(FrameProfiler::Counter::UploadCopyTime, copy_t0);
@@ -2106,6 +2185,77 @@ void BufferCache::UploadCpuPending(const RangeSet& pending) {
 	                       vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0, nullptr, 0,
 	                       nullptr);
 	FrameProfiler::AddSince(FrameProfiler::Counter::UploadTime, profile_t0);
+}
+
+void BufferCache::UploadThread(std::stop_token stop) {
+	for (;;) {
+		UploadJob job;
+		{
+			std::unique_lock lock(m_upload_mutex);
+			m_upload_ready.wait(lock,
+			                    [&] { return stop.stop_requested() || !m_upload_jobs.empty(); });
+			if (m_upload_jobs.empty()) {
+				return;
+			}
+			job = std::move(m_upload_jobs.front());
+			m_upload_jobs.pop_front();
+		}
+		for (const auto& range: job.protect) {
+			m_page_manager.ApplyProtection(range.address, range.size);
+		}
+		for (const auto& copy: job.copies) {
+			std::memcpy(copy.staging, copy.source, copy.size);
+		}
+		{
+			std::lock_guard lock(m_upload_mutex);
+			m_uploads_done++;
+		}
+		m_upload_done.notify_all();
+	}
+}
+
+void BufferCache::WaitUploads() {
+	std::unique_lock lock(m_upload_mutex);
+	m_upload_sources.clear();
+	if (m_uploads_done == m_uploads_queued) {
+		return;
+	}
+	const uint64_t profile_t0 = FrameProfiler::Start();
+	m_upload_done.wait(lock, [this] { return m_uploads_done == m_uploads_queued; });
+	FrameProfiler::AddSince(FrameProfiler::Counter::UploadHelperWaitTime, profile_t0);
+}
+
+void BufferCache::WaitUploadsUntil(uint64_t queued) {
+	std::unique_lock lock(m_upload_mutex);
+	if (m_uploads_done >= queued) {
+		return;
+	}
+	const uint64_t profile_t0 = FrameProfiler::Start();
+	m_upload_done.wait(lock, [this, queued] { return m_uploads_done >= queued; });
+	FrameProfiler::AddSince(FrameProfiler::Counter::UploadHelperWaitTime, profile_t0);
+}
+
+void BufferCache::WaitUploadsFrom(uint64_t vaddr, uint64_t size) {
+	if (m_upload_sources.empty()) {
+		return;
+	}
+	uint64_t serial = 0;
+	for (const auto& source: m_upload_sources) {
+		if (source.address < vaddr + size && vaddr < source.address + source.size) {
+			serial = std::max(serial, source.serial);
+		}
+	}
+	std::unique_lock lock(m_upload_mutex);
+	const auto       done = m_uploads_done;
+	std::erase_if(m_upload_sources, [done](const UploadSource& source) {
+		return source.serial <= done;
+	});
+	if (serial <= done) {
+		return;
+	}
+	const uint64_t profile_t0 = FrameProfiler::Start();
+	m_upload_done.wait(lock, [this, serial] { return m_uploads_done >= serial; });
+	FrameProfiler::AddSince(FrameProfiler::Counter::UploadHelperWaitTime, profile_t0);
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

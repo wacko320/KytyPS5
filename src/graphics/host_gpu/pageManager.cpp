@@ -89,6 +89,8 @@ private:
 	std::atomic_flag& m_lock;
 };
 
+thread_local std::vector<GuestRange>* t_deferred_write_watches = nullptr;
+
 void ValidateRange(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		Fatal("invalid range vaddr=0x%016" PRIx64 ", size=0x%016" PRIx64, vaddr, size);
@@ -151,8 +153,10 @@ struct PageManager::Impl {
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
 		std::array<PageState, REGION_PAGES> pages;
-		// Pages whose protection differs from what their watchers ask (a lazy release), and the
-		// protection they have meanwhile.
+		// Pages whose protection differs from what their watchers ask, and the protection they
+		// have meanwhile: a lazy release left it tighter, or a deferred walk
+		// (SetDeferredWriteWatches) left a new write watch to apply. `applied` is also kept for
+		// pages that are not deferred, as their watchers' protection.
 		std::array<bool, REGION_PAGES>                        deferred {};
 		std::array<Common::VirtualMemory::Mode, REGION_PAGES> applied {};
 	};
@@ -245,9 +249,16 @@ struct PageManager::Impl {
 
 		const auto release_pending = [&] {
 			if (range_bytes != 0) {
-				Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				// New write watches only tighten a page's protection.
+				const bool defer = track && !is_read && t_deferred_write_watches != nullptr;
+				if (defer) {
+					t_deferred_write_watches->push_back(
+					    {base_addr + range_begin * PAGE_SIZE, range_bytes});
+				} else {
+					Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				}
 				std::fill_n(region.deferred.begin() + static_cast<std::ptrdiff_t>(range_begin),
-				            range_bytes / PAGE_SIZE, false);
+				            range_bytes / PAGE_SIZE, defer);
 				range_bytes           = 0;
 				potential_range_bytes = 0;
 			}
@@ -259,6 +270,10 @@ struct PageManager::Impl {
 			const bool update  = !masked || mask->Get(page_index);
 
 			const auto old_perms = page.Perms();
+			if (!region.deferred[page_index]) {
+				// Its protection, for a deferred walk's release_pending.
+				region.applied[page_index] = old_perms;
+			}
 			const auto new_count = update ? page.AddDelta<track ? 1 : -1, is_read>(address)
 			                              : page.AddDelta<0, is_read>(address);
 			const auto new_perms = page.Perms();
@@ -275,7 +290,8 @@ struct PageManager::Impl {
 			}
 
 			// A page whose protection was left takes the one its watchers now ask, unless it
-			// has it already: a new watcher may need the faults at once.
+			// has it already: a new watcher may need the faults at once (a deferred walk's
+			// release_pending may leave it again).
 			bool protect = false;
 			if (region.deferred[page_index]) {
 				region.deferred[page_index] = false;
@@ -337,6 +353,41 @@ struct PageManager::Impl {
 		}
 		Protect(region_base + page_index * PAGE_SIZE, PAGE_SIZE, perms);
 		return true;
+	}
+
+	void ApplyProtection(uint64_t vaddr, uint64_t size) {
+		ValidateRange(vaddr, size);
+		const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
+		const auto end   = Common::AlignUp(vaddr + size, PAGE_SIZE);
+		for (auto chunk_begin = begin; chunk_begin < end;) {
+			const auto chunk_end   = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
+			const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
+			if (auto* region = FindRegion(chunk_begin); region != nullptr) {
+				SpinGuard  lock(region->lock);
+				const auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
+				const auto last  = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+				const auto stale = [&](size_t page) {
+					return region->deferred[page] &&
+					       region->applied[page] != region->pages[page].Perms();
+				};
+				for (size_t run = first; run < last;) {
+					if (!stale(run)) {
+						region->deferred[run] = false;
+						run++;
+						continue;
+					}
+					const auto perms = region->pages[run].Perms();
+					auto       next  = run;
+					while (next < last && stale(next) && region->pages[next].Perms() == perms) {
+						region->deferred[next] = false;
+						next++;
+					}
+					Protect(region_base + run * PAGE_SIZE, (next - run) * PAGE_SIZE, perms);
+					run = next;
+				}
+			}
+			chunk_begin = chunk_end;
+		}
 	}
 
 	template <bool track, bool is_read>
@@ -406,6 +457,15 @@ void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& ma
 		Fatal("untracking unknown region 0x%016" PRIx64, base_addr);
 	}
 	m_impl->UpdateRegionWatchers<track, is_read, true>(*region, base_addr, first, last, &mask);
+}
+
+std::vector<GuestRange>* PageManager::SetDeferredWriteWatches(
+    std::vector<GuestRange>* sink) noexcept {
+	return std::exchange(t_deferred_write_watches, sink);
+}
+
+void PageManager::ApplyProtection(uint64_t vaddr, uint64_t size) {
+	m_impl->ApplyProtection(vaddr, size);
 }
 
 bool PageManager::IsReadWatched(uint64_t vaddr) const noexcept {

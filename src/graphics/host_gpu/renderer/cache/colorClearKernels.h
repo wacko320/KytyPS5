@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_CACHE_COLORCLEARKERNELS_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_CACHE_COLORCLEARKERNELS_H_
 
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -49,23 +50,23 @@ public:
 	// Records the check of `slices` consecutive slices of slice_bytes (a multiple of 4) at
 	// metadata + offset (a multiple of 4) against the codes, after every earlier write. The
 	// predicate records carry store_groups as the storage clear's group counts.
-	[[nodiscard]] Check RecordCheck(vk::CommandBuffer command, vk::Buffer metadata, uint64_t offset,
+	[[nodiscard]] Check RecordCheck(CommandRecorder command, vk::Buffer metadata, uint64_t offset,
 	                                uint64_t slice_bytes, uint32_t slices,
 	                                std::span<const uint8_t> codes, vk::Extent2D store_groups);
 	// Records the expansion of the check's matched slices to 0xff bytes, as the hardware leaves
 	// decompressed metadata, and a barrier before later readers of the metadata.
-	void RecordExpand(vk::CommandBuffer command, const Check& check, vk::Buffer metadata,
+	void RecordExpand(CommandRecorder command, const Check& check, vk::Buffer metadata,
 	                  uint64_t offset, uint64_t slice_bytes);
 	// The fallback without conditional rendering: a storage clear of the view (one 2D layer in
 	// GENERAL layout) to the colour, dispatched with the record's group counts.
-	void RecordStoreClear(vk::CommandBuffer command, vk::ImageView view, vk::Extent2D extent,
+	void RecordStoreClear(CommandRecorder command, vk::ImageView view, vk::Extent2D extent,
 	                      const std::array<float, 4>& color, const Check& check, uint32_t slice,
 	                      uint32_t code);
 	// For an image whose guest memory the GPU wrote as a buffer: a fill of the slice's
 	// slice_bytes at buffer + offset (multiples of 4) with the clear texel (pattern words
 	// alternating), dispatched with the record's group counts, and a barrier before later
 	// readers and writers of the buffer.
-	void RecordBufferFill(vk::CommandBuffer command, vk::Buffer buffer, uint64_t offset,
+	void RecordBufferFill(CommandRecorder command, vk::Buffer buffer, uint64_t offset,
 	                      uint64_t slice_bytes, const std::array<uint32_t, 2>& pattern,
 	                      const Check& check, uint32_t slice, uint32_t code);
 
@@ -75,7 +76,7 @@ private:
 	static constexpr uint64_t RecordBytes  = 16;
 	static constexpr uint64_t ResultsBytes = 1024 * 1024;
 
-	void BindCheck(vk::CommandBuffer command, vk::Buffer metadata, uint64_t window,
+	void BindCheck(CommandRecorder command, vk::Buffer metadata, uint64_t window,
 	               uint64_t range);
 
 	GraphicContext&         m_graphics;

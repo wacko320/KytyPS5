@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/tickSlotRing.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -81,7 +82,7 @@ private:
 
 	// The next slot of the ring, after waiting for its segment's earlier tick.
 	[[nodiscard]] uint32_t NextSlot();
-	void RecordConversion(vk::CommandBuffer command, const Source& source, uint32_t slot);
+	void RecordConversion(CommandRecorder command, const Source& source, uint32_t slot);
 	[[nodiscard]] Arguments SlotArguments(uint32_t slot) const;
 
 	GraphicContext&         m_graphics;

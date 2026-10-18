@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_GPUTIMESTAMPS_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_GPUTIMESTAMPS_H_
 
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -63,11 +64,11 @@ public:
 
 	// The recording thread, in command-buffer order: Begin after vkBeginCommandBuffer, End before
 	// vkEndCommandBuffer, outside a render pass.
-	void Begin(vk::CommandBuffer command);
-	void BeginRegion(vk::CommandBuffer command, GpuRegion region);
-	void EndRegion(vk::CommandBuffer command, GpuRegion region);
+	void Begin(CommandRecorder command);
+	void BeginRegion(CommandRecorder command, GpuRegion region);
+	void EndRegion(CommandRecorder command, GpuRegion region);
 	// Ends the command buffer's timing; pass the token to Submitted with its tick (0: untimed).
-	[[nodiscard]] uint32_t End(vk::CommandBuffer command);
+	[[nodiscard]] uint32_t End(CommandRecorder command);
 	void                   Submitted(uint32_t token, uint64_t tick);
 	// Reads the command buffers of ticks up to `completed_tick`, in tick order: adds their time to
 	// the statistics and the frame profiler, and releases their pools. Begin does it too.

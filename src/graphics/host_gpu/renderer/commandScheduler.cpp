@@ -101,7 +101,11 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
     : m_master(graphics), m_context(context), m_present(present), m_graphics(graphics),
       m_timestamps(graphics, present),
       m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+	if (!m_present) {
+		m_submit_thread = std::jthread([this](std::stop_token stop) { SubmitThread(stop); });
+	}
+}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
@@ -129,6 +133,16 @@ void CommandScheduler::Shutdown() {
 	}
 	if (!m_command.IsInvalid()) {
 		Submit();
+	}
+	DrainSubmits();
+	if (m_submit_thread.joinable()) {
+		m_submit_thread.request_stop();
+		{
+			// Orders the stop before the submit thread's predicate check.
+			std::lock_guard lock(m_submit_mutex);
+		}
+		m_submit_ready.notify_all();
+		m_submit_thread.join();
 	}
 	m_master.Wait(CurrentTick() - 1, WaitSite::SchedulerShutdown);
 	PopPendingOperations();
@@ -249,7 +263,7 @@ void CommandScheduler::FeedIdleGpu() {
 	// An atomic load: the priority thread refreshes the known GPU tick when the last submitted
 	// command buffer completes.
 	if (m_present || m_open_work < m_feed_min_work ||
-	    m_master.KnownGpuTick() < m_submitted.load(std::memory_order_acquire) || !Active() ||
+	    m_master.KnownGpuTick() < m_enqueued.load(std::memory_order_acquire) || !Active() ||
 	    m_command.IsInvalid() || m_in_pre_submit || InDeferredOperation()) {
 		return;
 	}
@@ -491,13 +505,29 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 }
 
 void CommandScheduler::BeginRecording() {
-	m_command.m_buffer = m_command_pool.Commit();
+	if (m_submit_thread.joinable()) {
+		// The submit thread replays the log into a command buffer of its own pool.
+		{
+			std::lock_guard lock(m_submit_mutex);
+			if (m_free_logs.empty()) {
+				m_logs.push_back(std::make_unique<LogSlot>());
+				m_free_logs.push_back(m_logs.back().get());
+			}
+			m_open_log = m_free_logs.back();
+			m_free_logs.pop_back();
+			m_submit_queue.push_back(m_open_log);
+		}
+		m_submit_ready.notify_one();
+		m_command.m_log = &m_open_log->log;
+	} else {
+		m_command.m_buffer = m_command_pool.Commit();
+	}
 	m_command.Begin();
 	m_open_work = 0;
 	m_dynamic_state.Invalidate();
 	// Reads the timestamps of command buffers already known complete: never a wait.
 	m_timestamps.Poll(m_master.KnownGpuTick());
-	m_timestamps.Begin(m_command.m_buffer);
+	m_timestamps.Begin(m_command.Handle());
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
@@ -541,19 +571,61 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 	// Timestamps are written outside a render pass.
 	m_command.EndRendering();
-	const auto timing = m_timestamps.End(m_command.m_buffer);
+	const auto timing = m_timestamps.End(m_command.Handle());
 	m_command.End();
-	const auto buffer   = m_command.m_buffer;
-	auto&      graphics = m_graphics;
-	EXIT_IF(graphics.queue == nullptr);
+	EXIT_IF(m_graphics.queue == nullptr);
 
-	vk::Result result;
-	uint64_t   tick;
+	PendingSubmit pending {.buffer          = m_command.m_buffer,
+	                       .submit          = submit,
+	                       .wait_mark       = m_submit_mark ? m_submit_mark() : 0,
+	                       .other           = m_command.m_registers == nullptr,
+	                       .pre_submit      = pre_submit,
+	                       .debug_op        = m_command.m_debug_op,
+	                       .debug_submit_id = m_command.m_debug_submit_id,
+	                       .debug_arg0      = m_command.m_debug_arg0,
+	                       .debug_arg1      = m_command.m_debug_arg1,
+	                       .debug_arg2      = m_command.m_debug_arg2,
+	                       .debug_arg3      = m_command.m_debug_arg3,
+	                       .debug_arg4      = m_command.m_debug_arg4};
+	uint64_t tick = 0;
+	if (m_open_log != nullptr) {
+		// The tick is this scheduler's own: taken here, it is the command buffer's at once, and
+		// the submit thread submits in tick order.
+		tick         = m_master.NextTick();
+		pending.tick = tick;
+		pending.submit.AddSignal(m_master.Handle(), tick);
+		m_open_log->pending = pending;
+		{
+			std::lock_guard lock(m_submit_mutex);
+			m_logs_closed++;
+		}
+		m_open_log->log.Close();
+		m_open_log = nullptr;
+	} else {
+		if (m_submit_wait) {
+			m_submit_wait(pending.wait_mark);
+		}
+		QueueSubmit(pending);
+		tick = pending.tick;
+	}
+	m_enqueued.store(tick, std::memory_order_release);
+	m_timestamps.Submitted(timing, tick);
+	m_command.m_buffer = nullptr;
+	m_command.m_log    = nullptr;
+	return tick;
+}
+
+void CommandScheduler::QueueSubmit(PendingSubmit& pending) {
+	auto&      graphics  = m_graphics;
+	auto&      submit    = pending.submit;
+	vk::Result result    = vk::Result::eSuccess;
 	uint64_t   submit_t0 = 0;
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
-		tick = m_master.NextTick();
-		submit.AddSignal(m_master.Handle(), tick);
+		if (pending.tick == 0) {
+			pending.tick = m_master.NextTick();
+			submit.AddSignal(m_master.Handle(), pending.tick);
+		}
 
 		vk::TimelineSemaphoreSubmitInfo timeline_info {};
 		timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
@@ -567,7 +639,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
 		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
 		submit_info.commandBufferCount   = 1;
-		submit_info.pCommandBuffers      = &buffer;
+		submit_info.pCommandBuffers      = &pending.buffer;
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
@@ -580,15 +652,16 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		}
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
-
+	const auto tick = pending.tick;
 	if (result != vk::Result::eSuccess) {
-		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
-		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
-		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
-		                  m_command.m_debug_arg4);
+		ReportVulkanFatal("vkQueueSubmit", result, tick, pending.debug_op, pending.debug_submit_id,
+		                  pending.debug_arg0, pending.debug_arg1, pending.debug_arg2,
+		                  pending.debug_arg3, pending.debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
+	m_last_submitted_buffer.store(static_cast<VkCommandBuffer>(pending.buffer),
+	                              std::memory_order_release);
 	m_submitted.store(tick, std::memory_order_release);
 	if (!m_present) {
 		// Wakes the priority thread to watch for this tick's completion (taking the mutex orders
@@ -598,25 +671,64 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		}
 		m_priority_wake.notify_one();
 	}
-	m_timestamps.Submitted(timing, tick);
-	if (profile.t0 != 0) {
+	if (submit_t0 != 0) {
 		using Common::FrameProfiler::Counter;
 		// The host queue was empty from when the priority thread saw the previous tick complete
 		// to vkQueueSubmit (a lower bound: completions it was too busy to see are not counted).
 		if (m_empty_tick.load(std::memory_order_acquire) == tick - 1) {
 			const auto since = m_empty_since.load(std::memory_order_relaxed);
-			if (since != 0 && submit_t0 != 0 && since < submit_t0) {
+			if (since != 0 && since < submit_t0) {
 				Common::FrameProfiler::Add(Counter::GpuQueueEmptyTime, submit_t0 - since);
 			}
 		}
 		// SubmitsCommand is the rest of QueueSubmits (the capture reads the debug counters).
-		if (m_command.m_registers == nullptr || pre_submit) {
-			Common::FrameProfiler::Add(m_command.m_registers == nullptr ? Counter::SubmitsOther
-			                                                            : Counter::SubmitsPreSubmit);
+		if (pending.other || pending.pre_submit) {
+			Common::FrameProfiler::Add(pending.other ? Counter::SubmitsOther
+			                                         : Counter::SubmitsPreSubmit);
 		}
 	}
-	m_command.m_buffer = nullptr;
-	return tick;
+}
+
+void CommandScheduler::SubmitThread(std::stop_token stop) {
+	for (;;) {
+		LogSlot* slot = nullptr;
+		{
+			std::unique_lock lock(m_submit_mutex);
+			m_submit_ready.wait(lock,
+			                    [&] { return stop.stop_requested() || !m_submit_queue.empty(); });
+			if (m_submit_queue.empty()) {
+				return;
+			}
+			slot = m_submit_queue.front();
+			m_submit_queue.pop_front();
+		}
+		const auto buffer = m_command_pool.Commit();
+		vk::CommandBufferBeginInfo begin_info {};
+		begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+		EXIT_NOT_IMPLEMENTED(buffer.begin(&begin_info) != vk::Result::eSuccess);
+		// Returns once the recording thread closes the log, which writes `pending` first.
+		slot->log.Replay(buffer);
+		EXIT_NOT_IMPLEMENTED(buffer.end() != vk::Result::eSuccess);
+		auto& pending  = slot->pending;
+		pending.buffer = buffer;
+		if (m_submit_wait) {
+			m_submit_wait(pending.wait_mark);
+		}
+		QueueSubmit(pending);
+		slot->log.Reset();
+		{
+			std::lock_guard lock(m_submit_mutex);
+			m_free_logs.push_back(slot);
+			m_logs_submitted++;
+		}
+		m_submit_done.notify_all();
+	}
+}
+
+void CommandScheduler::DrainSubmits() {
+	std::unique_lock lock(m_submit_mutex);
+	const auto       closed = m_logs_closed;
+	m_submit_done.wait(lock, [this, closed] { return m_logs_submitted >= closed; });
 }
 
 void CommandScheduler::BeginNext() {

@@ -149,7 +149,7 @@ bool ColorClearKernels::Fits(uint32_t slices, uint32_t codes) noexcept {
 	       MaskBytes(slices) + static_cast<uint64_t>(slices) * codes * RecordBytes <= ResultsBytes;
 }
 
-void ColorClearKernels::BindCheck(vk::CommandBuffer command, vk::Buffer metadata, uint64_t window,
+void ColorClearKernels::BindCheck(CommandRecorder command, vk::Buffer metadata, uint64_t window,
                                   uint64_t range) {
 	const vk::DescriptorBufferInfo infos[] {
 	    {metadata, window, range},
@@ -167,7 +167,7 @@ void ColorClearKernels::BindCheck(vk::CommandBuffer command, vk::Buffer metadata
 	                             writes);
 }
 
-ColorClearKernels::Check ColorClearKernels::RecordCheck(vk::CommandBuffer command,
+ColorClearKernels::Check ColorClearKernels::RecordCheck(CommandRecorder command,
                                                         vk::Buffer metadata, uint64_t offset,
                                                         uint64_t slice_bytes, uint32_t slices,
                                                         std::span<const uint8_t> codes,
@@ -252,7 +252,7 @@ ColorClearKernels::Check ColorClearKernels::RecordCheck(vk::CommandBuffer comman
 	return check;
 }
 
-void ColorClearKernels::RecordExpand(vk::CommandBuffer command, const Check& check,
+void ColorClearKernels::RecordExpand(CommandRecorder command, const Check& check,
                                      vk::Buffer metadata, uint64_t offset, uint64_t slice_bytes) {
 	const auto alignment = std::max<uint64_t>(
 	    m_graphics.physical_device_properties.limits.minStorageBufferOffsetAlignment, 4);
@@ -277,7 +277,7 @@ void ColorClearKernels::RecordExpand(vk::CommandBuffer command, const Check& che
 	                        nullptr);
 }
 
-void ColorClearKernels::RecordStoreClear(vk::CommandBuffer command, vk::ImageView view,
+void ColorClearKernels::RecordStoreClear(CommandRecorder command, vk::ImageView view,
                                          vk::Extent2D extent, const std::array<float, 4>& color,
                                          const Check& check, uint32_t slice, uint32_t code) {
 	const vk::DescriptorImageInfo image_info {nullptr, view, vk::ImageLayout::eGeneral};
@@ -295,7 +295,7 @@ void ColorClearKernels::RecordStoreClear(vk::CommandBuffer command, vk::ImageVie
 	command.dispatchIndirect(check.results, check.RecordOffset(slice, code));
 }
 
-void ColorClearKernels::RecordBufferFill(vk::CommandBuffer command, vk::Buffer buffer,
+void ColorClearKernels::RecordBufferFill(CommandRecorder command, vk::Buffer buffer,
                                          uint64_t offset, uint64_t slice_bytes,
                                          const std::array<uint32_t, 2>& pattern,
                                          const Check& check, uint32_t slice, uint32_t code) {

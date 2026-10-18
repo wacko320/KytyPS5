@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_BINDLESSHEAP_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_BINDLESSHEAP_H_
 
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -48,7 +49,7 @@ public:
 	// Writes and binds set 1 for one dispatch or draw. images[class] holds the class's views in
 	// slot order, starting with the null image; classes the shaders do not use are empty.
 	// samplers and compare_samplers likewise start with a default sampler, or are empty.
-	void Commit(vk::CommandBuffer command, vk::PipelineLayout layout,
+	void Commit(CommandRecorder command, vk::PipelineLayout layout,
 	            vk::PipelineBindPoint bind_point, StreamBuffer& upload,
 	            const std::array<std::vector<vk::DescriptorImageInfo>,
 	                             ShaderRecompiler::IR::Bindless::ClassCount>& images,

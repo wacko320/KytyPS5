@@ -20,17 +20,20 @@ CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
     : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
 
 bool CommandBuffer::IsInvalid() const {
-	return m_buffer == nullptr;
+	return m_buffer == nullptr && m_log == nullptr;
 }
 
-vk::CommandBuffer CommandBuffer::Handle() const {
+CommandRecorder CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
-	return m_buffer;
+	return m_log != nullptr ? CommandRecorder(m_log) : CommandRecorder(m_buffer);
 }
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
-	auto buffer = Handle();
+	if (m_log != nullptr) {
+		return;
+	}
+	auto buffer = m_buffer;
 
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
@@ -42,7 +45,10 @@ void CommandBuffer::Begin() {
 
 void CommandBuffer::End() const {
 	EndRendering();
-	auto buffer = Handle();
+	if (m_log != nullptr) {
+		return;
+	}
+	auto buffer = m_buffer;
 
 	auto result = buffer.end();
 

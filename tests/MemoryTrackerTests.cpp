@@ -561,6 +561,69 @@ void TestLazyRelease() {
   Release(memory);
 }
 
+// An upload walk with deferred protection (BufferCache's upload helper) leaves the pages it
+// cleans writable until ApplyProtection, which protects them as their watchers now ask: a page
+// another change made unreadable meanwhile stays so, and a page another watcher took was
+// protected at once.
+void TestDeferredUploadProtection() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 3);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto walk = [&](std::vector<Libs::Graphics::GuestRange> &deferred) {
+    tracker.MarkRegionAsCpuModified(address, page_size * 3);
+    Check(PageManager::SetDeferredWriteWatches(&deferred) == nullptr, "a sink was already set");
+    uint64_t uploaded = 0;
+    tracker.ForEachUploadRange(
+        address, page_size * 3, false,
+        [&](uint64_t, uint64_t size) noexcept { uploaded += size; }, []() noexcept {});
+    Check(PageManager::SetDeferredWriteWatches(nullptr) == &deferred, "the sink changed");
+    Check(uploaded == page_size * 3 && !tracker.IsRegionCpuModified(address, page_size * 3),
+          "the deferred walk did not clean its pages");
+  };
+  const auto apply = [&](const std::vector<Libs::Graphics::GuestRange> &deferred) {
+    for (const auto &range : deferred) {
+      page_manager.ApplyProtection(range.address, range.size);
+    }
+  };
+
+  std::vector<Libs::Graphics::GuestRange> deferred;
+  walk(deferred);
+  Check(!deferred.empty() && IsWritable(memory) && IsWritable(memory + page_size * 2),
+        "a deferred walk protected its pages itself");
+  apply(deferred);
+  Check(Protection(memory) == PAGE_READONLY && Protection(memory + page_size * 2) == PAGE_READONLY,
+        "ApplyProtection did not watch the cleaned pages");
+
+  // A GPU write over page 1 before the helper: it is unreadable at once and stays so.
+  deferred.clear();
+  walk(deferred);
+  tracker.MarkRegionAsGpuModified(address + page_size, page_size);
+  Check(Protection(memory + page_size) == PAGE_NOACCESS && IsWritable(memory),
+        "a GPU write over a deferred page did not protect it at once");
+  apply(deferred);
+  Check(Protection(memory) == PAGE_READONLY && Protection(memory + page_size) == PAGE_NOACCESS &&
+            Protection(memory + page_size * 2) == PAGE_READONLY,
+        "ApplyProtection undid a later protection");
+  tracker.UnmarkRegionAsGpuModified(address + page_size, page_size);
+
+  // Another write watcher on page 2 before the helper: protected at once.
+  deferred.clear();
+  walk(deferred);
+  page_manager.UpdatePageWatchers<true>(address + page_size * 2, page_size);
+  Check(Protection(memory + page_size * 2) == PAGE_READONLY && IsWritable(memory),
+        "a new write watcher on a deferred page did not protect it at once");
+  apply(deferred);
+  page_manager.UpdatePageWatchers<false>(address + page_size * 2, page_size);
+  Check(Protection(memory + page_size * 2) == PAGE_READONLY,
+        "the walk's own watcher was lost");
+
+  tracker.UntrackMemory(address, page_size * 3);
+  Release(memory);
+}
+
 void TestCleanUploadPreservesOwnership() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
@@ -2327,6 +2390,7 @@ int main(int argc, char **argv) {
   TestBdaSyncConcurrentDrain();
   TestBdaSyncTakeWaitsForHolds();
   TestLazyRelease();
+  TestDeferredUploadProtection();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestInvalidationHoldsAcrossCpuDirty();

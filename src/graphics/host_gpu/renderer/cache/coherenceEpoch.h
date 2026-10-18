@@ -17,8 +17,8 @@ class BufferCache;
 // plain translation of the guest address.
 //
 // The pending set is the memory tracker's BDA sync queue (MemoryTracker::QueueBdaSync): an acquire
-// takes all of it and uploads it in one batch, and PrepareBda synchronizes what was queued since
-// (BufferCache::SynchronizeBda).
+// takes all of it and uploads it in one batch, and PrepareBda uploads what was queued since
+// (UploadPending).
 class CoherenceEpoch {
 public:
 	using Hold = MemoryTracker::BdaSyncHold;

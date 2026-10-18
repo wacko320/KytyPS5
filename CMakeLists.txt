@@ -795,6 +795,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pm4-lookahead-only)
 	add_test(NAME indirect_draw_gpu_args
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-draw-args-only)
+	add_test(NAME submit_thread
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submit-thread-only)
 	add_test(NAME gpu_flat_copy
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-flat-copy-only)
 	add_test(NAME feed_idle_gpu

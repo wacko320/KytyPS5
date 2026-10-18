@@ -85,6 +85,8 @@ public:
 	template <typename Writer>
 	void GpuThreadGuestWrite(uint64_t vaddr, uint64_t size, Writer&& writer) {
 		Common::FrameProfiler::Rec(Common::FrameProfiler::Event::GpuGuestWrite, vaddr, size);
+		// Uploads recorded before the store take the bytes before it.
+		m_buffer_cache.WaitUploadsFrom(vaddr, size);
 		if (auto* through = BeginWriteThrough(vaddr, size); through != nullptr) {
 			std::forward<Writer>(writer)(static_cast<void*>(through));
 			SrtPageWatch::Guest().Unsettle(vaddr, size);

@@ -87,7 +87,7 @@ void IndirectThreadDispatch::NoteRead(vk::DeviceAddress threads_address) {
 	m_ring.Touch(static_cast<uint32_t>(offset / SlotBytes), m_scheduler.CurrentTick());
 }
 
-void IndirectThreadDispatch::RecordConversion(vk::CommandBuffer command, const Source& source,
+void IndirectThreadDispatch::RecordConversion(CommandRecorder command, const Source& source,
                                               uint32_t slot) {
 	EXIT_IF((source.offset & 3u) != 0);
 	// A window around the three counts, not the whole buffer: a cache buffer can be larger than
@@ -124,7 +124,7 @@ IndirectThreadDispatch::Arguments IndirectThreadDispatch::SlotArguments(uint32_t
 namespace {
 
 // The conversions' writes before the indirect dispatches and the shaders reading the counts.
-void ConvertedBarrier(vk::CommandBuffer command) {
+void ConvertedBarrier(CommandRecorder command) {
 	vk::MemoryBarrier after {};
 	after.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	after.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead | vk::AccessFlagBits::eShaderRead;

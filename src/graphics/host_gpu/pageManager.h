@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <memory>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -37,6 +38,16 @@ public:
 	static bool SetLazyRelease(bool lazy) noexcept;
 	// Any thread, from a fault: whether the page's protection was left and is now applied.
 	[[nodiscard]] bool ApplyDeferred(uint64_t vaddr);
+
+	// Deferred write protection, for an upload walk that copies its pages after protecting them:
+	// while a sink is set on this thread, the ranges its new write watches would protect are
+	// appended to it instead, and the caller has them applied later (ApplyProtection), before
+	// it copies their bytes. A CPU write in between lands before the copy. Any other change to
+	// the watchers of such a page applies its protection at once (a watch that needs its faults,
+	// such as an image's or a BVH's, never starts on a writable page). Returns the previous sink.
+	static std::vector<GuestRange>* SetDeferredWriteWatches(std::vector<GuestRange>* sink) noexcept;
+	// Any thread: protects the range's pages a deferred walk left, as their watchers now ask.
+	void ApplyProtection(uint64_t vaddr, uint64_t size);
 
 private:
 	struct Impl;

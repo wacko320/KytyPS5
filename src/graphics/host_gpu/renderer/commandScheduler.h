@@ -11,7 +11,9 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <source_location>
@@ -59,7 +61,17 @@ public:
 	// records and operations are still accepted. The hook may submit (a stream-buffer wrap):
 	// that nested submit does not run it again.
 	void SetPreSubmitHook(std::function<void()> hook) { m_pre_submit = std::move(hook); }
-	// Any thread: whether the command buffer of the tick has been handed to the queue.
+	// Host writes a command buffer's commands read that finish off the recording thread (staging
+	// copies): `mark`, on the recording thread when the command buffer ends, names what the
+	// command buffer needs; `wait(mark)` runs before its vkQueueSubmit.
+	void SetSubmitWaitHook(std::function<uint64_t()> mark, std::function<void(uint64_t)> wait) {
+		m_submit_mark = std::move(mark);
+		m_submit_wait = std::move(wait);
+	}
+	// Waits until every command buffer handed to the submit thread is submitted.
+	void DrainSubmits();
+	// Any thread: whether the command buffer of the tick has been handed to the queue (a
+	// command buffer the submit thread still holds has its tick, and is not).
 	[[nodiscard]] bool IsSubmitted(uint64_t tick) const noexcept {
 		return m_submitted.load(std::memory_order_acquire) >= tick;
 	}
@@ -153,6 +165,7 @@ private:
 		KYTY_CLASS_NO_COPY(CommandPool);
 
 		vk::CommandBuffer Commit();
+		[[nodiscard]] size_t Size() const noexcept { return m_buffers.size(); }
 
 	private:
 		static constexpr size_t GrowStep = 4;
@@ -174,8 +187,29 @@ private:
 		uint64_t                     tick = 0;
 	};
 
+	// A command buffer the recording thread ended, for vkQueueSubmit.
+	struct PendingSubmit {
+		vk::CommandBuffer buffer = nullptr;
+		SubmitInfo        submit;
+		uint64_t          tick            = 0;
+		uint64_t          wait_mark       = 0;
+		bool              other           = false;
+		bool              pre_submit      = false;
+		uint32_t          debug_op        = 0;
+		uint64_t          debug_submit_id = 0;
+		uint32_t          debug_arg0      = 0;
+		uint32_t          debug_arg1      = 0;
+		uint32_t          debug_arg2      = 0;
+		uint32_t          debug_arg3      = 0;
+		uint64_t          debug_arg4      = 0;
+	};
+
 	void BeginNext();
 	void BeginRecording();
+	// vkQueueSubmit of an ended command buffer, then its publication (m_submitted).
+	void QueueSubmit(PendingSubmit& pending);
+	// The main scheduler's submits run here, off the recording thread, in tick order.
+	void SubmitThread(std::stop_token stop);
 	void PriorityOperationsThread(std::stop_token stop);
 	// Priority thread: notes the time when the last submitted command buffer is seen complete
 	// (the frame profiler's GpuQueueEmptyTime).
@@ -223,9 +257,35 @@ private:
 	OperationState               m_operation_state      = OperationState::Open;
 	bool                         m_host_barrier_requested = false;
 	std::function<void()>        m_pre_submit;
+	std::function<uint64_t()>     m_submit_mark;
+	std::function<void(uint64_t)> m_submit_wait;
 	std::chrono::steady_clock::time_point m_last_refresh {};
 	bool                         m_in_pre_submit = false;
 	std::atomic<uint64_t>        m_submitted {0};
+	// The last tick the recording thread handed over for submission (FeedIdleGpu: the GPU is
+	// idle only once it completes).
+	std::atomic<uint64_t>        m_enqueued {0};
+	std::mutex                   m_submit_mutex;
+	std::condition_variable      m_submit_ready;
+	std::condition_variable      m_submit_done;
+	// A logged command buffer: handed to the submit thread when its recording begins, so it is
+	// replayed while recorded, and submitted with `pending` (written before the log closes).
+	struct LogSlot {
+		CommandLog    log;
+		PendingSubmit pending;
+	};
+	std::deque<LogSlot*>         m_submit_queue;
+	// Logged command buffers closed (recording thread) and submitted (submit thread).
+	uint64_t                     m_logs_closed    = 0;
+	uint64_t                     m_logs_submitted = 0;
+	// The main scheduler's log slots: free ones under m_submit_mutex.
+	std::vector<std::unique_ptr<LogSlot>> m_logs;
+	std::vector<LogSlot*>        m_free_logs;
+	LogSlot*                     m_open_log = nullptr;
+	// The command buffer the last submit ran (tests).
+	std::atomic<VkCommandBuffer> m_last_submitted_buffer {VK_NULL_HANDLE};
+	// The main scheduler only; started last.
+	std::jthread                 m_submit_thread;
 };
 
 } // namespace Libs::Graphics
