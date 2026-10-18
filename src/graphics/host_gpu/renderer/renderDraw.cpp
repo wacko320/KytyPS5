@@ -1265,6 +1265,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
+		const Common::FrameProfiler::ScopedPhase profile_phase(
+		    Common::FrameProfiler::Phase::VertexIndex);
 		AcquireVertexBuffers(buffer, state.vertex_info[0], vertex_bindings);
 		index_binding = PrepareIndexBuffer(buffer, index_source);
 	}
@@ -1293,6 +1295,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// memory.
 	auto vk_buffer = buffer.Handle();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
+	const Common::FrameProfiler::ScopedPhase profile_commit(Common::FrameProfiler::Phase::Commit);
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
@@ -1384,6 +1387,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (shader_write_stages) {
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
+		Common::FrameProfiler::Add(Common::FrameProfiler::Counter::DrawStorageWriteBarriers);
 	}
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {

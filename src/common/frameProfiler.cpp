@@ -129,6 +129,11 @@ constexpr EventNameEntry EventNames[] = {
     {Event::GuestDispatch, "GuestDispatch"},
     {Event::QueueEmpty, "QueueEmpty"},
     {Event::Feed, "Feed"},
+    {Event::WaitPass, "WaitPass"},
+    {Event::SuspendWait, "SuspendWait"},
+    {Event::LabelWrite, "LabelWrite"},
+    {Event::QueueSwitch, "QueueSwitch"},
+    {Event::QueuePark, "QueuePark"},
 };
 
 #define KYTY_FP_WAIT_SITE_INFO(name, description) {#name, description},

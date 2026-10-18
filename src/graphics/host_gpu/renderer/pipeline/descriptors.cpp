@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/frameProfiler.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -886,6 +887,8 @@ void RenderExecutor::ResetBindings() {
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	const Common::FrameProfiler::ScopedPhase profile_phase(
+	    Common::FrameProfiler::Phase::PrepareBindings);
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
@@ -1263,6 +1266,8 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
+	const Common::FrameProfiler::ScopedPhase profile_phase(
+	    Common::FrameProfiler::Phase::StageBindings);
 	bool uses_dma = false;
 	for (auto* stage: stages) {
 		if (stage->runtime->program->info.uses_dma) {

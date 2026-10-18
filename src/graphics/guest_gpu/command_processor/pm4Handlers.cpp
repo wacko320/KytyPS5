@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/frameProfiler.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -1289,6 +1290,7 @@ KYTY_HW_UC_PARSER(HwUcSetGdsOaRegisters) {
 
 KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
+	Common::FrameProfiler::Rec(Common::FrameProfiler::Event::AcquireMem, cmd_id);
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0065800);
 	// Caches are coherent on the host; the acquire still orders the work after it.

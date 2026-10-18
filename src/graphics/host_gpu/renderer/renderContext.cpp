@@ -69,6 +69,8 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 }
 
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+	Common::FrameProfiler::Rec(Common::FrameProfiler::Event::Fault, static_cast<uint64_t>(access),
+	                           fault_vaddr);
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
@@ -340,6 +342,8 @@ void RenderContext::DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, in
 }
 
 void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
+	Common::FrameProfiler::Rec(Common::FrameProfiler::Event::Interrupt,
+	                           static_cast<uint64_t>(event_id));
 	std::vector<InterruptEqRegistration> registrations;
 	{
 		Common::LockGuard lock(m_interrupt_mutex);

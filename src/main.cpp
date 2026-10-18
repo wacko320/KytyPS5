@@ -113,6 +113,9 @@ static void PrintUsage() {
 	::printf("  --profile-frames <start>[,<count>]  Profile <count> frames (default 100) from frame\n"
 	         "                                       <start>, write kyty-profile-*/ and quit.\n"
 	         "                                       F12 does the same from the next frame.\n");
+	::printf("  --dump-frames <start>[,<count>]     Write the image presented at <count> frames\n"
+	         "                                       (default 1) from frame <start> as PNG into\n"
+	         "                                       kyty-frames-*/.\n");
 	::printf("  --pad-script <frame>:<Control>[,...] Press DualSense controls (--keymap names) for a\n"
 	         "                                       few frames at the given frames.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
@@ -544,6 +547,15 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid profile frames (expected <start>[,<count>]): %s\n",
 				         value.c_str());
 				return false;
+			}
+		} else if (arg == "--dump-frames") {
+			if (!ParseFrameWindow(value, options.config.dump_frames_start,
+			                      options.config.dump_frames_count)) {
+				::printf("invalid dump frames (expected <start>[,<count>]): %s\n", value.c_str());
+				return false;
+			}
+			if (options.config.dump_frames_count == 0) {
+				options.config.dump_frames_count = 1;
 			}
 		} else if (arg == "--pad-script") {
 			options.config.pad_script = value;

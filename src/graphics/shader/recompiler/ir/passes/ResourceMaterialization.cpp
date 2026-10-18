@@ -3,6 +3,7 @@
 #include "graphics/shader/recompiler/ir/BindlessImages.h"
 
 #include "common/assert.h"
+#include "common/frameProfiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -316,6 +317,156 @@ void MarkGpuCopyableFlatSlots(ResourcePlan& plan) {
 		if ((op == ValueOpcode::LoadAddressU32 && kind == ResourceKind::ScalarAddress) ||
 		    (op == ValueOpcode::ReadConstBuffer && kind == ResourceKind::ScalarBuffer)) {
 			plan.gpu_copyable_flat_slots.push_back(slot);
+		}
+	}
+}
+
+// Marks with `bit` every flat slot that the values in `pending` reach, through a ReadConst of the
+// slot or by reaching the slot's read instruction (the reachability MarkGpuCopyableFlatSlots
+// uses). `read_slots` maps each read instruction to the slots it fills; one-dword reads that fill
+// no slot get `bit` in `nested`.
+void MarkReachedSlots(const ResourcePlan&                                           plan,
+                      const std::unordered_map<const Inst*, std::vector<uint32_t>>& read_slots,
+                      std::vector<Value> pending, uint16_t bit, std::vector<uint16_t>& consumers,
+                      std::vector<std::pair<Value, uint16_t>>& nested,
+                      std::unordered_map<const Inst*, size_t>& nested_index) {
+	std::unordered_set<const Inst*> reached;
+	while (!pending.empty()) {
+		const auto value = pending.back().Resolve();
+		pending.pop_back();
+		const auto* inst = value.IsEmpty() ? nullptr : value.TryInstruction();
+		if (inst == nullptr || !reached.insert(inst).second) {
+			continue;
+		}
+		if (const auto slots = read_slots.find(inst); slots != read_slots.end()) {
+			for (const auto slot: slots->second) {
+				consumers[slot] |= bit;
+			}
+		} else if (IsSrtRawRead(plan, *inst)) {
+			if (const auto [index, added] = nested_index.try_emplace(inst, nested.size()); added) {
+				nested.emplace_back(value, bit);
+			} else {
+				nested[index->second].second |= bit;
+			}
+		}
+		if (inst->GetOpcode() == ValueOpcode::ReadConst) {
+			const auto slot = inst->Arg(1).Resolve();
+			if (slot.IsImmediate() && slot.GetType() == Type::U32 &&
+			    slot.U32() < consumers.size()) {
+				consumers[slot.U32()] |= bit;
+				pending.push_back(plan.srt_reads[slot.U32()].value);
+			}
+			continue;
+		}
+		for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+			pending.push_back(inst->Arg(arg));
+		}
+	}
+}
+
+// Frame profiler data: the CPU consumers of each flat slot (Common::FrameProfiler::Consumer
+// bits), which kind of CPU-evaluated value reaches it (descriptor dwords by resource kind,
+// indirect table keys, selectors and masks, block conditions, prefetch addresses, fill values,
+// the addresses of other slots' reads), and the one-dword reads nested in those values that fill
+// no slot. A slot MarkGpuCopyableFlatSlots did not select that no value reaches gets Other, so
+// "no consumer" is exactly "GPU-copyable". Runs after MarkGpuCopyableFlatSlots.
+void MarkSrtReadConsumers(ResourcePlan& plan) {
+	using Common::FrameProfiler::Bit;
+	using Common::FrameProfiler::Consumer;
+	plan.srt_read_consumers.assign(plan.srt_reads.size(), 0u);
+	plan.srt_nested_reads.clear();
+	std::unordered_map<const Inst*, size_t>                nested_index;
+	std::unordered_map<const Inst*, std::vector<uint32_t>> read_slots;
+	for (uint32_t slot = 0; slot < plan.srt_reads.size(); slot++) {
+		if (const auto* inst = plan.srt_reads[slot].value.Resolve().TryInstruction();
+		    inst != nullptr) {
+			read_slots[inst].push_back(slot);
+		}
+	}
+	const auto mark = [&](std::vector<Value> values, uint16_t bit) {
+		MarkReachedSlots(plan, read_slots, std::move(values), bit, plan.srt_read_consumers,
+		                 plan.srt_nested_reads, nested_index);
+	};
+	std::vector<uint16_t> source_kinds(plan.descriptor_sources.size(), 0u);
+	for (const auto& buffer: plan.info.buffers) {
+		if (buffer.source < source_kinds.size()) {
+			source_kinds[buffer.source] |=
+			    buffer.written ? Bit(Consumer::BufferWritten) : Bit(Consumer::BufferRead);
+		}
+	}
+	for (const auto& image: plan.info.images) {
+		if (image.source < source_kinds.size()) {
+			source_kinds[image.source] |= Bit(Consumer::Texture);
+		}
+	}
+	for (const auto& sampler: plan.info.samplers) {
+		if (sampler.source < source_kinds.size()) {
+			source_kinds[sampler.source] |= Bit(Consumer::Sampler);
+		}
+	}
+	// The four resource kinds are the low Consumer bits.
+	constexpr uint32_t                         SourceBits = 4;
+	std::array<std::vector<Value>, SourceBits> by_kind;
+	std::vector<Value>                         other;
+	std::vector<Value>                         image_keys;
+	for (uint32_t i = 0; i < plan.descriptor_sources.size(); i++) {
+		const auto& source = plan.descriptor_sources[i];
+		const auto  dwords = std::span(source.dwords).first(source.dword_count);
+		for (uint32_t kind = 0; kind < SourceBits; kind++) {
+			if ((source_kinds[i] & (1u << kind)) != 0) {
+				by_kind[kind].insert(by_kind[kind].end(), dwords.begin(), dwords.end());
+			}
+		}
+		if (source_kinds[i] == 0) {
+			other.insert(other.end(), dwords.begin(), dwords.end());
+		}
+		if (source.indirect_descriptor.has_value()) {
+			image_keys.push_back(source.indirect_descriptor->key_count);
+			image_keys.push_back(source.indirect_descriptor->selector_first);
+			image_keys.push_back(source.indirect_descriptor->selector_mask);
+		}
+	}
+	for (uint32_t kind = 0; kind < SourceBits; kind++) {
+		mark(std::move(by_kind[kind]), static_cast<uint16_t>(1u << kind));
+	}
+	mark(std::move(image_keys), Bit(Consumer::ImageKey));
+	std::vector<Value> conditions;
+	for (const auto& block: plan.control_flow) {
+		conditions.push_back(block.condition);
+	}
+	mark(std::move(conditions), Bit(Consumer::Condition));
+	std::vector<Value> prefetches;
+	for (const auto& prefetch: plan.dma_prefetches) {
+		prefetches.insert(prefetches.end(), {prefetch.low, prefetch.high, prefetch.offset});
+	}
+	mark(std::move(prefetches), Bit(Consumer::Address));
+	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i) {
+		other.push_back(plan.uniform_fill.values[i]);
+	}
+	mark(std::move(other), Bit(Consumer::Other));
+	std::vector<Value> addresses;
+	for (const auto& read: plan.srt_reads) {
+		if (const auto* inst = read.value.Resolve().TryInstruction(); inst != nullptr) {
+			for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+				addresses.push_back(inst->Arg(arg));
+			}
+		}
+	}
+	mark(std::move(addresses), Bit(Consumer::TablePointer));
+	// A slot that stays on the CPU whatever reads it (MarkGpuCopyableFlatSlots' other rules: a
+	// read shared by slots, a clean read, a flat offset not its own, not a scalar dword read)
+	// also gets Other; so does a slot no value reaches that is still not GPU-copyable.
+	for (uint32_t slot = 0; slot < plan.srt_reads.size(); slot++) {
+		if (std::ranges::binary_search(plan.gpu_copyable_flat_slots, slot)) {
+			continue;
+		}
+		const auto* inst  = plan.srt_reads[slot].value.Resolve().TryInstruction();
+		bool        fixed = inst == nullptr || read_slots[inst].size() != 1u ||
+		             plan.srt_reads[slot].flat_offset != slot ||
+		             inst->Flags<SrtReadFlags>().clean != 0u ||
+		             inst->GetOpcode() == ValueOpcode::LoadBufferU32 || !IsSrtRawRead(plan, *inst);
+		if (fixed || plan.srt_read_consumers[slot] == 0u) {
+			plan.srt_read_consumers[slot] |= Bit(Consumer::Other);
 		}
 	}
 }
@@ -1638,6 +1789,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	if (capture_indirect_reads || !plan.source_reads.empty())
 		plan.resource_tracking_complete &= !program.has_address_writes;
 	MarkGpuCopyableFlatSlots(plan);
+	MarkSrtReadConsumers(plan);
 	CompileSrtWalker(plan);
 	return plan;
 }

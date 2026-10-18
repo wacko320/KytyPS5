@@ -146,6 +146,11 @@ private:
 
 // What CommandBuffer::Handle returns: the vk::CommandBuffer calls the renderer makes, either
 // made at once (a scheduler that records directly) or logged for the submit thread.
+// Pipeline barriers the calling thread recorded through a CommandRecorder, logged or direct: every
+// barrier of the main scheduler's command buffers (the compute-ordering census,
+// CommandScheduler::CountGuestDispatch).
+inline thread_local uint64_t t_recorded_barriers = 0;
+
 class CommandRecorder {
 public:
 	CommandRecorder() noexcept = default;
@@ -289,6 +294,7 @@ public:
 	                     const vk::MemoryBarrier* memory, uint32_t buffer_count,
 	                     const vk::BufferMemoryBarrier* buffers, uint32_t image_count,
 	                     const vk::ImageMemoryBarrier* images) const {
+		t_recorded_barriers++;
 		if (Direct()) {
 			m_direct.pipelineBarrier(src, dst, flags, memory_count, memory, buffer_count, buffers,
 			                         image_count, images);
@@ -302,6 +308,7 @@ public:
 		});
 	}
 	void pipelineBarrier2(const vk::DependencyInfo& dependency) const {
+		t_recorded_barriers++;
 		if (Direct()) {
 			m_direct.pipelineBarrier2(dependency);
 			return;

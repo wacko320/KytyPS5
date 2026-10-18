@@ -1,3 +1,4 @@
+#include "common/frameProfiler.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
@@ -1523,6 +1524,157 @@ void TestUnreadableFiniteImageCandidateIsNull() {
   Check(null_candidate, "an unreadable finite image candidate was not a null descriptor");
 }
 
+// Per-slot CPU consumers (srt_read_consumers, frame profiler) of a hand-built plan, one slot per
+// class: a slot has none exactly when it is GPU-copyable. Also the read addresses the profiler's
+// attribution evaluates without loading (EvaluateLoadAddress).
+void TestSrtReadConsumers() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Common::FrameProfiler::Bit;
+  using Common::FrameProfiler::Consumer;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  auto &srt = block.AppendNewInst(ValueOpcode::GetSrtResource);
+  const auto read_const = [&](uint32_t slot) {
+    return Value(&block.AppendNewInst(ValueOpcode::ReadConst, {Value(&srt), Value(slot)}));
+  };
+  // An s_load_dword of the table at `low` + offset: one guest dword read.
+  const auto load = [&](Value low, uint32_t offset) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.planning_only = true;
+    program.memory_info.push_back(memory);
+    auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource, {low, Value(0u)});
+    auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+                                     {Value(&handle), Value(offset), Value(0u), Value(true)});
+    read.SetFlags(MemoryFlags{
+        .index = static_cast<uint32_t>(program.memory_info.size() - 1u), .pc = 0});
+    return Value(&read);
+  };
+  const auto table = Value(0x1000u);
+  // (Block conditions come from the program's blocks; not built here.)
+  constexpr uint32_t ReadV = 0, WrittenV = 1, TextureSlot = 2, TablePointer = 3,
+                     ThroughPointer = 4, TwiceA = 5, TwiceB = 6, DirectTexture = 7,
+                     ShaderOnly = 8, NestedPointer = 9, Slots = 10;
+  // A table pointer loaded in place inside a slot's address: a read that fills no slot.
+  const auto nested_pointer = load(table, 0x80u);
+  for (uint32_t slot = 0; slot < Slots; slot++) {
+    if (slot == ThroughPointer) {
+      // Its address is slot TablePointer's dword: a second-level table.
+      program.srt_reads.push_back({load(read_const(TablePointer), 0), slot});
+    } else if (slot == NestedPointer) {
+      program.srt_reads.push_back({load(nested_pointer, 0), slot});
+    } else if (slot == TwiceB) {
+      program.srt_reads.push_back({program.srt_reads[TwiceA].value, slot});
+    } else {
+      program.srt_reads.push_back({load(table, slot * 4u), slot});
+    }
+  }
+  const auto add_source = [&](std::initializer_list<Value> dwords) {
+    DescriptorSource source;
+    for (const auto dword : dwords) {
+      source.dwords[source.dword_count++] = dword;
+    }
+    program.descriptor_sources.push_back(source);
+    return static_cast<uint32_t>(program.descriptor_sources.size() - 1u);
+  };
+  program.info.buffers.push_back(
+      {.source = add_source({read_const(ReadV), read_const(TablePointer),
+                             read_const(ThroughPointer), Value(0u)}),
+       .written = false});
+  program.info.buffers.push_back(
+      {.source = add_source({read_const(TwiceA), Value(0u), Value(4u), Value(0u)}),
+       .written = false});
+  program.info.buffers.push_back(
+      {.source = add_source({read_const(WrittenV), Value(0u), Value(4u), Value(0u)}),
+       .written = true});
+  program.info.buffers.push_back(
+      {.source = add_source({read_const(NestedPointer), Value(0u), Value(4u), Value(0u)}),
+       .written = false});
+  // T#s: one through ReadConst, one taking slot DirectTexture's read instruction itself.
+  const auto image_source =
+      add_source({read_const(TextureSlot), program.srt_reads[DirectTexture].value, Value(0u),
+                  Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+  program.info.images.push_back(
+      {.source = image_source,
+       .resource_class = ImageResourceClass::Sampled,
+       .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
+       .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D});
+  const auto plan = ExtractResourcePlan(program);
+
+  const auto &consumers = plan.srt_read_consumers;
+  Check(consumers.size() == Slots && plan.srt_reads.size() == Slots,
+        "a consumer set per flat slot");
+  Check(consumers[ReadV] == Bit(Consumer::BufferRead), "a read-only V# dword is buffer-read only");
+  Check(consumers[WrittenV] == Bit(Consumer::BufferWritten), "a written V# dword");
+  Check(consumers[TextureSlot] == Bit(Consumer::Texture), "a T# dword");
+  Check(consumers[TablePointer] == (Consumer::TablePointer | Consumer::BufferRead),
+        "a table pointer that is also a V# dword");
+  Check(consumers[ThroughPointer] == Bit(Consumer::BufferRead),
+        "a V# dword read through a table pointer");
+  Check(consumers[TwiceA] == (Consumer::BufferRead | Consumer::Other) &&
+            consumers[TwiceB] == (Consumer::BufferRead | Consumer::Other),
+        "a dword read by two slots, and the CPU reaches their shared read");
+  Check(consumers[DirectTexture] == Bit(Consumer::Texture),
+        "a T# that takes a slot's read instruction without a ReadConst");
+  Check(consumers[ShaderOnly] == 0u, "a slot only the shader reads");
+  Check(consumers[NestedPointer] == Bit(Consumer::BufferRead),
+        "a V# dword read through a pointer loaded in place");
+  Check(plan.srt_nested_reads.size() == 1u &&
+            plan.srt_nested_reads[0].second == (Consumer::TablePointer | Consumer::BufferRead),
+        "a read that fills no slot is listed with its consumers");
+  Check(plan.gpu_copyable_flat_slots == std::vector<uint32_t>{ShaderOnly},
+        "only the slot without CPU consumers is GPU-copyable");
+
+  // Addresses without loads: the reader fails every read.
+  const SrtRuntime runtime{
+      .read_memory = [](void *, uint64_t, std::span<uint32_t>) { return false; },
+      .read_specialization_memory = [](void *, uint64_t, std::span<uint32_t>) { return false; }};
+  SrtWalker walker(plan, runtime);
+  uint64_t address = 0;
+  Check(walker.EvaluateLoadAddress(plan.srt_reads[ShaderOnly].value, address) &&
+            address == 0x1000u + ShaderOnly * 4u,
+        "a scalar slot's address evaluates without loading");
+  Check(!walker.EvaluateLoadAddress(plan.srt_reads[ThroughPointer].value, address),
+        "an address that needs a failed read does not evaluate");
+}
+
+// A uniform-buffer read's (LoadBufferU32, one dword at the V# base) address, and none when the
+// read returns 0 without loading.
+void TestUniformBufferLoadAddress() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  auto &handle = block.AppendNewInst(ValueOpcode::GetBufferResource,
+      {Value(0x1000u), Value(4u << 16u), Value(4u), Value(0x16204u)});
+  program.memory_info.push_back({.kind = ResourceKind::Buffer});
+  auto &read = block.AppendNewInst(ValueOpcode::LoadBufferU32,
+      {Value(&handle), Value(0u), Value(0u), Value(0u), Value(true)});
+  read.SetFlags(MemoryFlags{.index = 0});
+  // The read is a buffer's record count.
+  DescriptorSource source;
+  source.dword_count = 4;
+  source.dwords = {Value(0x2000u), Value(4u << 16u), Value(&read), Value(0x16204u)};
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0});
+  const auto plan = ExtractResourcePlan(program);
+  const SrtRuntime runtime{};
+  SrtWalker walker(plan, runtime);
+  uint64_t address = 0;
+  Check(walker.EvaluateLoadAddress(plan.descriptor_sources[0].dwords[2], address) &&
+            address == 0x1000u,
+        "a uniform-buffer read's address is the V# base");
+  handle.SetArg(3, Value(0x204u));
+  const auto zero_format = ExtractResourcePlan(program);
+  SrtWalker zero_walker(zero_format, runtime);
+  Check(!zero_walker.EvaluateLoadAddress(zero_format.descriptor_sources[0].dwords[2], address),
+        "a zero-format read loads nothing");
+}
+
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestNativeNestedSrtRefresh();
@@ -1547,6 +1699,8 @@ int main() {
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestSignedStorageSpecialization();
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
+  TestSrtReadConsumers();
+  TestUniformBufferLoadAddress();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

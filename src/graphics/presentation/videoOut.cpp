@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/frameProfiler.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -872,6 +873,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 			continue;
 		}
 
+		Common::FrameProfiler::Rec(Common::FrameProfiler::Event::Vblank);
 		VblankBegin();
 		bool presented = m_flip_queue.Flip(0);
 		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
@@ -950,6 +952,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 
 	Request r {};
 	r.id         = m_next_request_id++;
+	Common::FrameProfiler::Rec(Common::FrameProfiler::Event::FlipRequest, r.id);
 	r.group      = cfg.master == nullptr ? r.id : 0;
 	r.cfg        = &cfg;
 	r.master     = cfg.master;
@@ -1154,6 +1157,7 @@ void FlipQueue::Complete(uint64_t request_id) {
 			EXIT("completed GPU flip has no prepared recording, id=%" PRIu64 "\n", request_id);
 		}
 		request->state = RequestState::Ready;
+		Common::FrameProfiler::Rec(Common::FrameProfiler::Event::FlipReady, request_id);
 		m_submit_cond_var.Signal();
 		m_mutex.Unlock();
 		return;
@@ -1182,7 +1186,10 @@ void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg) {
 		if (m_requests.empty()) {
 			EXIT("video-out queue is saturated by CPU flips queued behind the current EOP\n");
 		}
+		const uint64_t profile_t0 = Common::FrameProfiler::Start();
+		Common::FrameProfiler::RecIf(profile_t0, Common::FrameProfiler::Event::SlotWaitBegin);
 		m_submit_slot_cond_var.Wait(&m_mutex);
+		Common::FrameProfiler::RecIf(profile_t0, Common::FrameProfiler::Event::SlotWaitEnd);
 	}
 }
 
@@ -1194,9 +1201,12 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 		return std::any_of(m_requests.begin(), m_requests.end(), matches) ||
 		       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 	};
+	const uint64_t profile_t0 = Common::FrameProfiler::Start();
+	Common::FrameProfiler::RecIf(profile_t0, Common::FrameProfiler::Event::FlipWaitBegin);
 	while (has_request()) {
 		m_done_cond_var.Wait(&m_mutex);
 	}
+	Common::FrameProfiler::RecIf(profile_t0, Common::FrameProfiler::Event::FlipWaitEnd);
 }
 
 bool FlipQueue::Flip(uint32_t micros) {
@@ -1249,7 +1259,10 @@ bool FlipQueue::Flip(uint32_t micros) {
 		layers[i] = {r.frame, r.cfg->bus, r.premultiplied_alpha};
 	}
 	if (due) {
+		const uint64_t profile_t0 = Common::FrameProfiler::Start();
+		Common::FrameProfiler::RecIf(profile_t0, Common::FrameProfiler::Event::PresentBegin, group);
 		m_presenter.Present(std::span(layers.data(), count));
+		Common::FrameProfiler::RecIf(profile_t0, Common::FrameProfiler::Event::PresentEnd, group);
 		if (requests[0].cfg->bus == 0) {
 			Graphics::PerformanceOverlayRecordFlip(requests[0].cfg->width, requests[0].cfg->height);
 		}

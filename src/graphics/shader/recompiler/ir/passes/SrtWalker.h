@@ -73,6 +73,8 @@ bool ValidateWaveUniformValue(const ResourcePlan& program, Value value);
 void CompileSrtWalker(ResourcePlan& program);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
+// A load the walker evaluates as one guest dword read.
+bool IsSrtRawRead(const ResourcePlan& program, const Inst& inst);
 
 // Nonnegative affine coefficients: element zero is constant, remaining elements are
 // caller-selected leaves. Runtime range proofs must additionally exclude U32 wrap.
@@ -131,6 +133,9 @@ public:
 	// `gpu_copies`, GPU-written dwords of gpu_copyable_flat_slots are left 0 and listed there.
 	bool RefreshFlatBuffer(std::vector<uint32_t>&                      flat,
 	                       std::vector<std::pair<uint32_t, uint64_t>>* gpu_copies = nullptr);
+	// The guest dword a one-dword read (IsSrtRawRead) loads, without loading it; false when the
+	// address does not evaluate or the read returns 0 without loading.
+	bool EvaluateLoadAddress(Value read, uint64_t& address);
 
 private:
 	SrtWalker(SrtWalker& parent, Value active_mask, bool clean = false,
@@ -143,6 +148,8 @@ private:
 	bool EvaluatePhi(const Inst& inst, uint64_t& result);
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
+	// `loads`: false when the read returns 0 without loading (lane disabled, zero format/extent).
+	bool RawReadAddress(const Inst& inst, uint64_t& address, bool& loads);
 	// The guest address a scalar raw read (LoadAddressU32, ReadConstBuffer) loads, unloaded.
 	bool ScalarReadAddress(const Inst& inst, const Inst& handle, const MemoryInfo& mem,
 	                       uint64_t& address, bool* out_of_bounds = nullptr);

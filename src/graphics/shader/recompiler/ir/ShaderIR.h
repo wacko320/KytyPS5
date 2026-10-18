@@ -723,6 +723,12 @@ struct ResourcePlan {
 	// descriptor, condition, prefetch, fill or other slot needs it on the CPU): when the GPU has
 	// written that dword, the GPU copies it into the flat buffer instead of the CPU reading it.
 	std::vector<uint32_t>               gpu_copyable_flat_slots;
+	// Frame profiler: per flat slot, the kinds of CPU-evaluated values that need it
+	// (Common::FrameProfiler::Consumer bits; none exactly for gpu_copyable_flat_slots), and the
+	// one-dword reads nested in CPU-evaluated values that fill no slot, with their bits. The
+	// profiler attributes materialization readbacks with them.
+	std::vector<uint16_t>                   srt_read_consumers;
+	std::vector<std::pair<Value, uint16_t>> srt_nested_reads;
 	bool                                requires_specialization_memory = false;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
 	bool                                capture_specialization_reads = false;

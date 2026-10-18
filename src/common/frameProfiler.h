@@ -50,7 +50,7 @@ enum class Event : uint16_t {
 	GpuReadbackBegin   = 19, // a: vaddr, b: size
 	GpuReadbackEnd     = 20,
 	Fault              = 21, // a: access, b: vaddr
-	Suspend            = 22,
+	Suspend            = 22, // a: polled address (0: none), b: SuspendReason | func << 8
 	EqueueWaitBegin    = 23, // a: queue, b: timeout (all ones: none)
 	EqueueWaitEnd      = 24, // a: result, b: first event's ident
 	FlipWaitBegin      = 25,
@@ -76,6 +76,11 @@ enum class Event : uint16_t {
 	GuestDispatch      = 52, // a: barriers since the previous guest dispatch, b: guest syncs since
 	QueueEmpty         = 53, // a: last submitted tick, seen complete (priority thread)
 	Feed               = 54, // a: guest draws and dispatches of the command buffer FeedIdleGpu submits
+	WaitPass           = 55, // a: address, b: value: a WAIT_REG_MEM that suspended passed
+	SuspendWait        = 56, // a: reference, b: mask: follows a WaitRegMem Suspend
+	LabelWrite         = 57, // a: vaddr (bit 63: GPU-ordered, visible at completion), b: first qword (WRITE_DATA)
+	QueueSwitch        = 58, // a: queue released or ready, b: 1 for a parked queue's tick
+	QueuePark          = 59, // a: queue, b: tick it waits for
 };
 
 [[nodiscard]] const char* EventName(Event id);

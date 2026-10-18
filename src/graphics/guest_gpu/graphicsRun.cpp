@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/frameProfiler.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -289,20 +290,20 @@ void CommandProcessor::ResetDeCe() {
 
 void CommandProcessor::WaitCe() {
 	if (m_ce_count <= m_de_count && !m_ce_complete) {
-		SuspendPm4();
+		SuspendPm4(SuspendReason::Ce);
 	}
 }
 
 void CommandProcessor::WaitDeDiff(uint32_t diff) {
 	EXIT_IF(m_de_count > m_ce_count);
 	if (m_ce_count - m_de_count >= diff) {
-		SuspendPm4();
+		SuspendPm4(SuspendReason::DeDiff);
 	}
 }
 
 void CommandProcessor::WaitForRewind(bool valid) {
 	if (!valid) {
-		SuspendPm4();
+		SuspendPm4(SuspendReason::Rewind);
 		return;
 	}
 	// The guest marked the commands after the rewind valid; what it wrote before that is ordered
@@ -375,8 +376,17 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 			     static_cast<uint64_t>(*addr), static_cast<uint64_t>(mask), func,
 			     static_cast<uint64_t>(ref));
 		}
-		SuspendPm4();
+		SuspendPm4(SuspendReason::WaitRegMem, reinterpret_cast<uint64_t>(addr), func);
+		Common::FrameProfiler::Rec(Common::FrameProfiler::Event::SuspendWait,
+		                           static_cast<uint64_t>(ref), static_cast<uint64_t>(mask));
 		return;
+	}
+	if (m_suspended_wait != 0) {
+		if (m_suspended_wait == reinterpret_cast<uint64_t>(addr)) {
+			Common::FrameProfiler::Rec(Common::FrameProfiler::Event::WaitPass, m_suspended_wait,
+			                           static_cast<uint64_t>(*addr));
+		}
+		m_suspended_wait = 0;
 	}
 	// A CPU write before the one this wait observed is ordered before the commands after it, also
 	// when the wait passes on arrival (a resumed wait begins a new slice as well).
@@ -411,9 +421,20 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	const auto bytes = static_cast<uint64_t>(write_one_address ? 1u : dw_num) * sizeof(uint32_t);
 	// Repeated writes to one address leave the last.
 	const auto* data = write_one_address ? src + (dw_num - 1u) : src;
+	const auto profile_label = [&](bool gpu_ordered) {
+		if (Common::FrameProfiler::Active()) {
+			uint64_t value = 0;
+			std::memcpy(&value, data, std::min<uint64_t>(bytes, sizeof(value)));
+			Common::FrameProfiler::RecordEvent(
+			    Common::FrameProfiler::Event::LabelWrite,
+			    reinterpret_cast<uint64_t>(dst) | (gpu_ordered ? 1ull << 63u : 0u), value);
+		}
+	};
 	if (m_renderer.TryWriteGpuOrdered(reinterpret_cast<uint64_t>(dst), data, bytes)) {
+		profile_label(true);
 		return;
 	}
+	profile_label(false);
 	EndThreadWindow();
 	m_renderer.GpuThreadGuestWrite(reinterpret_cast<uint64_t>(dst), bytes, [&](void* to) {
 		auto* words = static_cast<uint32_t*>(to);
@@ -519,6 +540,14 @@ void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	if (Common::FrameProfiler::Active()) {
+		Common::FrameProfiler::RecordEvent(Common::FrameProfiler::Event::Enqueue,
+		                                   submission.queue_id,
+		                                   static_cast<uint64_t>(submission.type));
+		if (submission.type == SubmissionType::Graphics && submission.queue_id == 0) {
+			Common::FrameProfiler::NoteRenderThread();
+		}
+	}
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
@@ -532,12 +561,25 @@ void GuestGpu::WaitForIdle() {
 	}
 }
 
+// GPU thread: a wait's time and count, and the longest single wait.
+static void ProfileGpuWait(uint64_t t0, Common::FrameProfiler::Counter time,
+                           Common::FrameProfiler::Counter count) {
+	if (t0 == 0) {
+		return;
+	}
+	const uint64_t ticks = Common::FrameProfiler::Ticks() - t0;
+	Common::FrameProfiler::Add(time, ticks);
+	Common::FrameProfiler::Add(count);
+	Common::FrameProfiler::Max(Common::FrameProfiler::Counter::GpuLongestWait, ticks);
+}
+
 void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
+	Common::FrameProfiler::MarkGpuThread();
 
 	for (;;) {
 		Submission                   submission;
@@ -549,7 +591,12 @@ void GuestGpu::ThreadRun(void* data) {
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				const uint64_t idle_t0 = Common::FrameProfiler::Start();
+				Common::FrameProfiler::RecIf(idle_t0, Common::FrameProfiler::Event::IdleBegin);
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				Common::FrameProfiler::RecIf(idle_t0, Common::FrameProfiler::Event::IdleEnd);
+				ProfileGpuWait(idle_t0, Common::FrameProfiler::Counter::GpuIdleTime,
+				               Common::FrameProfiler::Counter::GpuIdleWaits);
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
@@ -571,7 +618,12 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
+					const uint64_t block_t0 = Common::FrameProfiler::Start();
+					Common::FrameProfiler::RecIf(block_t0, Common::FrameProfiler::Event::BlockedBegin);
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					Common::FrameProfiler::RecIf(block_t0, Common::FrameProfiler::Event::BlockedEnd);
+					ProfileGpuWait(block_t0, Common::FrameProfiler::Counter::GpuBlockedTime,
+					               Common::FrameProfiler::Counter::GpuBlockedWaits);
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -595,9 +647,31 @@ void GuestGpu::ThreadRun(void* data) {
 			return;
 		}
 
+		// A processing slice: one GPU-thread command or one Process call.
+		const uint64_t proc_t0  = Common::FrameProfiler::Start();
+		uint64_t       proc_cpu = 0;
+		if (proc_t0 != 0) {
+			Common::FrameProfiler::RecordEvent(Common::FrameProfiler::Event::ProcessBegin,
+			                                   command ? 99u : submission.queue_id,
+			                                   command || submission.started ? 0u : 1u);
+			proc_cpu = Common::FrameProfiler::ThreadCpuNs();
+		}
+		const auto end_slice = [proc_t0, proc_cpu](bool complete) {
+			if (proc_t0 == 0) {
+				return;
+			}
+			Common::FrameProfiler::RecordEvent(Common::FrameProfiler::Event::ProcessEnd,
+			                                   complete ? 1u : 0u, 0);
+			Common::FrameProfiler::AddSince(Common::FrameProfiler::Counter::GpuProcessTime, proc_t0);
+			Common::FrameProfiler::Add(Common::FrameProfiler::Counter::GpuProcessCpuTime,
+			                           Common::FrameProfiler::ThreadCpuNs() - proc_cpu);
+			Common::FrameProfiler::Add(Common::FrameProfiler::Counter::GpuProcessSlices);
+		};
+
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
 			command();
+			end_slice(true);
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -609,6 +683,7 @@ void GuestGpu::ThreadRun(void* data) {
 
 		EXIT_IF(!has_submission);
 		const bool complete = gpu->Process(submission);
+		end_slice(complete);
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
@@ -765,8 +840,13 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 	g_current_execution->m_chain       = chain;
 }
 
-void CommandProcessor::SuspendPm4() {
+void CommandProcessor::SuspendPm4(SuspendReason reason, uint64_t address, uint32_t func) {
 	EXIT_IF(g_current_execution == nullptr);
+	Common::FrameProfiler::Rec(Common::FrameProfiler::Event::Suspend, address,
+	                           static_cast<uint64_t>(reason) | (uint64_t {func} << 8u));
+	if (reason == SuspendReason::WaitRegMem) {
+		m_suspended_wait = address;
+	}
 	g_current_execution->m_suspended = true;
 }
 
@@ -776,6 +856,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			g_gpu_state->ProcessCommands();
 		}
 		auto& cursor = execution.m_buffer_stack.back();
+		// Readbacks are labelled with the packet that asked for them (frame profiler).
+		const Common::FrameProfiler::ScopedPacket profile_packet(Common::FrameProfiler::PacketFetch);
 		EXIT_IF(cursor.offset_dw > cursor.commands.size());
 		if (cursor.offset_dw == cursor.commands.size()) {
 			execution.m_buffer_stack.pop_back();
@@ -860,9 +942,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			const auto kind = Pm4Lookahead::Classify(packet);
 			if (kind == Pm4Lookahead::PacketKind::Draw ||
 			    kind == Pm4Lookahead::PacketKind::Dispatch) {
+				Common::FrameProfiler::t_packet = Common::FrameProfiler::PacketLookahead;
 				m_lookahead->OnDraw(*this, cursor.commands, cursor.offset_dw);
 			}
 		}
+		Common::FrameProfiler::t_packet = static_cast<uint8_t>(opcode);
 		m_packet_commands = cursor.commands;
 		m_packet_offset   = cursor.offset_dw;
 		const auto packet_dw =
@@ -968,7 +1052,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				const auto end   = results[db * 2u + 1u];
 				if ((begin & end & ready_bit) == 0) {
 					if (wait_op == 0) {
-						SuspendPm4();
+						SuspendPm4(SuspendReason::Predication, reinterpret_cast<uint64_t>(address));
 					} else {
 						m_predicate_skip = false;
 					}
@@ -1232,6 +1316,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		const auto args_addr = m_draw_indirect_args_base_addr + data_offset +
 		                       static_cast<uint64_t>(i) * stride_in_bytes;
 
+		// GPU-written arguments read on the CPU (frame profiler: DrawIndirectCpuArgsZero).
+		bool cpu_reads_gpu_args = false;
 		if (gpu_count || sgpr_destination) {
 			using Common::FrameProfiler::Counter;
 			Common::FrameProfiler::Add(Counter::DrawIndirectDraws);
@@ -1243,14 +1329,20 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 				Common::FrameProfiler::Add(gpu_count ? Counter::DrawIndirectBlockedGpuCount
 				                                     : Counter::DrawIndirectBlockedSgprDestination);
 				Common::FrameProfiler::Add(Counter::DrawIndirectCpuArgs);
+				cpu_reads_gpu_args = true;
 			}
-		} else if (DrawIndirectGpu(args_addr, indexed, i + 1 == draw_count) ==
-		           IndirectArgsRoute::Gpu) {
+		} else if (const auto route = DrawIndirectGpu(args_addr, indexed, i + 1 == draw_count);
+		           route == IndirectArgsRoute::Gpu) {
 			continue;
+		} else {
+			cpu_reads_gpu_args = route == IndirectArgsRoute::Refused;
 		}
 
 		if (!indexed) {
 			auto* args = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
+			if (cpu_reads_gpu_args && args->vertex_count_per_instance == 0) {
+				Common::FrameProfiler::Add(Common::FrameProfiler::Counter::DrawIndirectCpuArgsZero);
+			}
 			PatchIndirectDrawOffsets(*this, registers, args->start_vertex_location,
 			                         args->start_instance_location, 0);
 			SetIndirectInstances(args->instance_count);
@@ -1263,6 +1355,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 
 		auto* args = reinterpret_cast<const DrawIndexedIndirectArgs*>(args_addr);
+		if (cpu_reads_gpu_args && args->index_count_per_instance == 0) {
+			Common::FrameProfiler::Add(Common::FrameProfiler::Counter::DrawIndirectCpuArgsZero);
+		}
 		PatchIndirectDrawOffsets(*this, registers, args->base_vertex_location,
 		                         args->start_instance_location, args->start_index_location);
 
@@ -1404,6 +1499,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
 
 	auto& command = CurrentBuffer();
+	Common::FrameProfiler::Rec(Common::FrameProfiler::Event::EopWrite,
+	                           reinterpret_cast<uint64_t>(dst_gpu_addr), static_cast<uint64_t>(value));
 
 	if (GraphicsRunDebugDumpEnabled()) {
 		const auto bits      = static_cast<unsigned>(sizeof(T) * 8u);

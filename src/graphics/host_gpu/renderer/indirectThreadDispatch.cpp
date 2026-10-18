@@ -150,6 +150,7 @@ IndirectThreadDispatch::Arguments IndirectThreadDispatch::Convert(const Source& 
 	                        0, nullptr);
 	RecordConversion(command, source, slot);
 	ConvertedBarrier(command);
+	m_scheduler.NoteThreadBarriers(2);
 	return SlotArguments(slot);
 }
 
@@ -183,6 +184,7 @@ void IndirectThreadDispatch::ConvertBatch(std::span<const Source> sources, bool 
 		converted[i] = SlotArguments(m_batch_slots[i]);
 	}
 	ConvertedBarrier(command);
+	m_scheduler.NoteThreadBarriers(order_before ? 2 : 1);
 }
 
 } // namespace Libs::Graphics

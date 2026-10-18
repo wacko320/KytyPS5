@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/frameProfiler.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -420,6 +421,10 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	     (timo == nullptr ? "inf" : fmt::format("{}", *timo).c_str()),
 	     Common::Thread::GetThreadIdUnique());
 
+	const uint64_t profile_t0 = Common::FrameProfiler::Start();
+	Common::FrameProfiler::RecIf(profile_t0, Common::FrameProfiler::Event::EqueueWaitBegin,
+	                             static_cast<uint64_t>(eq),
+	                             timo == nullptr ? ~uint64_t {0} : static_cast<uint64_t>(*timo));
 	if (timo == nullptr) {
 		*out = owner->WaitForEvents(ev, num, 0);
 	}
@@ -431,6 +436,9 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 			*out = owner->WaitForEvents(ev, num, *timo);
 		}
 	}
+	Common::FrameProfiler::RecIf(profile_t0, Common::FrameProfiler::Event::EqueueWaitEnd,
+	                             static_cast<uint64_t>(*out),
+	                             *out > 0 ? static_cast<uint64_t>(ev[0].ident) : 0);
 
 	if (*out == KERNEL_ERROR_EBADF) {
 		return KERNEL_ERROR_EBADF;

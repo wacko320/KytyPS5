@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/frameProfiler.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
@@ -39,6 +40,7 @@
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include <vulkan/vulkan_format_traits.hpp>
+#include "graphics/presentation/frameDump.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -61,6 +63,7 @@
 #include "libs/errno.h"
 #include "loader/symbolDatabase.h"
 #include "spirv-tools/libspirv.hpp"
+#include "stb_image.h"
 
 #if __has_include("graphics/host_gpu/renderer/renderTargetBarriers.h")
 #error "legacy render-target barrier API must remain deleted"
@@ -15323,6 +15326,183 @@ public:
                                                                allocation_size) == 0,
             "allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A materialization readback is attributed to the CPU consumers of the planned dwords on the
+  // pages it waited for (frame profiler): removable when only read V#s need them, not when a
+  // written V# does.
+  void CheckMaterializeReadbackConsumers() {
+    namespace FrameProfiler = Common::FrameProfiler;
+    using FrameProfiler::Counter;
+    constexpr const char *name = "MaterializeReadbackConsumers";
+    constexpr uintptr_t base = 0x0000000204e00000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    // Different 16 KiB caching pages of one 512 KiB window.
+    constexpr uint64_t table = base + 0x10000;
+    constexpr uint64_t clean_table = base + 0x20000;
+    constexpr uint64_t data = base + 0x40000;
+    constexpr uint64_t output_clean = base + 0x50000;
+    constexpr uint64_t output_written = base + 0x60000;
+    constexpr u32 value = 0x7e5a0c31u;
+    // Stores s4..s11 to the dwords 0..7 of s[0:3].
+    std::vector<u32> writer;
+    for (u32 i = 0; i < 8; i++) {
+      writer.push_back(EncodeVop1(0x01u, 1, 4 + i)); // v_mov_b32 v1, s[4 + i]
+      writer.push_back(EncodeMubuf0(0x1cu, 4 * i, false, false)); // buffer_store_dword v1
+      writer.push_back(EncodeMubuf1(1, 0, 0));
+    }
+    AppendEnd(&writer);
+    // Copies a dword from the V# at s[0:1] + 0 to the V# at s[2:3] + 0.
+    std::vector<u32> reader;
+    reader.push_back(EncodeSmem0(0x02, 8, 0)); // s_load_dwordx4 s[8:11], s[0:1], 0
+    reader.push_back(EncodeSmem1(0, 0x7d));
+    reader.push_back(EncodeSmem0(0x02, 12, 1)); // s_load_dwordx4 s[12:15], s[2:3], 0
+    reader.push_back(EncodeSmem1(0, 0x7d));
+    reader.push_back(EncodeMubuf0(0x0cu, 0, false, false)); // buffer_load_dword v1, s[8:11]
+    reader.push_back(EncodeMubuf1(1, 2, 0));
+    reader.push_back(EncodeMubuf0(0x1cu, 0, false, false)); // buffer_store_dword v1, s[12:15]
+    reader.push_back(EncodeMubuf1(1, 3, 0));
+    AppendEnd(&reader);
+    // As reader, with both V#s from s[0:1]: + 0 and + 16.
+    std::vector<u32> table_reader;
+    table_reader.push_back(EncodeSmem0(0x02, 8, 0)); // s_load_dwordx4 s[8:11], s[0:1], 0
+    table_reader.push_back(EncodeSmem1(0, 0x7d));
+    table_reader.push_back(EncodeSmem0(0x02, 12, 0)); // s_load_dwordx4 s[12:15], s[0:1], 16
+    table_reader.push_back(EncodeSmem1(16, 0x7d));
+    table_reader.push_back(EncodeMubuf0(0x0cu, 0, false, false));
+    table_reader.push_back(EncodeMubuf1(1, 2, 0));
+    table_reader.push_back(EncodeMubuf0(0x1cu, 0, false, false));
+    table_reader.push_back(EncodeMubuf1(1, 3, 0));
+    AppendEnd(&table_reader);
+    for (const auto *code : {&writer, &reader, &table_reader}) {
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code->data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<uint32_t>(code->size() * sizeof(u32))});
+    }
+    const auto table_vsharp = EpochDwordBuffer(table, 32);
+    const auto data_vsharp = EpochDwordBuffer(data, sizeof(u32));
+    const auto clean_vsharp = EpochDwordBuffer(output_clean, sizeof(u32));
+    const auto written_vsharp = EpochDwordBuffer(output_written, sizeof(u32));
+    std::vector<u32> write_commands{
+        KYTY_PM4(14, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+        table_vsharp.fields[0], table_vsharp.fields[1], table_vsharp.fields[2],
+        table_vsharp.fields[3]};
+    for (const auto &vsharp : {data_vsharp, written_vsharp}) {
+      write_commands.insert(write_commands.end(), std::begin(vsharp.fields),
+                            std::end(vsharp.fields));
+    }
+    write_commands.insert(write_commands.end(),
+                          {KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u, 0x41u});
+    const std::vector<u32> read_commands{
+        KYTY_PM4(6, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+        static_cast<u32>(table), static_cast<u32>(table >> 32u),
+        static_cast<u32>(clean_table), static_cast<u32>(clean_table >> 32u),
+        KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u, 0x41u};
+    const std::vector<u32> table_read_commands{
+        KYTY_PM4(4, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+        static_cast<u32>(table), static_cast<u32>(table >> 32u),
+        KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u, 0x41u};
+
+    const auto profile_root = std::filesystem::temp_directory_path() /
+                              ("kyty-readback-consumers-" + std::to_string(getpid()));
+    std::filesystem::create_directories(profile_root);
+    FrameProfiler::SetOutputRoot(profile_root);
+    (void)FrameProfiler::SetRingCapacity(uint64_t{1} << 16);
+    RunEpochFixture(
+        name, base, allocation_size,
+        [&] {
+          std::memcpy(reinterpret_cast<void *>(clean_table), clean_vsharp.fields,
+                      sizeof(clean_vsharp.fields));
+          std::memcpy(reinterpret_cast<void *>(data), &value, sizeof(value));
+        },
+        [&](RenderContext &context, CommandProcessor &processor) {
+          auto &cache = context.GetBufferCache();
+          const auto run = [&](const std::vector<u32> &code, u32 sgprs,
+                               const std::vector<u32> &commands) {
+            processor.GetShCtx().SetCsShader(
+                {.data_addr = reinterpret_cast<uint64_t>(code.data()), .num_thread_x = 1,
+                 .num_thread_y = 1, .num_thread_z = 1, .wave_size = 64,
+                 .user_sgpr = static_cast<uint8_t>(sgprs)});
+            // Each stream stands for a submission (GuestGpu::Process).
+            processor.RequestGuestBarrier(CommandProcessor::GuestSync::Submission);
+            Pm4Execution execution;
+            Require(name, "command stream",
+                    processor.Process(execution, commands) == Pm4ProcessResult::Complete,
+                    "a dispatch stream did not complete");
+          };
+          const auto read = [&](uint64_t address) {
+            cache.ReadMemory(address, sizeof(u32));
+            u32 word = 0;
+            Require(name, "readback",
+                    LibKernel::Memory::TryReadBacking(address, &word, sizeof(word)),
+                    "a dword could not be read back");
+            return word;
+          };
+          constexpr std::array counters{Counter::MaterializeReadbacks,
+                                        Counter::MaterializeReadbackTimeRemovable,
+                                        Counter::MaterializeReadbackTimeBufferRead,
+                                        Counter::MaterializeReadbackTimeBufferWritten,
+                                        Counter::MaterializeReadbackTimeUnplanned};
+          const auto sample = [&] {
+            std::array<uint64_t, counters.size()> values{};
+            for (size_t i = 0; i < counters.size(); i++) {
+              values[i] = FrameProfiler::CounterValue(counters[i]);
+            }
+            return values;
+          };
+          // One cached buffer over the tables, so the download window spans both pages.
+          std::vector<u32> read_all;
+          AppendEpochCopy(read_all, base, 0x40000, base + 0x80000);
+          RunEpochSlice(name, processor, EpochCopyShader(), 8, read_all);
+          // A program's first materialization runs where it is compiled, outside the cache's
+          // Materialize: compile all three first.
+          run(writer, 12, write_commands);
+          run(reader, 4, read_commands);
+          run(table_reader, 2, table_read_commands);
+          FrameProfiler::Arm(0, 1);
+          (void)FrameProfiler::OnFrame(1);
+          Require(name, "profiler", FrameProfiler::Active(), "the capture did not start");
+
+          run(writer, 12, write_commands);
+          Require(name, "written", cache.HasGpuDirtyBytes(table, sizeof(u32)),
+                  "the table writes did not leave the table GPU-dirty");
+          const auto before_read = sample();
+          run(reader, 4, read_commands);
+          const auto after_read = sample();
+          run(writer, 12, write_commands);
+          run(table_reader, 2, table_read_commands);
+          const auto after_table = sample();
+          (void)FrameProfiler::OnFrame(2);
+
+          const auto delta = [](const auto &from, const auto &to, size_t i) {
+            return to[i] - from[i];
+          };
+          const auto deltas = [&](const auto &from, const auto &to) {
+            std::string text = " (readbacks, removable, read, written, unplanned:";
+            for (size_t i = 0; i < counters.size(); i++) {
+              text += " " + std::to_string(delta(from, to, i));
+            }
+            return text + ")";
+          };
+          Require(name, "read V# readback",
+                  delta(before_read, after_read, 0) != 0 &&
+                      delta(before_read, after_read, 1) != 0 &&
+                      delta(before_read, after_read, 2) != 0 &&
+                      delta(before_read, after_read, 3) == 0 &&
+                      delta(before_read, after_read, 4) == 0,
+                  "a readback of read V# dwords was not attributed as removable" +
+                      deltas(before_read, after_read));
+          Require(name, "written V# readback",
+                  delta(after_read, after_table, 0) != 0 &&
+                      delta(after_read, after_table, 1) == 0 &&
+                      delta(after_read, after_table, 2) != 0 &&
+                      delta(after_read, after_table, 3) != 0,
+                  "a readback that also feeds a written V# was attributed as removable" +
+                      deltas(after_read, after_table));
+          Require(name, "values", read(output_clean) == value && read(output_written) == value,
+                  "a dispatch did not copy the dword through its table's V#s");
+        });
+    std::filesystem::remove_all(profile_root);
   }
 
   // PM4 dispatches whose V# the command processor's lookahead materializes on the pipeline
@@ -49206,6 +49386,151 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
   };
 }
 
+// --dump-frames reads the presenter's source image back through FrameReadback. Each format a
+// guest can present (any blittable colour format) comes back as RGB8 in red, green, blue order,
+// rows top to bottom, at an extent that is not a multiple of any tile size, and the PNG writer
+// round-trips it.
+void CheckFrameReadback(VulkanHarness &vulkan) {
+  constexpr const char *name = "FrameReadback";
+  auto &graphics = vulkan.RuntimeContext();
+  CommandScheduler scheduler(vulkan.RuntimeRenderer(), graphics);
+  constexpr u32 Width = 37, Height = 19;
+  const auto expected_rgb = [](u32 x, u32 y, bool binary) {
+    if (binary) {
+      return std::array<uint8_t, 3>{uint8_t((x & 1u) * 255u), uint8_t((y & 1u) * 255u),
+                                    uint8_t(((x + y) % 3u == 0u) * 255u)};
+    }
+    return std::array<uint8_t, 3>{uint8_t(x * 7u + y), uint8_t(y * 13u + x),
+                                  uint8_t(x ^ (y * 3u))};
+  };
+  // Half floats convert to UNORM exactly only at 0 and 1, so that format uses a binary pattern.
+  constexpr std::array formats{vk::Format::eR8G8B8A8Unorm, vk::Format::eB8G8R8A8Unorm,
+                               vk::Format::eR16G16B16A16Sfloat};
+  FrameReadback readback(graphics);
+  for (const auto format : formats) {
+    const bool half = format == vk::Format::eR16G16B16A16Sfloat;
+    const bool bgra = format == vk::Format::eB8G8R8A8Unorm;
+    const u32 texel_bytes = half ? 8u : 4u;
+    std::vector<uint8_t> texels(size_t{Width} * Height * texel_bytes);
+    std::vector<uint8_t> expected(size_t{Width} * Height * 3u);
+    for (u32 y = 0; y < Height; y++) {
+      for (u32 x = 0; x < Width; x++) {
+        const auto rgb = expected_rgb(x, y, half);
+        const size_t pixel = size_t{y} * Width + x;
+        std::copy(rgb.begin(), rgb.end(), expected.begin() + pixel * 3u);
+        auto *texel = texels.data() + pixel * texel_bytes;
+        if (half) {
+          for (u32 c = 0; c < 4; c++) {
+            const uint16_t bits = c == 3 || rgb[c] != 0 ? 0x3c00u : 0u;
+            std::memcpy(texel + c * 2u, &bits, 2);
+          }
+        } else {
+          texel[0] = bgra ? rgb[2] : rgb[0];
+          texel[1] = rgb[1];
+          texel[2] = bgra ? rgb[0] : rgb[2];
+          // Alpha is not part of the dump.
+          texel[3] = uint8_t(x * 3u);
+        }
+      }
+    }
+
+    VulkanImage image;
+    vk::ImageCreateInfo create{};
+    create.imageType = vk::ImageType::e2D;
+    create.format = format;
+    create.extent = vk::Extent3D{Width, Height, 1};
+    create.mipLevels = 1;
+    create.arrayLayers = 1;
+    create.samples = vk::SampleCountFlagBits::e1;
+    create.tiling = vk::ImageTiling::eOptimal;
+    create.usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+    create.initialLayout = vk::ImageLayout::eUndefined;
+    Require(name, "image", graphics.CreateImage(create, image), "could not allocate the source");
+
+    vk::BufferCreateInfo staging_info{};
+    staging_info.size = texels.size();
+    staging_info.usage = vk::BufferUsageFlagBits::eTransferSrc;
+    VmaAllocationCreateInfo allocation{};
+    allocation.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                       VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    allocation.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+    VkBuffer staging = VK_NULL_HANDLE;
+    VmaAllocation staging_allocation = nullptr;
+    VmaAllocationInfo staging_result{};
+    Require(name, "staging",
+            vmaCreateBuffer(graphics.allocator,
+                            static_cast<const VkBufferCreateInfo *>(staging_info), &allocation,
+                            &staging, &staging_allocation, &staging_result) == VK_SUCCESS &&
+                staging_result.pMappedData != nullptr,
+            "could not allocate the staging buffer");
+    std::memcpy(staging_result.pMappedData, texels.data(), texels.size());
+    Require(name, "staging flush",
+            vmaFlushAllocation(graphics.allocator, staging_allocation, 0, VK_WHOLE_SIZE) ==
+                VK_SUCCESS,
+            "could not flush the staging buffer");
+
+    auto &command_buffer = scheduler.BeginCommand();
+    auto command = command_buffer.Handle();
+    vk::ImageMemoryBarrier2 barrier{};
+    barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+    barrier.dstStageMask = vk::PipelineStageFlagBits2::eCopy;
+    barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+    barrier.oldLayout = vk::ImageLayout::eUndefined;
+    barrier.newLayout = vk::ImageLayout::eTransferDstOptimal;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image.image;
+    barrier.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+    vk::DependencyInfo dependency{};
+    dependency.imageMemoryBarrierCount = 1;
+    dependency.pImageMemoryBarriers = &barrier;
+    command.pipelineBarrier2(dependency);
+    vk::BufferImageCopy upload{};
+    upload.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+    upload.imageExtent = vk::Extent3D{Width, Height, 1};
+    command.copyBufferToImage(staging, image.image, vk::ImageLayout::eTransferDstOptimal, 1,
+                              &upload);
+    // The presenter hands the readback a source in TransferSrcOptimal after its own blit.
+    barrier.srcStageMask = vk::PipelineStageFlagBits2::eCopy;
+    barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+    barrier.dstStageMask = vk::PipelineStageFlagBits2::eBlit;
+    barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+    barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
+    barrier.newLayout = vk::ImageLayout::eTransferSrcOptimal;
+    command.pipelineBarrier2(dependency);
+    readback.Record(command, image);
+    scheduler.Wait(scheduler.Submit());
+
+    const auto rgb = readback.ReadRgb();
+    Require(name, vk::to_string(format).c_str(),
+            readback.Width() == Width && readback.Height() == Height && rgb == expected,
+            "read-back pixels differ from the uploaded image");
+
+    const auto path = std::filesystem::temp_directory_path() /
+                      ("kyty-frame-readback-" +
+                       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+                       ".png");
+    Require(name, "png write", WriteRgbPng(path, Width, Height, rgb), "PNG was not written");
+    std::ifstream file(path, std::ios::binary);
+    const std::vector<uint8_t> png{std::istreambuf_iterator<char>(file),
+                                   std::istreambuf_iterator<char>()};
+    file.close();
+    std::filesystem::remove(path);
+    int png_width = 0, png_height = 0, channels = 0;
+    auto *decoded = stbi_load_from_memory(png.data(), static_cast<int>(png.size()), &png_width,
+                                          &png_height, &channels, 3);
+    Require(name, "png round trip",
+            decoded != nullptr && png_width == int(Width) && png_height == int(Height) &&
+                channels == 3 && std::equal(expected.begin(), expected.end(), decoded),
+            "PNG does not decode to the read-back pixels");
+    stbi_image_free(decoded);
+
+    vmaDestroyBuffer(graphics.allocator, staging, staging_allocation);
+    graphics.DeleteImage(image);
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckComputeLdsLimit(VulkanHarness &vulkan) {
   constexpr const char *name = "ComputeLdsLimit";
   std::vector<u32> code;
@@ -55234,6 +55559,43 @@ void CheckThreadDimensionBatches(RenderContext &renderer, GuestGpu &gpu, uint64_
   }
 }
 
+// The compute-ordering census (CommandScheduler::CountGuestDispatch) sees the barriers of every
+// recording site, and guest dispatches with no synchronisation between them follow none: of
+// these dispatches, only the first follows a barrier (the submission's, and the uploads of the
+// first run) once their buffers exist.
+void CheckBarrierCensus(VulkanHarness &vulkan) {
+  auto &renderer = vulkan.RuntimeRenderer();
+  constexpr uint64_t base = 0x0000000208000000ull;
+  constexpr uint64_t size = 0x40000;
+  MapQueueLabelMemory(renderer, base, size);
+  renderer.InitializeGpu(nullptr);
+  auto &gpu = renderer.GetGpu();
+  auto &scheduler = renderer.GetCommandScheduler();
+  static const FillKernel fill;
+  constexpr uint32_t Dispatches = 8;
+  for (uint32_t run = 0; run < 2; run++) {
+    std::vector<uint32_t> stream;
+    for (uint32_t i = 0; i < Dispatches; i++) {
+      AppendFillSetup(stream, fill, base + i * 0x1000ull, 64, i + run * 0x100);
+      stream.insert(stream.end(),
+                    {KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u, 0x41u});
+    }
+    const auto before = scheduler.DispatchesAfterBarrierCount();
+    const auto dispatches = scheduler.GuestDispatchCount();
+    gpu.Submit(stream, {});
+    gpu.WaitForIdle();
+    const auto counted = scheduler.DispatchesAfterBarrierCount() - before;
+    Require("BarrierCensus", "dispatches", scheduler.GuestDispatchCount() - dispatches == Dispatches,
+            "the census did not see every guest dispatch");
+    Require("BarrierCensus", "DispatchesAfterBarrier", run == 0 ? counted >= 1 : counted == 1,
+            std::to_string(counted) + " of " + std::to_string(Dispatches) +
+                " dispatches counted after a barrier in run " + std::to_string(run));
+  }
+  renderer.UnmapMemory(base, size);
+  renderer.ShutdownGpu();
+  std::printf("[host]    %-32s ok\n", "BarrierCensus");
+}
+
 void CheckGuestOrderedBarriers(VulkanHarness &vulkan) {
   auto &renderer = vulkan.RuntimeRenderer();
   constexpr uint64_t base = 0x0000000208000000ull;
@@ -56094,6 +56456,11 @@ int main(int argc, char **argv) {
     vulkan.BenchmarkReadOnlyBindings();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--frame-readback-only") == 0) {
+    VulkanHarness vulkan;
+    CheckFrameReadback(vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--scheduler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckSchedulerTimeline();
@@ -56446,6 +56813,11 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--barrier-census-only") == 0) {
+    VulkanHarness vulkan;
+    GuestOrder::CheckBarrierCensus(vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--guest-ordered-barriers-only") == 0) {
     VulkanHarness vulkan;
     GuestOrder::CheckGuestOrderedBarriers(vulkan);
@@ -56464,6 +56836,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--gpu-flat-copy-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuFlatCopyDependency();
+    vulkan.CheckMaterializeReadbackConsumers();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--submit-thread-only") == 0) {

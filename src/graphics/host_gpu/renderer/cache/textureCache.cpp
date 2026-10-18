@@ -2409,12 +2409,14 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 }
 
 bool TextureCache::IsMeta(uint64_t address) {
+	Common::FrameProfiler::Add(Common::FrameProfiler::Counter::SurfaceMetaQueries);
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	return found != m_surface_metas.end();
 }
 
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
+	Common::FrameProfiler::Add(Common::FrameProfiler::Counter::SurfaceMetaQueries);
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end() || slice >= found->second.clear_mask.size()) {
@@ -2424,6 +2426,7 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 }
 
 bool TextureCache::ClearMeta(uint64_t address) {
+	Common::FrameProfiler::Add(Common::FrameProfiler::Counter::SurfaceMetaQueries);
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end()) {
@@ -2434,6 +2437,7 @@ bool TextureCache::ClearMeta(uint64_t address) {
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
+	Common::FrameProfiler::Add(Common::FrameProfiler::Counter::SurfaceMetaQueries);
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end() || slice >= found->second.clear_mask.size()) {

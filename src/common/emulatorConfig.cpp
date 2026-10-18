@@ -243,6 +243,14 @@ uint32_t ShaderLoopLimit() {
 	return g_config->shader_loop_limit;
 }
 
+uint64_t DumpFramesStart() {
+	return g_config->dump_frames_start;
+}
+
+uint32_t DumpFramesCount() {
+	return g_config->dump_frames_count;
+}
+
 const Keymap& GetKeymap() {
 	return g_config->keymap;
 }

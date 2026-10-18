@@ -122,13 +122,19 @@ public:
 		return m_indirect_args_read_barriers;
 	}
 	// Follow each guest draw and dispatch command at once. CountGuestDispatch also keeps the
-	// compute-ordering census (frame profiler and tests).
+	// compute-ordering census (frame profiler and tests): barriers of any site recorded since the
+	// previous guest dispatch (t_recorded_barriers), global and thread-dimension ones among them.
 	void CountGuestDraw() noexcept { m_open_work++; }
 	void CountGuestDispatch();
-	// Lifetime totals (tests): global barriers, and guest dispatches with a global barrier since
-	// the previous one.
+	// Barriers IndirectThreadDispatch records for thread-dimension conversions (census).
+	void NoteThreadBarriers(uint32_t count) noexcept { m_thread_barriers += count; }
+	// Lifetime totals (tests): global barriers, guest dispatches with a global barrier since the
+	// previous one, and guest dispatches with a barrier of any site since the previous one.
 	[[nodiscard]] uint64_t GlobalBarrierCount() const noexcept { return m_global_barriers; }
 	[[nodiscard]] uint64_t OrderedDispatchCount() const noexcept { return m_ordered_dispatches; }
+	[[nodiscard]] uint64_t DispatchesAfterBarrierCount() const noexcept {
+		return m_dispatches_after_barrier;
+	}
 	[[nodiscard]] uint64_t GuestDispatchCount() const noexcept { return m_guest_dispatches; }
 	// Called before a guest draw or dispatch prepares anything (where a readback may submit):
 	// submits the open command buffer without a wait when it holds FeedMinWork guest draws and
@@ -239,6 +245,10 @@ private:
 	uint64_t                     m_guest_syncs                   = 0;
 	uint64_t                     m_guest_syncs_at_dispatch       = 0;
 	uint64_t                     m_global_barriers               = 0;
+	uint64_t                     m_barriers_at_dispatch          = 0;
+	uint64_t                     m_thread_barriers               = 0;
+	uint64_t                     m_thread_at_dispatch            = 0;
+	uint64_t                     m_dispatches_after_barrier      = 0;
 	uint64_t                     m_ordered_dispatches            = 0;
 	uint64_t                     m_guest_dispatches              = 0;
 	uint64_t                     m_dispatches_at_global_barrier  = 0;

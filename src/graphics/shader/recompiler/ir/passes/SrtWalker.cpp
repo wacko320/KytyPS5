@@ -533,6 +533,10 @@ void CompileSrtWalker(ResourcePlan& program) {
 	EXIT_IF(Xbyak::GetError() != 0);
 }
 
+bool IsSrtRawRead(const ResourcePlan& program, const Inst& inst) {
+	return IsRawRead(program, inst);
+}
+
 SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      SrtWalker* clean_evaluator)
     : m_program(program), m_runtime(runtime), m_clean_evaluator(clean_evaluator),
@@ -742,7 +746,8 @@ bool SrtWalker::ScalarReadAddress(const Inst& inst, const Inst& handle, const Me
 	return AddSignedAddress(base & ~uint64_t {3}, relative, address);
 }
 
-bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
+bool SrtWalker::RawReadAddress(const Inst& inst, uint64_t& address, bool& loads) {
+	loads            = false;
 	const auto flags = inst.Flags<SrtReadFlags>();
 	if (flags.index >= m_program.memory_info.size()) {
 		return false;
@@ -754,7 +759,6 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		uint64_t enabled = 0;
 		if (!Arg(inst, 4, enabled)) return false;
 		if (enabled == 0u) {
-			result = 0u;
 			return true;
 		}
 	}
@@ -762,13 +766,10 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	if (handle == nullptr) {
 		return false;
 	}
-	uint64_t address = 0;
 	if (!vector) {
 		bool out_of_bounds = false;
 		if (!ScalarReadAddress(inst, *handle, mem, address, &out_of_bounds)) {
-			if (!out_of_bounds) return false;
-			result = 0u;
-			return true;
+			return out_of_bounds;
 		}
 	} else {
 		uint64_t low    = 0;
@@ -794,18 +795,31 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		if ((high & (1u << 31u)) != 0u || (word3 & ((1u << 23u) | 0xf0000000u)) != 0u)
 			return false;
 		if (stride == 0u || records == 0u || ((word3 >> 12u) & 0x7fu) == 0u) {
-			result = 0u;
 			return true;
 		}
 		const auto size = stride == 0u
 		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
-			result = 0u;
 			return true;
 		}
 		address = (base & ~uint64_t {3}) + byte_offset;
 	}
+	loads = true;
+	return true;
+}
+
+bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
+	uint64_t address = 0;
+	bool     loads   = false;
+	if (!RawReadAddress(inst, address, loads)) {
+		return false;
+	}
+	if (!loads) {
+		result = 0u;
+		return true;
+	}
+	const bool vector = inst.GetOpcode() == ValueOpcode::LoadBufferU32;
 	uint32_t word = 0;
 	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
 	if (reader != nullptr) {
@@ -818,6 +832,13 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	}
 	result = word;
 	return true;
+}
+
+bool SrtWalker::EvaluateLoadAddress(Value read, uint64_t& address) {
+	const auto* inst  = read.Resolve().TryInstruction();
+	bool        loads = false;
+	return inst != nullptr && IsRawRead(m_program, *inst) && RawReadAddress(*inst, address, loads) &&
+	       loads;
 }
 
 bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {

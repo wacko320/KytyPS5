@@ -246,17 +246,29 @@ void CommandScheduler::CountGuestDispatch() {
 	}
 	const auto syncs          = m_guest_syncs - m_guest_syncs_at_dispatch;
 	m_guest_syncs_at_dispatch = m_guest_syncs;
+	// Any barrier since the previous guest dispatch waits for it on the host GPU: the two do not
+	// overlap.
+	const auto barriers    = t_recorded_barriers - m_barriers_at_dispatch;
+	const auto thread      = m_thread_barriers - m_thread_at_dispatch;
+	m_barriers_at_dispatch = t_recorded_barriers;
+	m_thread_at_dispatch   = m_thread_barriers;
+	if (barriers != 0) {
+		m_dispatches_after_barrier++;
+	}
 	if (!Common::FrameProfiler::Active()) {
 		return;
 	}
-	if (ordered) {
-		Common::FrameProfiler::Add(Counter::ComputeDispatchesAfterGlobalBarrier);
+	if (barriers != 0) {
+		Common::FrameProfiler::Add(Counter::ComputeDispatchesAfterBarrier);
+		// By the site that would still order the dispatch with the others removed.
+		Common::FrameProfiler::Add(ordered             ? Counter::ComputeDispatchesAfterGlobalBarrier
+		                           : barriers > thread ? Counter::ComputeDispatchesAfterOtherBarrier
+		                                               : Counter::ComputeDispatchesAfterThreadBarrier);
 	}
 	if (syncs != 0) {
 		Common::FrameProfiler::Add(Counter::ComputeDispatchesAfterGuestSync);
 	}
-	Common::FrameProfiler::Rec(Common::FrameProfiler::Event::GuestDispatch, ordered ? 1u : 0u,
-	                           syncs);
+	Common::FrameProfiler::Rec(Common::FrameProfiler::Event::GuestDispatch, barriers, syncs);
 }
 
 void CommandScheduler::FeedIdleGpu() {

@@ -721,6 +721,12 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --exit-frame 0)
 	set_tests_properties(emulator_exit_frame_invalid PROPERTIES
 	                     PASS_REGULAR_EXPRESSION "invalid exit frame")
+	add_test(NAME emulator_dump_frames_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --dump-frames 1800,3)
+	add_test(NAME emulator_dump_frames_invalid
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --dump-frames 0)
+	set_tests_properties(emulator_dump_frames_invalid PROPERTIES
+	                     PASS_REGULAR_EXPRESSION "invalid dump frames")
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
@@ -775,6 +781,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
+	add_test(NAME frame_readback
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --frame-readback-only)
 	add_test(NAME command_scheduler_timeline
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
 	add_test(NAME buffer_writeback
@@ -801,6 +809,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-flat-copy-only)
 	add_test(NAME feed_idle_gpu
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --feed-idle-gpu-only)
+	add_test(NAME barrier_census
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --barrier-census-only)
 	add_test(NAME guest_ordered_barriers
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --guest-ordered-barriers-only)
 	add_test(NAME native_indirect_dispatch

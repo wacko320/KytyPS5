@@ -275,6 +275,130 @@ void ReportReplayMismatches(const ResourcePrefetcher& prefetcher, uint64_t shade
 	}
 }
 
+// Profiler only: the dwords a materialization read through its runtime, ordinary and strict, so
+// the attribution can evaluate each slot's address from the values the materialization used,
+// without reading guest memory again (that could fault and read back on its own).
+struct MaterializeReadLog {
+	ShaderRecompiler::IR::SrtRuntime           inner;
+	std::vector<std::pair<uint64_t, uint32_t>> ordinary;
+	std::vector<std::pair<uint64_t, uint32_t>> strict;
+
+	static void Note(std::vector<std::pair<uint64_t, uint32_t>>& log, uint64_t address,
+	                 std::span<const uint32_t> values) {
+		for (size_t i = 0; i < values.size(); i++) {
+			log.emplace_back(address + i * sizeof(uint32_t), values[i]);
+		}
+	}
+	static bool OrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
+		auto& log = *static_cast<MaterializeReadLog*>(userdata);
+		if (!log.inner.read_memory(log.inner.userdata, address, values)) {
+			return false;
+		}
+		Note(log.ordinary, address, values);
+		return true;
+	}
+	static bool StrictRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
+		auto& log = *static_cast<MaterializeReadLog*>(userdata);
+		if (!log.inner.read_specialization_memory(log.inner.userdata, address, values)) {
+			return false;
+		}
+		Note(log.strict, address, values);
+		return true;
+	}
+	// The logged runtime: the same readers, recording what they return.
+	ShaderRecompiler::IR::SrtRuntime Logged() {
+		auto runtime     = inner;
+		runtime.userdata = this;
+		if (inner.read_memory != nullptr) {
+			runtime.read_memory = OrdinaryRead;
+		}
+		if (inner.read_specialization_memory != nullptr) {
+			runtime.read_specialization_memory = StrictRead;
+		}
+		return runtime;
+	}
+
+	// Before Replaying: by address, the first read of a dword first.
+	void Sort() {
+		const auto by_address = [](const auto& a, const auto& b) { return a.first < b.first; };
+		std::ranges::stable_sort(ordinary, by_address);
+		std::ranges::stable_sort(strict, by_address);
+	}
+	static bool Replay(const std::vector<std::pair<uint64_t, uint32_t>>& log, uint64_t address,
+	                   std::span<uint32_t> values) {
+		for (size_t i = 0; i < values.size(); i++) {
+			const auto dword = address + i * sizeof(uint32_t);
+			const auto found = std::ranges::lower_bound(log, dword, {},
+			                                            &std::pair<uint64_t, uint32_t>::first);
+			if (found == log.end() || found->first != dword) {
+				return false;
+			}
+			values[i] = found->second;
+		}
+		return true;
+	}
+	// A runtime that serves only the logged dwords (sorted): any other read fails.
+	ShaderRecompiler::IR::SrtRuntime Replaying() const {
+		auto runtime        = inner;
+		runtime.userdata    = const_cast<MaterializeReadLog*>(this);
+		runtime.gpu_written = nullptr;
+		runtime.read_memory = +[](void* userdata, uint64_t address, std::span<uint32_t> values) {
+			return Replay(static_cast<const MaterializeReadLog*>(userdata)->ordinary, address,
+			              values);
+		};
+		runtime.read_specialization_memory =
+		    +[](void* userdata, uint64_t address, std::span<uint32_t> values) {
+			    return Replay(static_cast<const MaterializeReadLog*>(userdata)->strict, address,
+			                  values);
+		    };
+		return runtime;
+	}
+};
+
+// Profiler only: each readback during a materialization gets the union of the CPU consumers of
+// the planned dwords on the pages it waited for (a drain stays while any of them needs the CPU):
+// the flat slots and the one-dword reads nested in what the CPU evaluates, uniform-buffer reads
+// included. A read whose address does not evaluate from the logged dwords is left out.
+void AttributeMaterializeReadbacks(
+    const ShaderRecompiler::IR::ResourcePlan&                   plan,
+    MaterializeReadLog&                                         log,
+    std::span<const Common::FrameProfiler::MaterializeReadback> readbacks) {
+	using Common::FrameProfiler::Bit;
+	using Common::FrameProfiler::Consumer;
+	if (readbacks.empty()) {
+		return;
+	}
+	if (plan.srt_read_consumers.size() != plan.srt_reads.size()) {
+		for (const auto& readback: readbacks) {
+			Common::FrameProfiler::NoteMaterializeReadback(readback, Bit(Consumer::Unplanned));
+		}
+		return;
+	}
+	std::vector<Common::FrameProfiler::SlotRead> reads;
+	reads.reserve(plan.srt_reads.size());
+	log.Sort();
+	const auto                      replaying     = log.Replaying();
+	const auto                      clean_runtime = ShaderRecompiler::IR::CleanRuntime(replaying);
+	ShaderRecompiler::IR::SrtWalker clean(plan, clean_runtime);
+	ShaderRecompiler::IR::SrtWalker walker(plan, replaying, &clean);
+	for (uint32_t slot = 0; slot < plan.srt_reads.size(); slot++) {
+		uint64_t address = 0;
+		if (walker.EvaluateLoadAddress(plan.srt_reads[slot].value, address)) {
+			reads.push_back({address, plan.srt_read_consumers[slot]});
+		}
+	}
+	for (const auto& [read, consumers]: plan.srt_nested_reads) {
+		uint64_t address = 0;
+		if (walker.EvaluateLoadAddress(read, address)) {
+			reads.push_back({address, consumers});
+		}
+	}
+	for (const auto& readback: readbacks) {
+		Common::FrameProfiler::NoteMaterializeReadback(
+		    readback, Common::FrameProfiler::ReadbackConsumers(readback, reads));
+	}
+}
+
 // The draw-prep prefetcher's worker count.
 uint32_t DrawPrepThreads() {
 	// Two keep up with a draw every ~20 us; more mostly compete with the guest's threads.
@@ -424,6 +548,19 @@ struct PipelineCache::ProgramCache {
 		// A prefetch worker's result is used when one was accepted (ResourcePrefetcher).
 		bool Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                 ResourcePrefetcher* prefetcher) {
+			if (!Common::FrameProfiler::Active()) {
+				return MaterializeEntry(runtime, prefetcher);
+			}
+			// Profiling: the same readers, logged, so its readbacks can be attributed afterwards.
+			Common::FrameProfiler::ScopedMaterialize profile_readbacks(resource_plan.shader_hash);
+			MaterializeReadLog                       log {.inner = runtime};
+			const bool materialized = MaterializeEntry(log.Logged(), prefetcher);
+			AttributeMaterializeReadbacks(resource_plan, log, profile_readbacks.Take());
+			return materialized;
+		}
+
+		bool MaterializeEntry(const ShaderRecompiler::IR::SrtRuntime& runtime,
+		                      ResourcePrefetcher* prefetcher) {
 			using Common::FrameProfiler::Counter;
 			const bool profiling = Common::FrameProfiler::Active();
 			const Common::FrameProfiler::ScopedPhase profile_phase(

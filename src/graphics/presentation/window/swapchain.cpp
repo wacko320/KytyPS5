@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/frameDump.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
@@ -318,7 +319,8 @@ private:
 struct Presenter::Impl {
 	explicit Impl(WindowContext& owner)
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
-	      present_scheduler(renderer, owner.graphic_ctx, true), frames(owner, present_scheduler) {
+	      present_scheduler(renderer, owner.graphic_ctx, true), frames(owner, present_scheduler),
+	      readback(owner.graphic_ctx) {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
@@ -362,6 +364,7 @@ struct Presenter::Impl {
 	Common::Mutex         present_mutex;
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
+	FrameReadback         readback;
 };
 
 vk::SurfaceFormatKHR Swapchain::SelectFormat() {
@@ -1034,6 +1037,9 @@ void Presenter::Impl::Present() {
 	if (hdr_changed || swapchain.NeedsResize()) {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
+	// --dump-frames reads back the guest image that the swapchain blit takes as its source.
+	const auto frame_number = window.loop.presented_frames.load(std::memory_order_relaxed) + 1;
+	const bool dump         = layers[0].frame != nullptr && FrameDump::Wants(frame_number);
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		auto status = swapchain.AcquireNextImage(present_scheduler);
 		if (status != Swapchain::Status::Success) {
@@ -1047,6 +1053,9 @@ void Presenter::Impl::Present() {
 		                                 swapchain.PrepareSystemOverlay();
 		swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
 		                                draw_system_overlay);
+		if (dump) {
+			readback.Record(command.Handle(), layers[0].frame->image);
+		}
 		const auto tick = swapchain.Submit(present_scheduler);
 		for (const auto& layer: layers) {
 			if (layer.frame != nullptr) {
@@ -1060,6 +1069,12 @@ void Presenter::Impl::Present() {
 		}
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
+		// Before OnFramePresented, which records --frame-times and drives the profiler, so a
+		// dumped frame's wait and encode are charged to that frame and not to the next one.
+		if (dump) {
+			present_scheduler.Wait(tick, Common::FrameProfiler::WaitSite::FrameDump);
+			FrameDump::Write(frame_number, readback);
+		}
 		window.OnFramePresented(
 		    window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed) + 1);
 		return;

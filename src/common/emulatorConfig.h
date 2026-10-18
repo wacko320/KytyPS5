@@ -110,6 +110,9 @@ struct ConfigOptions {
 	uint32_t profile_frame_count = 0;
 	// Debugging: shader loops end after this many iterations (0: no limit).
 	uint32_t shader_loop_limit = 0;
+	// Presented frames written as PNG (--dump-frames): first frame (0: none) and count.
+	uint64_t dump_frames_start = 0;
+	uint32_t dump_frames_count = 1;
 };
 
 void Load(const ConfigOptions& cfg);
@@ -181,6 +184,8 @@ const std::string& GetPadScript();
 uint64_t           ProfileStartFrame();
 uint32_t           ProfileFrameCount();
 uint32_t           ShaderLoopLimit();
+uint64_t           DumpFramesStart();
+uint32_t           DumpFramesCount();
 
 } // namespace Config
 

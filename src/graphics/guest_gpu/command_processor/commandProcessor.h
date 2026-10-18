@@ -21,6 +21,18 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 
 enum class Pm4ProcessResult { Complete, Blocked };
 
+// Why a PM4 execution suspended (frame profiler: Event::Suspend).
+enum class SuspendReason : uint8_t {
+	Other,
+	WaitRegMem,
+	Ce,
+	DeDiff,
+	Rewind,
+	Predication,
+	Yield, // a wait this queue released, or a parked queue's tick, lets another queue run
+	Park,  // a dispatch's readback would block on the host GPU while another queue can run
+};
+
 enum class ContextStateOperation : uint32_t {
 	Clear     = 0,
 	Push      = 1,
@@ -196,7 +208,8 @@ private:
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
-	void SuspendPm4();
+	void SuspendPm4(SuspendReason reason = SuspendReason::Other, uint64_t address = 0,
+	                uint32_t func = 0);
 	// The thread-dimension batch for the dispatch packet executing now: a new one when the
 	// dispatch heads a guest synchronisation window or is an indirect thread-dimension dispatch
 	// the current batch does not cover (ThreadDispatchBatch::requests), else the covering one.
@@ -238,6 +251,8 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+	// The address of the WAIT_REG_MEM this processor last suspended on (frame profiler).
+	uint64_t  m_suspended_wait              = 0;
 
 	// Decodes draws ahead of execution for the pipeline cache's prefetch workers.
 	std::unique_ptr<Pm4Lookahead> m_lookahead;
