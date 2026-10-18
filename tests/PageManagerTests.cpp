@@ -1,3 +1,4 @@
+#include "TrackingProtectionCheck.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
 
@@ -29,9 +30,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #else
+#include <csignal>
 #include <map>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <ucontext.h>
 #include <unistd.h>
 #endif
 
@@ -132,6 +135,7 @@ int VirtualFree(void *address, size_t, DWORD) {
 #else
   const int ok = ::munmap(address, it->second) == 0 ? 1 : 0;
 #endif
+  TrackingProtectionCheck::Forget(reinterpret_cast<uint64_t>(address), it->second);
   sizes.erase(it);
   return ok;
 }
@@ -228,6 +232,7 @@ uint8_t *Allocate(uint64_t size, uint32_t protection = PAGE_READWRITE,
   auto *memory = static_cast<uint8_t *>(raw);
   AllocationSizes()[raw] = static_cast<size_t>(size);
 #endif
+  TrackingProtectionCheck::NoteAllocation(reinterpret_cast<uint64_t>(memory), size);
   return memory;
 }
 
@@ -673,6 +678,110 @@ void CheckDeathCase(const char *name) {
 #endif
 }
 
+
+#if defined(__linux__)
+PageManager *g_fault_manager = nullptr;
+volatile sig_atomic_t g_fault_signal = 0;
+volatile uint64_t g_fault_error = 0;
+
+// A write to a write-protected page: what the emulator's fault path does, for one page.
+void WriteProtectFault(int signal_number, siginfo_t *info, void *context) {
+  g_fault_signal = signal_number;
+  g_fault_error = static_cast<uint64_t>(
+      static_cast<ucontext_t *>(context)->uc_mcontext.gregs[REG_ERR]);
+  const auto page =
+      reinterpret_cast<uint64_t>(info->si_addr) & ~(TRACKER_PAGE_SIZE - 1);
+  g_fault_manager->UpdatePageWatchers<false>(page, TRACKER_PAGE_SIZE);
+}
+
+// Write watches on memory registered for write protection: armed without a protection change,
+// NoAccess edges by protection, the protection kept across NoAccess, a lazy release, and the fault.
+void TestWriteProtectedWatches() {
+  if (!TrackingProtectionCheck::Enable(true)) {
+    std::puts("PageManagerTests: write protection unsupported, skipped its cases");
+    return;
+  }
+  using TrackingProtectionCheck::IsWriteProtected;
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto region_size = TRACKER_REGION_SIZE;
+  auto *memory = Allocate(region_size * 2);
+  std::memset(memory, 1, region_size * 2);
+  const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+  const auto region_base =
+      (allocation_base + region_size - 1) & ~(region_size - 1);
+  const auto page = [&](uint64_t index) {
+    return reinterpret_cast<uint8_t *>(region_base + page_size * index);
+  };
+
+  RegionBits write_mask;
+  write_mask.SetRange(10, 15);
+  RegionBits read_mask;
+  read_mask.Set(11);
+  read_mask.Set(13);
+  manager.UpdatePageWatchersForRegion<true>(region_base, write_mask);
+  Check(IsWritable(page(10)) && IsWritable(page(14)) &&
+            IsWriteProtected(page(10)) && IsWriteProtected(page(14)) &&
+            !IsWriteProtected(page(9)) && !IsWriteProtected(page(15)),
+        "write watch did not arm write protection on writable pages");
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, read_mask);
+  Check(Protection(page(11)) == PAGE_NOACCESS &&
+            Protection(page(13)) == PAGE_NOACCESS && IsWritable(page(12)) &&
+            IsWriteProtected(page(12)),
+        "read watchers did not compose with armed write watchers");
+  manager.UpdatePageWatchersForRegion<false>(region_base, write_mask);
+  Check(IsWritable(page(10)) && !IsWriteProtected(page(10)) &&
+            IsWritable(page(12)) && !IsWriteProtected(page(12)) &&
+            Protection(page(11)) == PAGE_NOACCESS &&
+            Protection(page(13)) == PAGE_NOACCESS,
+        "write unwatch changed pages still owned by read watchers");
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, read_mask);
+  Check(IsWritable(page(11)) && IsWritable(page(13)) &&
+            !IsWriteProtected(page(11)) && !IsWriteProtected(page(13)),
+        "read unwatch did not restore access");
+
+  // A write watch added while NoAccess holds when access returns.
+  RegionBits read_20;
+  read_20.Set(20);
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, read_20);
+  manager.UpdatePageWatchers<true>(region_base + page_size * 20, page_size);
+  Check(Protection(page(20)) == PAGE_NOACCESS, "read watch did not deny access");
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, read_20);
+  Check(IsWritable(page(20)) && IsWriteProtected(page(20)),
+        "a write watch made under NoAccess was lost when access returned");
+  manager.UpdatePageWatchers<false>(region_base + page_size * 20, page_size);
+  Check(!IsWriteProtected(page(20)), "write unwatch left write protection");
+
+  // A lazy release leaves the protection until a fault applies it.
+  manager.UpdatePageWatchers<true>(region_base + page_size * 30, page_size);
+  const bool lazy = PageManager::SetLazyRelease(true);
+  manager.UpdatePageWatchers<false>(region_base + page_size * 30, page_size);
+  (void)PageManager::SetLazyRelease(lazy);
+  Check(IsWriteProtected(page(30)), "lazy release changed the protection");
+  Check(manager.ApplyDeferred(region_base + page_size * 30) &&
+            !IsWriteProtected(page(30)),
+        "a fault on a lazily released page did not apply its release");
+
+  // The write itself: SIGBUS on the writing thread, decoded as a write, retried once released.
+  manager.UpdatePageWatchers<true>(region_base + page_size * 40, page_size);
+  struct sigaction action{};
+  struct sigaction previous{};
+  action.sa_sigaction = WriteProtectFault;
+  action.sa_flags = SA_SIGINFO;
+  sigemptyset(&action.sa_mask);
+  g_fault_manager = &manager;
+  Check(::sigaction(SIGBUS, &action, &previous) == 0, "sigaction failed");
+  *reinterpret_cast<volatile uint8_t *>(page(40) + 5) = 7;
+  ::sigaction(SIGBUS, &previous, nullptr);
+  Check(g_fault_signal == SIGBUS && (g_fault_error & 0x2u) != 0 &&
+            page(40)[5] == 7 && !IsWriteProtected(page(40)),
+        "a write to a write-watched page did not fault as a write and retry");
+
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+  (void)TrackingProtectionCheck::Enable(false);
+}
+#endif
+
 void TestFatalPaths() {
   for (const char *name :
        {"invalid-range", "unknown-untrack", "destructor-watch",
@@ -686,7 +795,16 @@ void TestFatalPaths() {
 namespace Libs::LibKernel::Memory {
 
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
-                            Common::VirtualMemory::Mode mode) {
+                            Common::VirtualMemory::Mode mode, bool from_no_access) {
+  if (TrackingProtectionCheck::Note(vaddr, size, mode, from_no_access)) {
+    {
+      std::lock_guard lock(g_protection_log_mutex);
+      g_protection_calls++;
+      g_protection_ranges.push_back({vaddr, size});
+    }
+    return TrackingProtectionCheck::ApplyWriteProtected(vaddr, size, mode,
+                                                        from_no_access);
+  }
   return ProtectAddressSpace(vaddr, size, mode);
 }
 
@@ -705,6 +823,9 @@ int main(int argc, char **argv) {
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
   TestConcurrentSharedWatchers();
+#if defined(__linux__)
+  TestWriteProtectedWatches();
+#endif
   TestFatalPaths();
   std::puts("PageManagerTests: all cases passed");
   return 0;

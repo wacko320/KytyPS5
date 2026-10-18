@@ -1,3 +1,4 @@
+#include "TrackingProtectionCheck.h"
 #include "common/hostException.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
@@ -143,6 +144,7 @@ void *VirtualAlloc(void *address, size_t size, DWORD, uint32_t protection) {
   }
   void *raw = reinterpret_cast<void *>(raw_address);
   AllocationSizes()[raw] = size;
+  TrackingProtectionCheck::NoteAllocation(reinterpret_cast<uint64_t>(raw), size);
   return raw;
 #else
   const int extra = address != nullptr ? MAP_FIXED_NOREPLACE : 0;
@@ -152,6 +154,7 @@ void *VirtualAlloc(void *address, size_t size, DWORD, uint32_t protection) {
     return nullptr;
   }
   AllocationSizes()[raw] = size;
+  TrackingProtectionCheck::NoteAllocation(reinterpret_cast<uint64_t>(raw), size);
   return raw;
 #endif
 }
@@ -171,6 +174,7 @@ int VirtualFree(void *address, size_t, DWORD) {
 #else
   const int ok = ::munmap(address, it->second) == 0 ? 1 : 0;
 #endif
+  TrackingProtectionCheck::Forget(reinterpret_cast<uint64_t>(address), it->second);
   sizes.erase(it);
   return ok;
 }
@@ -2367,7 +2371,11 @@ void TestFaultOnProtectedStack() {
 namespace Libs::LibKernel::Memory {
 
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
-                            Common::VirtualMemory::Mode mode) {
+                            Common::VirtualMemory::Mode mode, bool from_no_access) {
+  if (TrackingProtectionCheck::Note(vaddr, size, mode, from_no_access)) {
+    return TrackingProtectionCheck::ApplyWriteProtected(vaddr, size, mode,
+                                                        from_no_access);
+  }
   return ProtectAddressSpace(vaddr, size, mode);
 }
 
@@ -2436,6 +2444,11 @@ int main(int argc, char **argv) {
   TestFaultOnProtectedStack();
   // Last: it leaves its write-fault handler installed.
   TestConcurrentCpuWritesAreNeverMissed();
+  // Again on memory registered for write protection: the writes fault with SIGBUS.
+  if (TrackingProtectionCheck::Enable(true)) {
+    TestConcurrentCpuWritesAreNeverMissed();
+    std::puts("MemoryTrackerTests: concurrent writes checked with write protection");
+  }
 #endif
   std::puts("MemoryTrackerTests: all cases passed");
   return 0;

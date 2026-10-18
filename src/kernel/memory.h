@@ -245,7 +245,11 @@ uint64_t AllocateGuestStackMemory(uint64_t search_addr, uint64_t size,
 bool     ProtectGuestMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode,
                             Common::VirtualMemory::Mode* old_mode = nullptr);
 // Transient PageManager watch state; does not change the guest mapping's semantic protection.
-bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
+// mode is NoAccess, Read (a write watch) or ReadWrite. Where the host supports it a write watch
+// arms write protection instead (VirtualMemory::WriteProtect), and only changes from or to NoAccess
+// change the protection: from_no_access says part of the range may be NoAccess now.
+bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode,
+                            bool from_no_access);
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)

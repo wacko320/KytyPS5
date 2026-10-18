@@ -1,3 +1,4 @@
+#include "TrackingProtectionCheck.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -423,8 +424,8 @@ void TestGuestAddressSpaceOwnsReservationsBeforeBacking() {
 	Check(test, Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base, SceKernelPageSize),
 	      "semantic reservation replaced the owner's placeholder");
 	Check(test,
-	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base, SceKernelPageSize,
-	                                                      Common::VirtualMemory::Mode::NoAccess),
+	      Libs::LibKernel::Memory::ProtectGuestHostMemory(
+	          base, SceKernelPageSize, Common::VirtualMemory::Mode::NoAccess, false),
 	      "owner rejected a sparse placeholder protection no-op");
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
 	Check(test, Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base, SceKernelPageSize),
@@ -1273,14 +1274,36 @@ void TestTrackedExecutablePagesKeepExecute() {
 		return permissions;
 	};
 	using Common::VirtualMemory::Mode;
+	using Libs::LibKernel::Memory::ProtectGuestHostMemory;
+	using TrackingProtectionCheck::IsWriteProtected;
+	// With write protection a write watch keeps the page writable and arms it instead.
+	const bool write_protect = Common::VirtualMemory::WriteProtectSupported();
+	*reinterpret_cast<volatile uint8_t*>(base) = 1;
 	Check(test,
-	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base, page, Mode::Read) &&
-	          host_permissions().substr(0, 3) == "r-x",
+	      ProtectGuestHostMemory(base, page, Mode::Read, false) &&
+	          host_permissions().substr(0, 3) == (write_protect ? "rwx" : "r-x") &&
+	          IsWriteProtected(reinterpret_cast<void*>(base)) == write_protect,
 	      "a read-tracked executable page lost Execute");
 	Check(test,
-	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base, page, Mode::ReadWrite) &&
-	          host_permissions().substr(0, 3) == "rwx",
+	      ProtectGuestHostMemory(base, page, Mode::ReadWrite, false) &&
+	          host_permissions().substr(0, 3) == "rwx" &&
+	          !IsWriteProtected(reinterpret_cast<void*>(base)),
 	      "a released executable page lost Execute");
+	// NoAccess and back: the way back restores the access (and the write watch).
+	Check(test,
+	      ProtectGuestHostMemory(base, page, Mode::NoAccess, false) &&
+	          host_permissions().substr(0, 3) == "---",
+	      "a GPU-written page kept access");
+	Check(test,
+	      ProtectGuestHostMemory(base, page, Mode::Read, true) &&
+	          host_permissions().substr(0, 3) == (write_protect ? "rwx" : "r-x") &&
+	          IsWriteProtected(reinterpret_cast<void*>(base)) == write_protect,
+	      "a write-watched page leaving NoAccess lost Execute or its watch");
+	Check(test,
+	      ProtectGuestHostMemory(base, page, Mode::ReadWrite, false) &&
+	          host_permissions().substr(0, 3) == "rwx" &&
+	          !IsWriteProtected(reinterpret_cast<void*>(base)),
+	      "a released page kept its watch");
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, page), "KernelMunmap");
 #endif
 	std::printf("[host]    %-48s ok\n", test);
@@ -1729,11 +1752,11 @@ void TestDirectPartialProtectUnmapPreservesNeighbors() {
 	    "KernelMprotect(middle)");
 	Check(test,
 	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base, size,
-	                                                      Common::VirtualMemory::Mode::Read),
+	                                                      Common::VirtualMemory::Mode::Read, false),
 	      "owner could not protect fragmented backing views");
 	Check(test,
 	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base, size,
-	                                                      Common::VirtualMemory::Mode::ReadWrite),
+	                                                      Common::VirtualMemory::Mode::ReadWrite, false),
 	      "owner could not restore fragmented backing views");
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
@@ -1843,11 +1866,11 @@ void TestPartialUnmapPreservesHostPermissions() {
 	const auto base = MapNamedFlexible(test, SceKernelPageSize * 3, SceKernelProtCpuRw,
 	                                   "unmap_host_permissions");
 	using Common::VirtualMemory::Mode;
-	Check(test, Libs::LibKernel::Memory::ProtectGuestHostMemory(base, SceKernelPageSize, Mode::Read),
+	Check(test, Libs::LibKernel::Memory::ProtectGuestHostMemory(base, SceKernelPageSize, Mode::Read, false),
 	      "could not protect the left survivor from writes");
 	Check(test,
 	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base + SceKernelPageSize * 2,
-	                                                      SceKernelPageSize, Mode::NoAccess),
+	                                                      SceKernelPageSize, Mode::NoAccess, false),
 	      "could not protect the right survivor from reads");
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
@@ -2164,11 +2187,11 @@ void TestMunmapAcrossAdjacentFlexibleMappings() {
 	      "ClampRangeSize did not cross adjacent committed mappings");
 	Check(test,
 	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base, SceKernelPageSize * 2,
-	                                                      Common::VirtualMemory::Mode::Read),
+	                                                      Common::VirtualMemory::Mode::Read, false),
 	      "owner could not protect adjacent backing mappings");
 	Check(test,
 	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base, SceKernelPageSize * 2,
-	                                                      Common::VirtualMemory::Mode::ReadWrite),
+	                                                      Common::VirtualMemory::Mode::ReadWrite, false),
 	      "owner could not restore adjacent backing mappings");
 
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 2),
@@ -2719,8 +2742,8 @@ void TestFixedDirectReplacementPreservesAccess() {
 		      size == SceKernelPageSize && bytes == sizeof(value) && value == 0x22,
 		      "fixed replacement exposed an inaccessible or changed old mapping before mmap");
 	};
-	Check(test, ProtectGuestHostMemory(base, page, Mode::Read) &&
-	                ProtectGuestHostMemory(base + page * 2, page, Mode::NoAccess),
+	Check(test, ProtectGuestHostMemory(base, page, Mode::Read, false) &&
+	                ProtectGuestHostMemory(base + page * 2, page, Mode::NoAccess, false),
 	      "could not protect neighboring pages");
 	TestBeforeNextBackingMap(observe_old_mapping);
 	CheckOk(test, replace(page, page, SceKernelProtCpuRead, "replacement_same"),
@@ -2745,7 +2768,7 @@ void TestFixedDirectReplacementPreservesAccess() {
 	                value == 0x11 && process_vm_writev(getpid(), &local, 1, &left, 1, 0) == -1 &&
 	                process_vm_readv(getpid(), &local, 1, &right, 1, 0) == -1,
 	      "middle replacement changed a neighboring page's bytes or host protection");
-	Check(test, ProtectGuestHostMemory(base, page * 3, Mode::ReadWrite),
+	Check(test, ProtectGuestHostMemory(base, page * 3, Mode::ReadWrite, true),
 	      "could not restore neighboring permissions");
 	const auto check_preserved = [&] {
 		Check(test, *reinterpret_cast<uint64_t*>(base) == 0x11 &&

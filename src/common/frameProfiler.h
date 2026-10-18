@@ -238,8 +238,12 @@ enum class Kind : uint8_t { Sum, Max };
 	X(RunAheadUpPages, Count, Sum, "faults: run-ahead pages made writable above a fault")         \
 	X(RunAheadDownPages, Count, Sum, "faults: run-ahead pages made writable below a fault")       \
 	X(RunAheadMarks, Count, Sum, "faults: run-ahead windows marked")                              \
-	R(PageProtectCalls, Count, Sum, "page protection: mprotect calls of write tracking")           \
-	R(PageProtectTime, Ticks, Sum, "page protection: mprotect time of write tracking")                 \
+	R(PageProtectCalls, Count, Sum, "page protection: protection changes of write tracking")       \
+	R(PageProtectTime, Ticks, Sum, "page protection: protection-change time of write tracking")      \
+	R(TrackingMprotectCalls, Count, Sum, "page protection: mprotect calls of write tracking")       \
+	R(TrackingMprotectTime, Ticks, Sum, "page protection: mprotect time of write tracking")         \
+	R(TrackingWriteProtectCalls, Count, Sum, "page protection: userfaultfd write-protect calls")    \
+	R(TrackingWriteProtectTime, Ticks, Sum, "page protection: userfaultfd write-protect time")      \
 	X(UploadWalkProtectCalls, Count, Sum, "upload: page walk, mprotect calls")                    \
 	X(UploadWalkProtectTime, Ticks, Sum, "upload: page walk, mprotect time")                           \
 	X(UploadHelperJobs, Count, Sum, "upload: walks the upload helper protected and copied")        \

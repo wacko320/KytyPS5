@@ -215,10 +215,12 @@ struct PageManager::Impl {
 		return ptr;
 	}
 
-	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
+	// from_no_access: some page of the range may have NoAccess now (its applied protection).
+	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode,
+	             bool from_no_access) noexcept {
 		namespace FrameProfiler   = Common::FrameProfiler;
 		const uint64_t profile_t0 = FrameProfiler::Start();
-		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
+		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode, from_no_access)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));
 		}
@@ -246,6 +248,9 @@ struct PageManager::Impl {
 		uint64_t  range_begin           = 0;
 		uint64_t  range_bytes           = 0;
 		uint64_t  potential_range_bytes = 0;
+		// Whether a page of the range, or of its potential extension, has NoAccess applied.
+		bool      range_from_no_access     = false;
+		bool      potential_from_no_access = false;
 
 		const auto release_pending = [&] {
 			if (range_bytes != 0) {
@@ -255,12 +260,15 @@ struct PageManager::Impl {
 					t_deferred_write_watches->push_back(
 					    {base_addr + range_begin * PAGE_SIZE, range_bytes});
 				} else {
-					Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+					Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms,
+					        range_from_no_access);
 				}
 				std::fill_n(region.deferred.begin() + static_cast<std::ptrdiff_t>(range_begin),
 				            range_bytes / PAGE_SIZE, defer);
-				range_bytes           = 0;
-				potential_range_bytes = 0;
+				range_bytes              = 0;
+				potential_range_bytes    = 0;
+				range_from_no_access     = false;
+				potential_from_no_access = false;
 			}
 		};
 
@@ -274,6 +282,8 @@ struct PageManager::Impl {
 				// Its protection, for a deferred walk's release_pending.
 				region.applied[page_index] = old_perms;
 			}
+			const bool was_no_access =
+			    region.applied[page_index] == Common::VirtualMemory::Mode::NoAccess;
 			const auto new_count = update ? page.AddDelta<track ? 1 : -1, is_read>(address)
 			                              : page.AddDelta<0, is_read>(address);
 			const auto new_perms = page.Perms();
@@ -283,6 +293,7 @@ struct PageManager::Impl {
 				perms = new_perms;
 			} else if (range_bytes != 0) {
 				potential_range_bytes += PAGE_SIZE;
+				potential_from_no_access |= was_no_access;
 			}
 
 			if (!update) {
@@ -302,10 +313,12 @@ struct PageManager::Impl {
 			}
 			if (protect) {
 				if (range_bytes == 0) {
-					range_begin           = page_index;
-					potential_range_bytes = PAGE_SIZE;
+					range_begin              = page_index;
+					potential_range_bytes    = PAGE_SIZE;
+					potential_from_no_access = was_no_access;
 				}
-				range_bytes = potential_range_bytes;
+				range_bytes          = potential_range_bytes;
+				range_from_no_access = potential_from_no_access;
 			}
 		}
 
@@ -351,7 +364,8 @@ struct PageManager::Impl {
 		if (perms == region->applied[page_index]) {
 			return false;
 		}
-		Protect(region_base + page_index * PAGE_SIZE, PAGE_SIZE, perms);
+		Protect(region_base + page_index * PAGE_SIZE, PAGE_SIZE, perms,
+		        region->applied[page_index] == Common::VirtualMemory::Mode::NoAccess);
 		return true;
 	}
 
@@ -376,13 +390,17 @@ struct PageManager::Impl {
 						run++;
 						continue;
 					}
-					const auto perms = region->pages[run].Perms();
-					auto       next  = run;
+					const auto perms          = region->pages[run].Perms();
+					auto       next           = run;
+					bool       from_no_access = false;
 					while (next < last && stale(next) && region->pages[next].Perms() == perms) {
 						region->deferred[next] = false;
+						from_no_access |=
+						    region->applied[next] == Common::VirtualMemory::Mode::NoAccess;
 						next++;
 					}
-					Protect(region_base + run * PAGE_SIZE, (next - run) * PAGE_SIZE, perms);
+					Protect(region_base + run * PAGE_SIZE, (next - run) * PAGE_SIZE, perms,
+					        from_no_access);
 					run = next;
 				}
 			}

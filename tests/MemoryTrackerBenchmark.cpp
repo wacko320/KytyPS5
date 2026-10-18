@@ -14,7 +14,7 @@
 
 namespace Libs::LibKernel::Memory {
 
-bool ProtectGuestHostMemory(uint64_t, uint64_t, Common::VirtualMemory::Mode) {
+bool ProtectGuestHostMemory(uint64_t, uint64_t, Common::VirtualMemory::Mode, bool) {
 	return true;
 }
 

@@ -1157,6 +1157,9 @@ void Initialize() {
 	g_virtual_ranges      = std::make_unique<VirtualRanges>();
 	EXIT_IF(!g_guest_address_space->SelfTest());
 	EXIT_IF(!SelfTestSub64SharedPlaceholderAlias());
+	Log::WriteToConsoleAndLog(VirtualMemory::WriteProtectSupported()
+	                              ? "Memory: GPU write tracking uses userfaultfd write protection.\n"
+	                              : "Memory: GPU write tracking uses page protection.\n");
 }
 
 void Shutdown() {
@@ -4039,7 +4042,8 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 	return true;
 }
 
-bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
+                            bool from_no_access) {
 	if (g_guest_address_space == nullptr) {
 		return false;
 	}
@@ -4051,7 +4055,7 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode m
 		mode = mode == VirtualMemory::Mode::Read ? VirtualMemory::Mode::ExecuteRead
 		                                         : VirtualMemory::Mode::ExecuteReadWrite;
 	}
-	return g_guest_address_space->ProtectTransient(vaddr, size, mode);
+	return g_guest_address_space->ProtectTransient(vaddr, size, mode, from_no_access);
 }
 
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {

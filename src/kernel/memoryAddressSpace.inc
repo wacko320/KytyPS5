@@ -946,7 +946,12 @@ public:
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
-	bool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+	// Tracking protection: mode is NoAccess, (Execute)Read for a write watch, or (Execute)ReadWrite.
+	// On memory registered for write protection a write watch arms it instead of removing write
+	// access, and only the NoAccess edges change the protection: from_no_access says the range may
+	// be NoAccess now (some of it; over-approximating costs an mprotect).
+	bool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
+	                      bool from_no_access) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
@@ -955,7 +960,58 @@ public:
 		// threads issue them at once. Changes to one page are ordered by the page manager's
 		// region lock, which every caller holds.
 		std::shared_lock lock(m_mutex);
-		return ProtectMappedUnlocked(vaddr, size, mode);
+		const bool       registered = m_write_protectable.Intersects(vaddr, size);
+		const auto       end        = vaddr + size;
+		auto       it  = m_mapped.upper_bound(vaddr);
+		if (it != m_mapped.begin()) {
+			--it;
+		}
+		for (; it != m_mapped.end() && it->second.vaddr < end; ++it) {
+			const auto& region      = it->second;
+			const auto  range_start = std::max(vaddr, region.vaddr);
+			const auto  range_end   = std::min(end, region.vaddr + region.size);
+			if (range_start >= range_end) {
+				continue;
+			}
+			if (!registered) {
+				if (!VirtualMemory::ProtectForTracking(range_start, range_end - range_start, mode,
+				                                       from_no_access, false)) {
+					return false;
+				}
+				continue;
+			}
+			// Registered parts, and the gaps between them.
+			auto       current = range_start;
+			bool       ok      = true;
+			const auto part    = [&](uint64_t begin, uint64_t finish, bool write_protectable) {
+				ok = ok && VirtualMemory::ProtectForTracking(begin, finish - begin, mode,
+				                                             from_no_access, write_protectable);
+			};
+			m_write_protectable.ForEachInRange(range_start, range_end - range_start,
+			                                   [&](uint64_t begin, uint64_t finish) {
+				                                   if (current < begin) {
+					                                   part(current, begin, false);
+				                                   }
+				                                   part(begin, finish, true);
+				                                   current = finish;
+			                                   });
+			if (current < range_end) {
+				part(current, range_end, false);
+			}
+			if (!ok) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	// Since the mapping was made (MapBacking, Commit) and until it goes, the range can be write
+	// protected without a protection change (VirtualMemory::WriteProtect), when the host supports it.
+	void NoteTrackingMapping(uint64_t vaddr, uint64_t size) {
+		m_write_protectable.Subtract(vaddr, size);
+		if (VirtualMemory::WriteProtectSupported() && VirtualMemory::RegisterWriteProtect(vaddr, size)) {
+			m_write_protectable.Add(vaddr, size);
+		}
 	}
 
 	bool MapBacking(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
@@ -980,6 +1036,7 @@ public:
 			if (!replacing) {
 				EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Backing));
 			}
+			NoteTrackingMapping(vaddr, size);
 			return true;
 		}
 		if (!replacing) {
@@ -997,6 +1054,7 @@ public:
 		if (!m_backing->Unmap(vaddr, size, &placeholder_preserved)) {
 			return false;
 		}
+		m_write_protectable.Subtract(vaddr, size);
 		if (!placeholder_preserved) {
 			return false;
 		}
@@ -1076,6 +1134,7 @@ public:
 #else
 		if (VirtualMemory::Protect(vaddr, size, host_mode)) {
 			EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Private));
+			NoteTrackingMapping(vaddr, size);
 			return true;
 		}
 		AddFreeUnlocked(vaddr, size);
@@ -1111,6 +1170,7 @@ public:
 		for (const auto& [region_vaddr, region_size]: regions) {
 			RestorePlaceholder(region_vaddr, region_size);
 		}
+		m_write_protectable.Subtract(vaddr, size);
 #endif
 		EXIT_IF(!RemoveMappedUnlocked(vaddr, size, MappingType::Private));
 		AddFreeUnlocked(vaddr, size);
@@ -1554,6 +1614,8 @@ private:
 	std::shared_mutex                          m_mutex;
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
+	// Mapped ranges registered for write protection (NoteTrackingMapping).
+	Libs::Graphics::RangeSet                   m_write_protectable;
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
 	uint64_t                                   m_granularity = 0x10000;
 	GuestBackingStore*                         m_backing     = nullptr;
