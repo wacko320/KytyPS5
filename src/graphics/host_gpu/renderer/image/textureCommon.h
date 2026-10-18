@@ -4,6 +4,8 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <optional>
+
 namespace Libs::Graphics {
 
 struct RenderTargetFormatInfo {
@@ -25,6 +27,10 @@ SurfaceFormatInfo      TextureGetSurfaceFormatInfo(Prospero::BufferFormat format
 RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layout,
                                                     Prospero::ChannelType   type,
                                                     Prospero::ChannelOrder  order);
+// TextureGetRenderTargetFormat without the exit: nullopt for an unsupported combination.
+std::optional<RenderTargetFormatInfo>
+TextureTryGetRenderTargetFormat(Prospero::ChannelLayout layout, Prospero::ChannelType type,
+                                Prospero::ChannelOrder order);
 
 } // namespace Libs::Graphics
 

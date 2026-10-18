@@ -4,6 +4,7 @@
 #include "graphics/shader/shader.h"
 
 #include <array>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -41,6 +42,21 @@ ShaderParams PrepareProgram(
     ShaderPixelInputInfo&                               input_info);
 ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
                             ShaderComputeInputInfo& input_info);
+
+// PrepareProgram for a predicted draw or dispatch, whose registers may not be the ones it runs
+// with: vertex tables are read from the backing store (no fault, no readback), and what
+// PrepareProgram stops the emulator on (an unmapped shader, an unsupported state) gives nullopt.
+std::optional<ShaderParams> TryPrepareProgram(const HW::VertexShaderInfo& regs,
+                                              const HW::Context&          context,
+                                              const HW::UserConfig&       user_config,
+                                              ShaderVertexInputInfo&      input_info);
+std::optional<ShaderParams>
+TryPrepareProgram(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
+                  std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+                  ShaderPixelInputInfo&                               input_info);
+std::optional<ShaderParams> TryPrepareProgram(const HW::ComputeShaderInfo& regs,
+                                              const HW::ShaderRegisters&   sh,
+                                              ShaderComputeInputInfo&      input_info);
 
 } // namespace Libs::Graphics
 

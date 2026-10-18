@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <optional>
 #include <algorithm>
 #include <array>
 
@@ -59,9 +60,9 @@ HostFormatInfo ResolveHostFormat(Prospero::BufferFormat guest_format,
 
 } // namespace
 
-RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layout,
-                                                    Prospero::ChannelType   type,
-                                                    Prospero::ChannelOrder  order) {
+std::optional<RenderTargetFormatInfo>
+TextureTryGetRenderTargetFormat(Prospero::ChannelLayout layout, Prospero::ChannelType type,
+                                Prospero::ChannelOrder order) {
 	const auto encoding = Prospero::ResolveRenderTargetFormat(layout, type);
 	if (encoding.IsValid() && encoding.SupportsOrder(order)) {
 		const auto backing_format = encoding.buffer_format == Prospero::BufferFormat::k11_11_10UNorm
@@ -72,9 +73,19 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layo
 		if (host_format.format != vk::Format::eUndefined && bytes != 0) {
 			const auto order_mapping =
 			    kRenderTargetColorMappings[static_cast<size_t>(order)][encoding.components - 1u];
-			return {host_format.format, bytes, host_format.host_to_storage.Then(order_mapping),
-			        encoding.buffer_format};
+			return RenderTargetFormatInfo {host_format.format, bytes,
+			                               host_format.host_to_storage.Then(order_mapping),
+			                               encoding.buffer_format};
 		}
+	}
+	return std::nullopt;
+}
+
+RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layout,
+                                                    Prospero::ChannelType   type,
+                                                    Prospero::ChannelOrder  order) {
+	if (const auto info = TextureTryGetRenderTargetFormat(layout, type, order)) {
+		return *info;
 	}
 	EXIT("unsupported render-target format combination: layout=%u type=%u order=%u\n",
 	     static_cast<uint32_t>(layout), static_cast<uint32_t>(type), static_cast<uint32_t>(order));

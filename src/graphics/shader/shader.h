@@ -335,6 +335,8 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// Changes whenever ShaderMapUserData maps a shader (an address may get other code).
+uint64_t ShaderMapGeneration();
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
