@@ -185,4 +185,101 @@ private:
 
 static_assert(sizeof(Inst) <= 120, "Inst operand and backend storage unintentionally increased");
 
+
+// Hot in every pass and in SRT evaluation: defined here so they inline.
+inline bool Value::IsEmpty() const {
+	return type == Type::Void;
+}
+
+inline bool Value::IsImmediate() const {
+	return type != Type::Opaque;
+}
+
+inline bool Value::IsIdentity() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
+}
+
+inline bool Value::IsPhi() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
+}
+
+inline Type Value::GetType() const {
+	if (IsPhi()) {
+		return inst->Flags<Type>();
+	}
+	if (IsIdentity()) {
+		return inst->Arg(0).GetType();
+	}
+	return type == Type::Opaque ? inst->GetType() : type;
+}
+
+inline Inst* Value::TryInstruction() const {
+	return type == Type::Opaque ? inst : nullptr;
+}
+
+inline Inst* Value::ResolveInstruction() const {
+	EXIT_IF(type != Type::Opaque);
+	return IsIdentity() ? inst->Arg(0).ResolveInstruction() : inst;
+}
+
+inline Value Value::Resolve() const {
+	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
+}
+
+inline bool Value::U1() const {
+	EXIT_IF(type != Type::U1);
+	return imm_u1;
+}
+
+inline uint8_t Value::U8() const {
+	EXIT_IF(type != Type::U8);
+	return imm_u8;
+}
+
+inline uint16_t Value::U16() const {
+	EXIT_IF(type != Type::U16);
+	return imm_u16;
+}
+
+inline uint32_t Value::U32() const {
+	EXIT_IF(type != Type::U32);
+	return imm_u32;
+}
+
+inline uint64_t Value::U64() const {
+	EXIT_IF(type != Type::U64);
+	return imm_u64;
+}
+
+inline float Value::F32Value() const {
+	EXIT_IF(type != Type::F32);
+	return std::bit_cast<float>(imm_u32);
+}
+
+inline ValueOpcode Inst::GetOpcode() const {
+	return opcode;
+}
+
+inline Type Inst::GetType() const {
+	if (opcode == ValueOpcode::Phi) {
+		return static_cast<Type>(flags);
+	}
+	if (opcode == ValueOpcode::Identity && num_args != 0) {
+		return Arg(0).GetType();
+	}
+	return TypeOf(opcode);
+}
+
+inline size_t Inst::NumArgs() const {
+	return num_args == PhiArity ? phi_args.size() : num_args;
+}
+
+inline Value Inst::Arg(size_t index) const {
+	EXIT_IF(index >= NumArgs());
+	if (num_args <= InlineArity) {
+		return fixed_args[index];
+	}
+	return num_args == PhiArity ? phi_args[index].second : large_args[index];
+}
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR

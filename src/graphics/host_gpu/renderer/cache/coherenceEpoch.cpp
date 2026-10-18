@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/coherenceEpoch.h"
+#include "graphics/host_gpu/renderer/cache/srtPageWatch.h"
 
 #include "common/frameProfiler.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -34,6 +35,8 @@ void CoherenceEpoch::Acquire() {
 		FrameProfiler::RecordEvent(FrameProfiler::Event::EpochAcquire, m_epoch_id, 0);
 		FrameProfiler::Add(FrameProfiler::Counter::EpochAcquires);
 	}
+	// Prefetched evaluations from before it did not see the CPU writes it publishes.
+	SrtPageWatch::Guest().Advance();
 	UploadPending();
 }
 

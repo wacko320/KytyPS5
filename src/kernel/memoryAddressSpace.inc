@@ -70,7 +70,8 @@ public:
 		AddressRangeUnavailable,
 	};
 
-	explicit GuestBackingStore(uint64_t size): m_size(size) {
+	explicit GuestBackingStore(uint64_t size)
+	    : m_size(size), m_backing_maps((size + AliasPageSize - 1u) / AliasPageSize) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		m_handle = CreateFileMappingA(
 		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
@@ -254,6 +255,28 @@ public:
 		return true;
 	}
 
+	// Whether another mapping holds backing bytes of [vaddr, vaddr + size): the guest sees them at
+	// more than one address.
+	bool IsBackingAliased(uint64_t vaddr, uint64_t size) {
+		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		MapEntry         entry {};
+		if (!FindContainingUnlocked(vaddr, size, &entry)) {
+			return false;
+		}
+		const auto offset = entry.backing_offset + vaddr - entry.vaddr;
+		const auto last   = (offset + size - 1u) / AliasPageSize;
+		for (auto page = offset / AliasPageSize; page <= last && page < m_backing_maps.size();
+		     page++) {
+			if (m_backing_maps[page] > 1) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	// Writes the parts of the range a mapping holds, skipping the rest; the bytes written.
 	uint64_t WriteMappedBacking(uint64_t vaddr, const void* data, uint64_t size) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
@@ -369,7 +392,7 @@ public:
 
 		{
 			std::lock_guard lock(m_mutex);
-			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
+			EXIT_IF(!InsertMapUnlocked(MapEntry {vaddr, size, backing_offset, mode}));
 		}
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
@@ -380,7 +403,7 @@ public:
 			return false;
 		}
 		RemoveMappingsUnlocked(vaddr, size);
-		EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
+		EXIT_IF(!InsertMapUnlocked(MapEntry {vaddr, size, backing_offset, mode}));
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
 #endif
@@ -467,7 +490,7 @@ public:
 				if (vaddr + size <= entry->second.vaddr + entry->second.size) {
 					old = entry->second;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-					m_maps.erase(entry);
+					EraseMapUnlocked(entry);
 #endif
 				}
 			}
@@ -487,7 +510,7 @@ public:
 			    UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
 			if (!unmapped) {
 				std::lock_guard lock(m_mutex);
-				m_maps.emplace(old.vaddr, old);
+				InsertMapUnlocked(old);
 				return false;
 			}
 			if (placeholder_preserved != nullptr) {
@@ -531,7 +554,7 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
-		m_maps.emplace(old.vaddr, old);
+		InsertMapUnlocked(old);
 		return false;
 #else
 		// Replace only the requested range so concurrent accesses and GPU watch
@@ -596,18 +619,42 @@ private:
 				++it;
 				continue;
 			}
-			it = m_maps.erase(it);
+			it = EraseMapUnlocked(it);
 			if (old.vaddr < vaddr) {
-				m_maps.emplace(old.vaddr,
-				               MapEntry {old.vaddr, vaddr - old.vaddr, old.backing_offset, old.mode});
+				InsertMapUnlocked(
+				    MapEntry {old.vaddr, vaddr - old.vaddr, old.backing_offset, old.mode});
 			}
 			if (end < old_end) {
-				m_maps.emplace(end, MapEntry {end, old_end - end,
-				                             old.backing_offset + end - old.vaddr, old.mode});
+				InsertMapUnlocked(
+				    MapEntry {end, old_end - end, old.backing_offset + end - old.vaddr, old.mode});
 			}
 		}
 	}
 #endif
+
+	// Every change to m_maps goes through these two, which keep m_backing_maps.
+	bool InsertMapUnlocked(const MapEntry& entry) {
+		if (!m_maps.emplace(entry.vaddr, entry).second) {
+			return false;
+		}
+		CountBackingMapsUnlocked(entry, 1);
+		return true;
+	}
+	std::map<uint64_t, MapEntry>::iterator
+	EraseMapUnlocked(std::map<uint64_t, MapEntry>::iterator entry) {
+		CountBackingMapsUnlocked(entry->second, -1);
+		return m_maps.erase(entry);
+	}
+	void CountBackingMapsUnlocked(const MapEntry& entry, int delta) {
+		if (entry.size == 0) {
+			return;
+		}
+		const auto last = (entry.backing_offset + entry.size - 1u) / AliasPageSize;
+		for (auto page = entry.backing_offset / AliasPageSize;
+		     page <= last && page < m_backing_maps.size(); page++) {
+			m_backing_maps[page] = static_cast<uint16_t>(m_backing_maps[page] + delta);
+		}
+	}
 
 	bool FindContainingUnlocked(uint64_t vaddr, uint64_t size, MapEntry* out) const {
 		EXIT_IF(out == nullptr);
@@ -743,6 +790,10 @@ private:
 	uint64_t                     m_size         = 0;
 	std::shared_mutex            m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
+	// The mappings over each AliasPageSize page of the backing: more than one shows its bytes at
+	// several guest addresses.
+	static constexpr uint64_t AliasPageSize = 4096;
+	std::vector<uint16_t>     m_backing_maps;
 };
 
 class GuestAddressSpace {
@@ -838,6 +889,10 @@ public:
 
 	bool BackingView(uint64_t vaddr, uint64_t size, GuestBackingView* out) {
 		return m_backing->BackingView(vaddr, size, out);
+	}
+
+	bool IsBackingAliased(uint64_t vaddr, uint64_t size) {
+		return m_backing->IsBackingAliased(vaddr, size);
 	}
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {

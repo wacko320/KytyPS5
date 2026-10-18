@@ -70,6 +70,7 @@ struct ResourceSpecialization {
 ResourcePlan ExtractResourcePlan(const Program& program);
 
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
+// The result depends only on the plan, the runtime and the words its readers return.
 // With bindless_fallback_pcs, a failure caused by a sampled image's indirect table (a candidate
 // that cannot be bound, incompatible candidates, more than MaxIndirectImageCandidates, an
 // unreadable table, or captured table reads next to address writes) also appends the root image's
@@ -78,6 +79,19 @@ ResourcePlan ExtractResourcePlan(const Program& program);
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
                           std::vector<uint32_t>* bindless_fallback_pcs = nullptr);
+
+// Enables or silences this thread's specialization-failure reports while in scope. Speculative
+// evaluations read bytes that may be stale and discard failed results.
+class SpecializationFailureReports {
+public:
+	explicit SpecializationFailureReports(bool enabled);
+	~SpecializationFailureReports();
+	SpecializationFailureReports(const SpecializationFailureReports&)            = delete;
+	SpecializationFailureReports& operator=(const SpecializationFailureReports&) = delete;
+
+private:
+	bool m_previous;
+};
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);

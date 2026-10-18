@@ -153,6 +153,14 @@ bool                   ReadGpuWrittenBacking(uint64_t vaddr, void* data, uint64_
 // GPU thread (or no GPU): the backing store's view of a range no GPU write has made stale (no
 // GPU-dirty buffer bytes, no GPU-written image), or nullptr.
 [[nodiscard]] const uint8_t* TryViewGpuCleanBacking(uint64_t vaddr, uint64_t size);
+// GPU thread: no byte of the range is GPU-written or under a GPU-written image,
+// or waiting for a download or other deferred write to publish it, and no other guest address
+// shows its backing: guest memory holds its final bytes, and every change to them is reported
+// at this address (SrtPageWatch).
+[[nodiscard]] bool IsBackingSettled(uint64_t vaddr, uint64_t size);
+// GPU thread: buffer bytes of the range the GPU wrote and the CPU has not read back
+// (RenderContext::IsGpuWrittenUnread); false elsewhere.
+[[nodiscard]] bool IsGpuWrittenUnread(uint64_t vaddr, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);

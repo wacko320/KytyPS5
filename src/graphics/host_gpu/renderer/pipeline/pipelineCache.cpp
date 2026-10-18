@@ -13,7 +13,9 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/cache/srtPageWatch.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/resourcePrefetch.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -33,6 +35,7 @@
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -130,6 +133,20 @@ struct CheckedReadScope {
 	KYTY_CLASS_NO_COPY(CheckedReadScope);
 };
 
+// The page's backing view if the whole page is GPU-clean, else nullptr; checked once per scope.
+const uint8_t* CheckedPageView(CheckedReadPages& pages, uint64_t page) {
+	for (size_t i = 0; i < CheckedReadPages::Ways; i++) {
+		if (pages.tags[i] == (page | 1u)) {
+			return pages.views[i];
+		}
+	}
+	const auto* view  = Libs::LibKernel::Memory::TryViewGpuCleanBacking(page, 4096);
+	const auto  slot  = pages.next++ % CheckedReadPages::Ways;
+	pages.tags[slot]  = page | 1u;
+	pages.views[slot] = view;
+	return view;
+}
+
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	if (values.empty()) {
 		return false;
@@ -138,21 +155,7 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	auto&      pages = t_checked_pages;
 	const auto page  = address & ~uint64_t {4095};
 	if (pages.active && address + bytes <= page + 4096) {
-		const uint8_t* view  = nullptr;
-		bool           found = false;
-		for (size_t i = 0; i < CheckedReadPages::Ways; i++) {
-			if (pages.tags[i] == (page | 1u)) {
-				view  = pages.views[i];
-				found = true;
-				break;
-			}
-		}
-		if (!found) {
-			view              = Libs::LibKernel::Memory::TryViewGpuCleanBacking(page, 4096);
-			const auto slot   = pages.next++ % CheckedReadPages::Ways;
-			pages.tags[slot]  = page | 1u;
-			pages.views[slot] = view;
-		}
+		const auto* view = CheckedPageView(pages, page);
 		if (view != nullptr) {
 			std::memcpy(values.data(), view + (address - page), bytes);
 			return true;
@@ -192,6 +195,90 @@ bool ReadOrdinaryGuestMemory(void* userdata, uint64_t address, std::span<uint32_
 	}
 	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	return true;
+}
+
+// The compiled SRT walker loads table levels through the guest pointer. It may, inside a checked
+// scope on the GPU thread, where every page of the level is mapped and GPU-clean as a whole
+// (the view ReadShaderGuestMemory would read): no GPU-dirty byte to read back, no GPU-written
+// image, nothing unmapped (Wolverine's null tables). Otherwise the walk takes
+// ReadOrdinaryGuestMemory, which also leaves data-only slots over GPU-written bytes to a GPU copy.
+bool CanLoadGuestTableRaw(void*, uint64_t address, uint64_t size) {
+	auto& pages = t_checked_pages;
+	if (!pages.active || size == 0 || address > UINT64_MAX - size) {
+		return false;
+	}
+	for (auto page = address & ~uint64_t {4095}; page < address + size; page += 4096) {
+		if (CheckedPageView(pages, page) == nullptr) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Prefetch workers read the backing store: guest pages the GPU thread protects would fault.
+const void* ViewGuestPage(uint64_t page) {
+	Libs::LibKernel::Memory::GuestBackingView view {};
+	return Libs::LibKernel::Memory::GetGuestBackingView(page, ResourcePrefetcher::PageSize, &view)
+	           ? view.pointer
+	           : nullptr;
+}
+
+// GPU thread: whether a prefetch replay that read the page may settle it (SrtPageWatch).
+bool IsSettledGuestPage(uint64_t page) {
+	const uint64_t profile_t0 = Common::FrameProfiler::Start();
+	const bool settled = Libs::LibKernel::Memory::IsBackingSettled(page, SrtPageWatch::PageSize);
+	if (profile_t0 != 0) {
+		Common::FrameProfiler::Add(Common::FrameProfiler::Counter::SettleChecks);
+		Common::FrameProfiler::AddSince(Common::FrameProfiler::Counter::SettleCheckTime,
+		                                profile_t0);
+	}
+	return settled;
+}
+
+// Samples the prefetch and SRT page-watch statistics for a running frame-profiler capture.
+void ProfilePrefetchStats(const ResourcePrefetcher* prefetcher) {
+	using Common::FrameProfiler::Gauge;
+	using Common::FrameProfiler::SetGaugeValue;
+	SetGaugeValue(Gauge::SrtWatchGeneration, SrtPageWatch::Guest().Generation());
+	SetGaugeValue(Gauge::SrtWatchSettles, SrtPageWatch::Guest().SettleCount());
+	if (prefetcher == nullptr) {
+		return;
+	}
+	const auto& stats = prefetcher->GetStats();
+	SetGaugeValue(Gauge::PrefetchSubmitted, stats.submitted);
+	SetGaugeValue(Gauge::PrefetchHits, stats.hits);
+	SetGaugeValue(Gauge::PrefetchUnmatched, stats.unmatched);
+	SetGaugeValue(Gauge::PrefetchMismatched, stats.mismatched);
+	SetGaugeValue(Gauge::PrefetchCancelled, stats.cancelled);
+	SetGaugeValue(Gauge::PrefetchFailed, stats.failed);
+	SetGaugeValue(Gauge::PrefetchStale, stats.stale);
+	SetGaugeValue(Gauge::PrefetchThrottled, stats.throttled);
+	SetGaugeValue(Gauge::PrefetchUnreplayed, stats.unreplayed);
+	SetGaugeValue(Gauge::PrefetchReplayMismatches, stats.replay_mismatches);
+	SetGaugeValue(Gauge::PrefetchFlushes, stats.flushes);
+	SetGaugeValue(Gauge::PrefetchFlushedJobs, stats.flushed_jobs);
+}
+
+// A result accepted on settled pages whose replay differs means a missed SrtPageWatch report
+// (MemoryOps::replay_check, debug builds): logged, sparsely.
+void ReportReplayMismatches(const ResourcePrefetcher& prefetcher, uint64_t shader_hash) {
+	static uint64_t reported   = 0;
+	const auto      mismatches = prefetcher.GetStats().replay_mismatches;
+	if (mismatches == reported) {
+		return;
+	}
+	reported = mismatches;
+	if (mismatches <= 64 || (mismatches & (mismatches - 1)) == 0) {
+		LOGF("PipelineCache: a prefetched evaluation accepted on settled pages differs from its "
+		     "replay (%" PRIu64 " so far), shader 0x%016" PRIx64 "\n",
+		     mismatches, shader_hash);
+	}
+}
+
+// The draw-prep prefetcher's worker count.
+uint32_t DrawPrepThreads() {
+	// Two keep up with a draw every ~20 us; more mostly compete with the guest's threads.
+	return std::clamp(std::thread::hardware_concurrency() / 6u, 1u, 3u);
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -334,11 +421,47 @@ struct PipelineCache::ProgramCache {
 		// Materializes the plan. When an indirect image table cannot be specialized for this
 		// runtime, its image is added to bindless_pcs and false is returned: the program must be
 		// translated again (with CompileOptions::bindless_image_pcs) and its plan extracted again.
-		bool Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime) {
+		// A prefetch worker's result is used when one was accepted (ResourcePrefetcher).
+		bool Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime,
+		                 ResourcePrefetcher* prefetcher) {
+			using Common::FrameProfiler::Counter;
+			const bool profiling = Common::FrameProfiler::Active();
+			const Common::FrameProfiler::ScopedPhase profile_phase(
+			    Common::FrameProfiler::Phase::Materialize, profiling);
+			if (profiling) {
+				Common::FrameProfiler::Add(Counter::Materializations);
+				Common::FrameProfiler::Add(Counter::MaterializeSrtReads,
+				                           resource_plan.srt_reads.size());
+				ProfilePrefetchStats(prefetcher);
+			}
 			const CheckedReadScope checked_reads;
+			if (prefetcher != nullptr && !replica_views.empty()) {
+				const uint64_t try_t0 = profiling ? Common::FrameProfiler::Ticks() : 0;
+				const bool     hit =
+				    prefetcher->TryMaterialize(this, runtime, resources, specialization);
+				if (try_t0 != 0) {
+					const uint64_t ticks = Common::FrameProfiler::Ticks() - try_t0;
+					Common::FrameProfiler::Add(Counter::PrefetchTries);
+					Common::FrameProfiler::Add(Counter::PrefetchTryTime, ticks);
+					if (hit) {
+						Common::FrameProfiler::Add(Counter::PrefetchHits);
+						Common::FrameProfiler::Add(Counter::PrefetchHitTime, ticks);
+					}
+				}
+				ReportReplayMismatches(*prefetcher, resource_plan.shader_hash);
+				if (hit) {
+					return true;
+				}
+			}
+			const uint64_t plain_t0 = profiling ? Common::FrameProfiler::Ticks() : 0;
 			std::vector<uint32_t> pcs;
-			if (ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-			                                               specialization, &pcs)) {
+			const bool materialized = ShaderRecompiler::IR::MaterializeResources(
+			    resource_plan, runtime, resources, specialization, &pcs);
+			if (plain_t0 != 0) {
+				Common::FrameProfiler::Add(Counter::PlainMaterializations);
+				Common::FrameProfiler::AddSince(Counter::PlainMaterializeTime, plain_t0);
+			}
+			if (materialized) {
 				return true;
 			}
 			bool added = false;
@@ -358,8 +481,8 @@ struct PipelineCache::ProgramCache {
 
 		template <bool HasCalls>
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                             uint32_t push_data_cursor) {
-			if (!Materialize(runtime)) {
+		                             uint32_t push_data_cursor, ResourcePrefetcher* prefetcher) {
+			if (!Materialize(runtime, prefetcher)) {
 				return nullptr;
 			}
 			for (auto& candidate: permutations) {
@@ -387,7 +510,85 @@ struct PipelineCache::ProgramCache {
 		// (sticky for the entry), and how often the plan changed because of them.
 		std::vector<uint32_t>                       bindless_pcs;
 		uint32_t                                    plan_generation = 0;
+		// One independent copy of the plan per prefetch worker: evaluation keeps scratch in
+		// the plan. Empty when the plan is not speculated.
+		std::vector<std::unique_ptr<ShaderRecompiler::IR::ResourcePlan>> replicas;
+		std::vector<const ShaderRecompiler::IR::ResourcePlan*>           replica_views;
 	};
+
+	// How a stage's MaterializeResources input follows from its registers, learned from the
+	// last draw that ran the shader at an address.
+	enum class PrefetchSlot : uint32_t { Pixel, Vertex, Compute, Count };
+	struct Prediction {
+		SourceEntry*            entry        = nullptr;
+		uint64_t                shader_base  = 0;
+		uint32_t                prefix_count = 0;
+		std::array<uint32_t, 8> prefix {};
+		// A GS back half receives its user-data address in s0:s1.
+		bool prefix_is_gs_address = false;
+	};
+
+	// After the entry's plan was (re)extracted from `program`: one copy per worker. Workers may
+	// still be evaluating the old copies, so the prefetcher drops and waits for their jobs.
+	void ResetReplicas(SourceEntry& entry, const ShaderRecompiler::IR::Program& program) {
+		if (prefetcher == nullptr) {
+			return;
+		}
+		if (!entry.replicas.empty()) {
+			prefetcher->ClearAndWait();
+			entry.replica_views.clear();
+			entry.replicas.clear();
+		}
+		if (!ResourcePrefetcher::CanSpeculate(entry.resource_plan)) {
+			return;
+		}
+		for (uint32_t i = 0; i < prefetcher->WorkerCount(); i++) {
+			entry.replicas.push_back(std::make_unique<ShaderRecompiler::IR::ResourcePlan>(
+			    ShaderRecompiler::IR::ExtractResourcePlan(program)));
+			entry.replica_views.push_back(entry.replicas.back().get());
+		}
+	}
+
+	void Learn(PrefetchSlot slot, uint64_t shader_address, const ShaderParams& params,
+	           uint32_t sgpr_count, uint64_t gs_user_data_address) {
+		auto*      entry     = last_materialized;
+		const auto user_data = std::span(params.user_data).first(params.user_data_count);
+		if (prefetcher == nullptr || entry == nullptr || entry->replica_views.empty() ||
+		    sgpr_count > user_data.size() ||
+		    user_data.size() - sgpr_count > Prediction {}.prefix.size()) {
+			return;
+		}
+		auto& prediction        = predictions[static_cast<uint32_t>(slot)][shader_address];
+		prediction.entry        = entry;
+		prediction.shader_base  = params.Base();
+		prediction.prefix_count = static_cast<uint32_t>(user_data.size()) - sgpr_count;
+		std::copy_n(user_data.begin(), prediction.prefix_count, prediction.prefix.begin());
+		prediction.prefix_is_gs_address =
+		    prediction.prefix_count >= 2 && gs_user_data_address != 0 &&
+		    user_data[0] == static_cast<uint32_t>(gs_user_data_address) &&
+		    user_data[1] == static_cast<uint32_t>(gs_user_data_address >> 32u);
+	}
+
+	void Speculate(uint64_t draw, PrefetchSlot slot, uint64_t shader_address,
+	               const HW::UserSgprInfo& sgprs, uint32_t sgpr_count,
+	               uint64_t gs_user_data_address, std::span<const uint32_t> workgroup_counts) {
+		const auto& table = predictions[static_cast<uint32_t>(slot)];
+		const auto  found = table.find(shader_address);
+		if (found == table.end() || sgpr_count > HW::UserSgprInfo::SGPRS_MAX) {
+			return;
+		}
+		const auto& prediction = found->second;
+		std::array<uint32_t, 8 + HW::UserSgprInfo::SGPRS_MAX> user_data {};
+		std::copy_n(prediction.prefix.begin(), prediction.prefix_count, user_data.begin());
+		if (prediction.prefix_is_gs_address) {
+			user_data[0] = static_cast<uint32_t>(gs_user_data_address);
+			user_data[1] = static_cast<uint32_t>(gs_user_data_address >> 32u);
+		}
+		std::copy_n(sgprs.value, sgpr_count, user_data.begin() + prediction.prefix_count);
+		prefetcher->Submit(draw, prediction.entry, prediction.entry->replica_views,
+		                   std::span(user_data).first(prediction.prefix_count + sgpr_count),
+		                   prediction.shader_base, workgroup_counts);
+	}
 
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
@@ -453,6 +654,7 @@ struct PipelineCache::ProgramCache {
 			stage = ShaderType::Compute;
 		}
 
+		last_materialized    = nullptr;
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
@@ -465,6 +667,8 @@ struct PipelineCache::ProgramCache {
 		    .shader_base                = params.Base(),
 		    .read_memory                = ReadOrdinaryGuestMemory,
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .gpu_written                = Libs::LibKernel::Memory::IsGpuWrittenUnread,
+		    .raw_table_reads            = CanLoadGuestTableRaw,
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
@@ -481,13 +685,17 @@ struct PipelineCache::ProgramCache {
 			Permutation* permutation = nullptr;
 			if (cached.call_source) {
 				source_changed = cached.RefreshCallSource(runtime);
-				if (!source_changed) permutation = cached.FindPermutation<true>(runtime, push_data_cursor);
+				if (!source_changed)
+					permutation = cached.FindPermutation<true>(runtime, push_data_cursor,
+					                                           prefetcher.get());
 			} else {
-				permutation = cached.FindPermutation<false>(runtime, push_data_cursor);
+				permutation =
+				    cached.FindPermutation<false>(runtime, push_data_cursor, prefetcher.get());
 			}
 			if (permutation != nullptr) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
+				last_materialized = &entry->second;
 				return permutation->handle;
 			}
 		}
@@ -561,23 +769,28 @@ struct PipelineCache::ProgramCache {
 		auto translated = translate();
 		// Tables that cannot be specialized move to the bindless heap; each retry adds new pcs.
 		const auto materialize = [&]() {
-			while (!entry->second.Materialize(runtime)) {
+			while (!entry->second.Materialize(runtime, prefetcher.get())) {
 				translated = translate();
 				entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+				ResetReplicas(entry->second, translated.program);
 			}
 		};
 		if (entry == programs.end()) {
 			auto retained = source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
+			ResetReplicas(entry->second, translated.program);
 			current = entry->second.call_source.get();
 			materialize();
 		} else if (source_changed || plan_generation != entry->second.plan_generation) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			ResetReplicas(entry->second, translated.program);
 			materialize();
-			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor)) {
+			if (const auto* permutation = entry->second.FindPermutation<true>(
+			        runtime, push_data_cursor, prefetcher.get())) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
+				last_materialized = &entry->second;
 				return permutation->handle;
 			}
 		}
@@ -588,6 +801,7 @@ struct PipelineCache::ProgramCache {
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
+		last_materialized = &entry->second;
 
 		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
 		for (const auto& [key, source]: programs) {
@@ -607,6 +821,12 @@ struct PipelineCache::ProgramCache {
 
 	explicit ProgramCache(GraphicContext& graphics): graphics(graphics) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
+		prefetcher = std::make_unique<ResourcePrefetcher>(
+		    DrawPrepThreads(),
+		    ResourcePrefetcher::MemoryOps {.view_page    = ViewGuestPage,
+		                                   .watch        = &SrtPageWatch::Guest(),
+		                                   .page_settled = IsSettledGuestPage,
+		                                   .replay_check = KYTY_BUILD == KYTY_BUILD_DEBUG});
 	}
 	~ProgramCache() {
 		for (const auto& [key, entry]: programs) {
@@ -621,6 +841,14 @@ struct PipelineCache::ProgramCache {
 	ProgramKey                                                  lookup_key;
 	GraphicContext&                                             graphics;
 	uint64_t                                                    next_shader_id = 0;
+	// The entry the last Get materialized, for Learn.
+	SourceEntry* last_materialized = nullptr;
+	std::array<std::unordered_map<uint64_t, Prediction>,
+	           static_cast<size_t>(PrefetchSlot::Count)>
+	    predictions;
+	uint64_t next_prefetch_draw = 0;
+	// Declared last: its workers evaluate the plans above, so it stops first.
+	std::unique_ptr<ResourcePrefetcher> prefetcher;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
@@ -922,11 +1150,19 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id);
 	GraphicsPrograms  result;
+	auto&             programs = *m_program_cache;
+	using Slot                 = ProgramCache::PrefetchSlot;
 	if (pixel_active) {
-		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		result.pixel = programs.Get(pixel_params, pixel_info, push_data_cursor);
+		programs.Learn(Slot::Pixel, pixel_regs.ps_regs.data_addr, pixel_params,
+		               pixel_regs.ps_regs.rsrc2.user_sgpr, 0);
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+		result.vertex[i] = programs.Get(vertex_params[i], vertex_info[i], push_data_cursor);
+	}
+	if (!tess_active) {
+		programs.Learn(Slot::Vertex, vertex_regs.es_regs.data_addr, vertex_params[0],
+		               vertex_regs.gs_regs.rsrc2.user_sgpr, vertex_regs.gs_regs.user_data_addr);
 	}
 	return result;
 }
@@ -939,7 +1175,83 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t          push_data_cursor = 0;
-	return m_program_cache->Get(params, input_info, push_data_cursor);
+	auto              program = m_program_cache->Get(params, input_info, push_data_cursor);
+	m_program_cache->Learn(ProgramCache::PrefetchSlot::Compute, regs.cs_regs.data_addr, params,
+	                       regs.cs_regs.user_sgpr, 0);
+	return program;
+}
+
+bool PipelineCache::PrefetchEnabled() const {
+	return m_program_cache->prefetcher != nullptr;
+}
+
+uint64_t PipelineCache::PrefetchDraw(const HW::Shader& shaders, const HW::UserConfig& user_config) {
+	auto&      programs = *m_program_cache;
+	const auto draw     = ++programs.next_prefetch_draw;
+	if (programs.prefetcher == nullptr ||
+	    user_config.GetPrimType() == Prospero::PrimitiveType::kPatch) {
+		return draw;
+	}
+	using Slot     = ProgramCache::PrefetchSlot;
+	const auto& ps = shaders.GetPs();
+	const auto& vs = shaders.GetVs();
+	// In the order the draw materializes them.
+	if (ps.ps_regs.data_addr != 0) {
+		programs.Speculate(draw, Slot::Pixel, ps.ps_regs.data_addr, ps.ps_user_sgpr,
+		                   ps.ps_regs.rsrc2.user_sgpr, 0, {});
+	}
+	if (vs.es_regs.data_addr != 0) {
+		programs.Speculate(draw, Slot::Vertex, vs.es_regs.data_addr, vs.gs_user_sgpr,
+		                   vs.gs_regs.rsrc2.user_sgpr, vs.gs_regs.user_data_addr, {});
+	}
+	return draw;
+}
+
+uint64_t PipelineCache::PrefetchDispatch(const HW::Shader&              shaders,
+                                         const std::array<uint32_t, 3>& workgroup_counts) {
+	auto&       programs = *m_program_cache;
+	const auto  draw     = ++programs.next_prefetch_draw;
+	const auto& cs       = shaders.GetCs();
+	if (programs.prefetcher != nullptr && cs.cs_regs.data_addr != 0) {
+		programs.Speculate(draw, ProgramCache::PrefetchSlot::Compute, cs.cs_regs.data_addr,
+		                   cs.cs_user_sgpr, cs.cs_regs.user_sgpr, 0, workgroup_counts);
+	}
+	return draw;
+}
+
+void PipelineCache::BeginPrefetchedDraw(uint64_t draw) {
+	if (m_program_cache->prefetcher != nullptr) {
+		m_program_cache->prefetcher->BeginDraw(draw);
+	}
+}
+
+void PipelineCache::ClearPrefetch() {
+	if (m_program_cache->prefetcher != nullptr) {
+		m_program_cache->prefetcher->Clear();
+	}
+}
+
+void PipelineCache::BeginPrefetchBatch() {
+	if (m_program_cache->prefetcher != nullptr) {
+		m_program_cache->prefetcher->BeginBatch();
+	}
+}
+
+void PipelineCache::FlushPrefetch() {
+	if (m_program_cache->prefetcher != nullptr) {
+		m_program_cache->prefetcher->Flush();
+	}
+}
+
+void PipelineCache::SetPrefetchReplayCheck(bool enabled) {
+	if (m_program_cache->prefetcher != nullptr) {
+		m_program_cache->prefetcher->SetReplayCheck(enabled);
+	}
+}
+
+ResourcePrefetcher::Stats PipelineCache::GetPrefetchStats() const {
+	return m_program_cache->prefetcher != nullptr ? m_program_cache->prefetcher->GetStats()
+	                                              : ResourcePrefetcher::Stats {};
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {

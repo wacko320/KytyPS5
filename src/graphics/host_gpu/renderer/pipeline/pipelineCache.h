@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/pipeline/resourcePrefetch.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
@@ -141,6 +142,25 @@ public:
 	                              const GraphicsPrograms& programs);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
+
+	// Resource materialization ahead of the command processor (see ResourcePrefetcher). The
+	// command processor numbers the draws it decodes ahead of execution and reports the one it
+	// executes next. GPU thread only.
+	// PrefetchDraw and PrefetchDispatch return the number they gave the draw (never 0).
+	[[nodiscard]] bool PrefetchEnabled() const;
+	uint64_t PrefetchDraw(const HW::Shader& shaders, const HW::UserConfig& user_config);
+	// `workgroup_counts`: what the dispatch's materialization will see (zero when indirect).
+	uint64_t PrefetchDispatch(const HW::Shader& shaders,
+	                          const std::array<uint32_t, 3>& workgroup_counts);
+	// Draw 0 matches no speculation.
+	void BeginPrefetchedDraw(uint64_t draw);
+	void ClearPrefetch();
+	// Speculation between these reaches the workers together (ResourcePrefetcher::BeginBatch).
+	void BeginPrefetchBatch();
+	void FlushPrefetch();
+	[[nodiscard]] ResourcePrefetcher::Stats GetPrefetchStats() const;
+	// See ResourcePrefetcher::MemoryOps::replay_check: on from the start in debug builds.
+	void SetPrefetchReplayCheck(bool enabled);
 
 private:
 	struct ProgramCache;

@@ -540,6 +540,18 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
 
+add_executable(resource_prefetch_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ResourcePrefetchTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/resourcePrefetch.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+)
+find_package(Threads REQUIRED)
+target_link_libraries(resource_prefetch_tests fmt::fmt xbyak::xbyak Threads::Threads)
+target_include_directories(resource_prefetch_tests PRIVATE ${inc_headers})
+
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
@@ -709,6 +721,7 @@ if(BUILD_TESTING)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
+	add_test(NAME resource_prefetch COMMAND $<TARGET_FILE:resource_prefetch_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
@@ -762,6 +775,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
 	add_test(NAME pm4_context_state
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
+	add_test(NAME pm4_lookahead_prefetch
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pm4-lookahead-only)
+	add_test(NAME gpu_flat_copy
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-flat-copy-only)
 	add_test(NAME gpu_tiler
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
 	add_test(NAME image_transfer_layout
@@ -808,6 +825,7 @@ if(BUILD_TESTING)
 		lru_cache_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
+		resource_prefetch_tests
 		resource_tracking_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests

@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -132,6 +133,7 @@ private:
 	OperationState               m_operation_state      = OperationState::Open;
 	bool                         m_host_barrier_requested = false;
 	std::function<void()>        m_pre_submit;
+	std::chrono::steady_clock::time_point m_last_refresh {};
 	bool                         m_in_pre_submit = false;
 	std::atomic<uint64_t>        m_submitted {0};
 };

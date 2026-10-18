@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGE_H_
 
 #include "common/alignment.h"
+#include "graphics/host_gpu/renderer/cache/srtPageWatch.h"
 #include "common/assert.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -95,13 +96,22 @@ public:
 		if (!IsCpuDirty()) {
 			EXIT("clean image cannot complete a refresh\n");
 		}
+		if (m_gpu_modified) {
+			SrtPageWatch::Guest().Unsettle(info.data.address, info.data.size);
+		}
 		m_cpu_dirty       = false;
 		m_maybe_cpu_dirty = false;
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
-	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
 	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
+	// Guest memory under a GPU-written image is not final (SrtPageWatch).
+	void MarkGpuModified() noexcept {
+		if (!m_gpu_modified) {
+			SrtPageWatch::Guest().Unsettle(info.data.address, info.data.size);
+		}
+		m_gpu_modified = true;
+	}
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept { m_buffer_modified = true; }

@@ -1,11 +1,15 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
+#include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
+#include <vector>
 
 namespace {
 
@@ -277,6 +281,107 @@ void TestNativeNestedSrtRefresh() {
   pointer_high.Instruction()->SetArg(1, Value(8u));
   Check(ExtractResourcePlan(program).srt_code == nullptr,
         "native SRT accepted nonadjacent nested pointer words");
+}
+
+// The GPU thread's runtime sets read_memory and raw_table_reads: the compiled walker runs and asks
+// before each table level, and a level it may not load raw (unmapped, as through Wolverine's null
+// table pointers, or GPU-written) sends the whole walk through read_memory.
+void TestNativeSrtRawTableCheck() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  std::array<uint32_t, 3> leaf_words{0u, 0x12345678u, 0xabcdef01u};
+  const auto pointer_words = [](uint64_t address) {
+    return std::array<uint32_t, 2>{static_cast<uint32_t>(address) | 3u,
+                                  static_cast<uint32_t>(address >> 32u) | 0xabcd0000u};
+  };
+  auto table = pointer_words(reinterpret_cast<uint64_t>(leaf_words.data()));
+  const auto user_data = pointer_words(reinterpret_cast<uint64_t>(table.data()));
+  auto program = SrtProgram(0u);
+  program.user_data_base = 4;
+  program.user_data_count = 2;
+  auto &block = *program.blocks[0];
+  const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto low = emit(ValueOpcode::GetUserData, {Value(ScalarReg(4))});
+  const auto high = emit(ValueOpcode::GetUserData, {Value(ScalarReg(5))});
+  const auto root = emit(ValueOpcode::GetAddressResource, {low, high});
+  const auto read = [&](Value address, uint32_t offset) {
+    const auto value = emit(ValueOpcode::LoadAddressU32,
+                            {address, Value(offset), Value(0u), Value(true)});
+    value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+    program.srt_reads.push_back(
+        {value, static_cast<uint32_t>(program.srt_reads.size())});
+    return value;
+  };
+  const auto pointer_low = read(root, 0u);
+  const auto pointer_high = read(root, 4u);
+  auto *leaf = program.srt_reads[0].value.Instruction();
+  leaf->Arg(0).Instruction()->SetArg(0, pointer_low);
+  leaf->Arg(0).Instruction()->SetArg(1, pointer_high);
+  leaf->SetArg(1, Value(7u));
+  read(leaf->Arg(0), 11u);
+  auto plan = ExtractResourcePlan(program);
+  Check(plan.srt_code != nullptr, "the two-level tree did not compile an x86 walker");
+
+  // Addresses below 64 KiB stand for unmapped memory: the reader returns zeros there, as
+  // ReadOrdinaryGuestMemory does, and the check refuses them.
+  struct Probe {
+    std::vector<std::pair<uint64_t, uint64_t>> checks;
+    uint64_t refused = UINT64_MAX;
+    uint32_t reads = 0;
+  } probe;
+  SrtRuntime runtime{
+      .user_data = user_data,
+      .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        ++static_cast<Probe *>(data)->reads;
+        if (address < 0x10000u) {
+          std::fill(words.begin(), words.end(), 0u);
+        } else {
+          std::memcpy(words.data(), reinterpret_cast<const void *>(address), words.size_bytes());
+        }
+        return true;
+      },
+      .userdata = &probe,
+      .raw_table_reads = +[](void *data, uint64_t address, uint64_t size) {
+        auto &probe = *static_cast<Probe *>(data);
+        probe.checks.emplace_back(address, size);
+        return address >= 0x10000u && (probe.refused < address || probe.refused >= address + size);
+      }};
+  const auto table_address = reinterpret_cast<uint64_t>(table.data());
+  const auto leaf_address = reinterpret_cast<uint64_t>(leaf_words.data());
+  const auto expected = [&] {
+    return std::vector<uint32_t>{leaf_words[1], table[0], table[1], leaf_words[2]};
+  };
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto run = [&](uint64_t refused) {
+    probe = {};
+    probe.refused = refused;
+    return MaterializeResources(plan, runtime, snapshot, specialization);
+  };
+
+  Check(run(UINT64_MAX) && probe.reads == 0 && snapshot.flattened_srt == expected() &&
+            probe.checks == std::vector<std::pair<uint64_t, uint64_t>>{{table_address, 8u},
+                                                                       {leaf_address + 4u, 8u}},
+        "the compiled walker did not run, or did not check each table level, under a reader");
+  Check(run(leaf_address + 8u) && probe.reads == 4u && snapshot.flattened_srt == expected(),
+        "a refused table level did not send the walk through the reader");
+  Check(run(table_address) && probe.reads == 4u && probe.checks.size() == 1u &&
+            snapshot.flattened_srt == expected(),
+        "a refused root level was loaded before the check");
+
+  // A null table pointer: the walk reads the leaf as zeros instead of loading near address 0.
+  table = pointer_words(0u);
+  Check(run(UINT64_MAX) && probe.reads == 4u &&
+            snapshot.flattened_srt == std::vector<uint32_t>{0u, table[0], table[1], 0u},
+        "a null table pointer was not read through the reader");
+  table = pointer_words(leaf_address);
+
+  // Without the check the reader keeps every read (the prefetch workers' runtime).
+  runtime.raw_table_reads = nullptr;
+  Check(run(UINT64_MAX) && probe.reads == 4u && probe.checks.empty() &&
+            snapshot.flattened_srt == expected(),
+        "the compiled walker bypassed a reader without a raw-read check");
 }
 
 void TestIntegerRuntimeValueFollowsSrtReads() {
@@ -1421,6 +1526,7 @@ void TestUnreadableFiniteImageCandidateIsNull() {
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestNativeNestedSrtRefresh();
+  TestNativeSrtRawTableCheck();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesRetainReadPolicy();
   TestUniformVectorDescriptorRead();

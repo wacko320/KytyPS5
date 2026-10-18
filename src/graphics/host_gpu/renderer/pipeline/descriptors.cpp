@@ -1129,6 +1129,42 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	}
 }
 
+// The flat-buffer dwords a snapshot leaves to the GPU (ResourceSnapshot::gpu_flat_copies): copied
+// from the cached buffers into this upload of the flat buffer, after the GPU work recorded before.
+static void CopyGpuFlatDwords(RenderContext& context, const vk::DescriptorBufferInfo& flat,
+                              std::span<const std::pair<uint32_t, uint64_t>> copies) {
+	auto& cache = context.GetBufferCache();
+	std::vector<std::pair<vk::Buffer, vk::BufferCopy>> regions;
+	regions.reserve(copies.size());
+	for (const auto& [dword, address]: copies) {
+		const auto [buffer, offset] = cache.TranslateRead(address, sizeof(uint32_t));
+		regions.push_back(
+		    {buffer->Handle(), vk::BufferCopy {offset, flat.offset + dword * sizeof(uint32_t),
+		                                       sizeof(uint32_t)}});
+	}
+	auto& scheduler = context.GetCommandScheduler();
+	auto& command   = scheduler.Current();
+	command.EndRendering();
+	const auto native = command.Handle();
+	scheduler.Timestamps().BeginRegion(native, GpuRegion::FlatCopy);
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+	                       nullptr);
+	for (const auto& [source, region]: regions) {
+		native.copyBuffer(source, flat.buffer, 1, &region);
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0, nullptr, 0,
+	                       nullptr);
+	scheduler.Timestamps().EndRegion(native, GpuRegion::FlatCopy);
+}
+
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -1156,6 +1192,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		if (!snapshot.gpu_flat_copies.empty()) {
+			CopyGpuFlatDwords(m_context, prepared.flattened_srt, snapshot.gpu_flat_copies);
+		}
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] != 0) {
 		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);

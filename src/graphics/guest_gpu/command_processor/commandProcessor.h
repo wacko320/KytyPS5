@@ -8,10 +8,13 @@
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
 namespace Libs::Graphics {
+
+class Pm4Lookahead;
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
 
@@ -62,14 +65,15 @@ public:
 		int64_t flip_arg  = 0;
 	};
 
-	CommandProcessor(RenderContext& renderer, int interrupt_event_id)
-	    : m_renderer(renderer), m_interrupt_event_id(interrupt_event_id) {}
-	~CommandProcessor() = default;
+	CommandProcessor(RenderContext& renderer, int interrupt_event_id);
+	~CommandProcessor();
 
 	KYTY_CLASS_NO_COPY(CommandProcessor);
 
 	void Reset();
 	void ApplyContextStateOperation(ContextStateOperation operation);
+	// The register and draw state packets set, for a lookahead processor.
+	void CopyRegisterState(const CommandProcessor& other);
 
 	void            BufferInit();
 	void            BufferFlush();
@@ -190,6 +194,13 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+
+	// Decodes draws ahead of execution for the pipeline cache's prefetch workers.
+	std::unique_ptr<Pm4Lookahead> m_lookahead;
+	bool                          m_lookahead_checked = false;
+	// The packet a handler is executing, within its command buffer (empty outside ProcessPm4).
+	std::span<const uint32_t> m_packet_commands;
+	uint32_t                  m_packet_offset = 0;
 };
 
 } // namespace Libs::Graphics

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/srtPageWatch.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -1428,6 +1429,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	if (is_written) {
+		// The GPU now owns these bytes: prefetched evaluations that read them replay.
+		SrtPageWatch::Guest().Unsettle(vaddr, size);
+	}
 	// Repeat binds of a written range find it in the set already.
 	// Only this thread changes the set, so it may read it unlocked.
 	if (is_written && !m_gpu_modified_ranges.Contains(vaddr, size)) {
@@ -1688,6 +1693,7 @@ bool BufferCache::TryWriteGpuOrdered(uint64_t vaddr, const void* data, uint64_t 
 	}
 	const auto id     = FindBuffer(vaddr, size);
 	auto&      buffer = m_slot_buffers[id];
+	SrtPageWatch::Guest().Unsettle(vaddr, size);
 	TouchBuffer(buffer);
 	WriteDataBuffer(buffer, vaddr, data, size);
 	NoteBufferWrite(vaddr, size);
@@ -1784,6 +1790,8 @@ void BufferCache::NotePendingGuestWrite(uint64_t vaddr, uint64_t size) {
 	if (size == 0) {
 		return;
 	}
+	// A download or write-back will publish into these pages.
+	SrtPageWatch::Guest().Unsettle(vaddr, size);
 	const auto      tick = m_scheduler.CurrentTick();
 	std::lock_guard lock(m_pending_writes_mutex);
 	for (auto page = Common::AlignDown(vaddr, CACHING_PAGESIZE); page < vaddr + size;

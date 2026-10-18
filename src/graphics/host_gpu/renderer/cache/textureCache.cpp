@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/cache/srtPageWatch.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -1790,6 +1791,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, ResolveStamp
 }
 
 void TextureCache::MoveResolveEpoch(GuestRange range) {
+	// An image over the range appeared, went, or changed its stencil association: whether it
+	// counts as GPU-written there may have changed too.
+	SrtPageWatch::Guest().Unsettle(range.address, range.size);
 	m_resolve_epoch++;
 	m_resolve_log[m_resolve_epoch % RESOLVE_LOG_SIZE] = range;
 }

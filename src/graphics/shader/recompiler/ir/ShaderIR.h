@@ -719,6 +719,10 @@ struct ResourcePlan {
 	std::unordered_map<const Inst*, std::vector<uint32_t>> control_phi_predecessors;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<DmaPrefetch>            dma_prefetches;
+	// Flat slots (ascending) whose value is one guest dword read that only the shader uses (no
+	// descriptor, condition, prefetch, fill or other slot needs it on the CPU): when the GPU has
+	// written that dword, the GPU copies it into the flat buffer instead of the CPU reading it.
+	std::vector<uint32_t>               gpu_copyable_flat_slots;
 	bool                                requires_specialization_memory = false;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
 	bool                                capture_specialization_reads = false;

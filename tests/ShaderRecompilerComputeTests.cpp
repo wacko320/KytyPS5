@@ -10,6 +10,7 @@
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
+#include "graphics/guest_gpu/command_processor/pm4Lookahead.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -2726,6 +2727,21 @@ public:
     scheduler.PopPendingOperations();
     Require("SchedulerTimeline", "implicit boundary", completed == 3,
             "operation boundary did not release the implicit tick callback");
+
+    // PopPendingOperations queries the timeline itself (at most every 250 us) when the next
+    // operation's tick is not known complete.
+    const auto unwaited_tick = scheduler.CurrentTick();
+    scheduler.DeferOperation([owned = std::make_unique<uint32_t>(4),
+                              &completed] { completed = *owned; });
+    scheduler.Flush();
+    Require("SchedulerTimeline", "unwaited tick idle",
+            m_runtime_context.device.waitIdle() == vk::Result::eSuccess,
+            "device wait failed");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    scheduler.PopPendingOperations();
+    Require("SchedulerTimeline", "unwaited boundary",
+            scheduler.IsFree(unwaited_tick) && completed == 4,
+            "operation boundary did not query the GPU for a completed tick");
 
     vk::SemaphoreTypeCreateInfo timeline_type{};
     timeline_type.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
@@ -13849,6 +13865,301 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "indirect argument allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A dispatch reads a dword the previous dispatch wrote through a flat SRT slot only the shader
+  // uses: the GPU copies it into the flat buffer, so preparing the dispatch reads nothing back.
+  void CheckGpuFlatCopyDependency() {
+    constexpr const char *name = "GpuFlatCopyDependency";
+    constexpr uintptr_t base = 0x0000000204c00000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t produced = base + 0x1000;
+    constexpr uint64_t output = base + 0x2000;
+    constexpr u32 value = 0x6c1a2b3du;
+    std::vector<u32> writer;
+    writer.push_back(EncodeVop1(0x01u, 1, 4)); // v_mov_b32 v1, s4
+    writer.push_back(EncodeMubuf0(0x1cu, 0, false, false)); // buffer_store_dword v1, off, s[0:3]
+    writer.push_back(EncodeMubuf1(1, 0, 0));
+    AppendEnd(&writer);
+    std::vector<u32> reader;
+    reader.push_back(EncodeSmem0(0x00, 8, 0)); // s_load_dword s8, s[0:1], 0
+    reader.push_back(EncodeSmem1(0, 0x7d));
+    reader.push_back(EncodeVop1(0x01u, 1, 8)); // v_mov_b32 v1, s8
+    reader.push_back(EncodeMubuf0(0x1cu, 0, false, false)); // buffer_store_dword v1, off, s[4:7]
+    reader.push_back(EncodeMubuf1(1, 1, 0));
+    AppendEnd(&reader);
+    for (const auto *code : {&writer, &reader}) {
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code->data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<uint32_t>(code->size() * sizeof(u32))});
+    }
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    const auto descriptor = [](uint64_t address) {
+      ShaderBufferResource resource{};
+      resource.UpdateAddress48(address);
+      resource.fields[2] = 4;
+      resource.fields[3] = DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      return resource;
+    };
+    const auto produced_vsharp = descriptor(produced);
+    const auto output_vsharp = descriptor(output);
+    const std::vector<u32> write_commands {
+        KYTY_PM4(7, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+        produced_vsharp.fields[0], produced_vsharp.fields[1], produced_vsharp.fields[2],
+        produced_vsharp.fields[3], value,
+        KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u, 0x41u};
+    const std::vector<u32> read_commands {
+        KYTY_PM4(10, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+        static_cast<u32>(produced), static_cast<u32>(produced >> 32u), 0u, 0u,
+        output_vsharp.fields[0], output_vsharp.fields[1], output_vsharp.fields[2],
+        output_vsharp.fields[3],
+        KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u, 0x41u};
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      GraphicsInitJmpTables();
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const auto run = [&](const std::vector<u32> &code, u32 sgprs,
+                           const std::vector<u32> &commands) {
+        processor.GetShCtx().SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                                          .num_thread_x = 1, .num_thread_y = 1,
+                                          .num_thread_z = 1, .wave_size = 64,
+                                          .user_sgpr = static_cast<uint8_t>(sgprs)});
+        Pm4Execution execution;
+        Require(name, "command stream",
+                processor.Process(execution, commands) == Pm4ProcessResult::Complete,
+                "a dispatch stream did not complete");
+      };
+      run(writer, 5, write_commands);
+      Require(name, "written", cache.HasGpuDirtyBytes(produced, sizeof(u32)),
+              "the first dispatch's store did not leave its dword GPU-dirty");
+      run(reader, 8, read_commands);
+      Require(name, "no readback", cache.HasGpuDirtyBytes(produced, sizeof(u32)),
+              "preparing the second dispatch read the GPU-written dword back");
+      const auto read = [&](uint64_t address) {
+        cache.ReadMemory(address, sizeof(u32));
+        u32 word = 0;
+        Require(name, "readback",
+                LibKernel::Memory::TryReadBacking(address, &word, sizeof(word)),
+                "a dword could not be read back");
+        return word;
+      };
+      Require(name, "dependency", read(output) == value,
+              "the second dispatch did not see the dword the first one wrote");
+      Require(name, "producer", read(produced) == value,
+              "the first dispatch's dword did not reach guest memory");
+      // The reader's table behind a null pointer, then behind one past the mapping: the walk
+      // (compiled, or through the reader once a level is refused) reads it as zeros instead of
+      // loading through the pointer (Wolverine).
+      for (const uint64_t table : {uint64_t{0}, uint64_t{base + allocation_size}}) {
+        auto commands = read_commands;
+        commands[2] = static_cast<u32>(table);
+        commands[3] = static_cast<u32>(table >> 32u);
+        run(reader, 8, commands);
+        Require(name, "unmapped table", read(output) == 0u,
+                "a dispatch reading an unmapped table did not read zeros");
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // PM4 dispatches whose V# the command processor's lookahead materializes on the pipeline
+  // cache's prefetch workers before the dispatch executes. A WRITE_DATA between the
+  // speculation and the dispatch moves one table's V#: that dispatch must follow it.
+  void CheckPm4LookaheadPrefetch() {
+    constexpr const char *name = "Pm4LookaheadPrefetch";
+    constexpr uintptr_t base = 0x0000000204a00000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint32_t dispatches = 48;
+    constexpr uint32_t moved = 30;
+    constexpr uint32_t sentinel = 0xa5a5a5a5u;
+    std::vector<u32> code;
+    code.push_back(EncodeSmem0(0x02, 4, 0)); // s_load_dwordx4 s[4:7], s[0:1], 0
+    code.push_back(EncodeSmem1(0, 0x7d)); // no SGPR offset
+    code.push_back(EncodeVop1(0x01u, 1, 2)); // v_mov_b32 v1, s2
+    code.push_back(EncodeMubuf0(0x1cu, 0, false, false)); // buffer_store_dword v1, off, s[4:7]
+    code.push_back(EncodeMubuf1(1, 1, 0));
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "table allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "table mapping failed");
+    std::memset(mapped, 0xa5, allocation_size);
+    const auto table = [](u32 index) { return base + index * 16u; };
+    const auto output = [](u32 index) { return base + 0x10000u + index * 0x100u; };
+    const uint64_t moved_output = base + 0x40000u;
+    const auto descriptor = [](uint64_t address) {
+      ShaderBufferResource resource{};
+      resource.UpdateAddress48(address);
+      resource.fields[2] = 4;
+      resource.fields[3] = DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      return resource;
+    };
+    for (u32 i = 0; i < dispatches; i++) {
+      const auto resource = descriptor(output(i));
+      std::memcpy(reinterpret_cast<void *>(table(i)), resource.fields, sizeof(resource.fields));
+    }
+    const auto moved_word = descriptor(moved_output).fields[0];
+
+    std::vector<u32> commands;
+    for (u32 i = 0; i < dispatches; i++) {
+      if (i == moved) {
+        commands.insert(commands.end(),
+                        {KYTY_PM4(5, Pm4::IT_WRITE_DATA, Pm4::R_ZERO), 0u,
+                         static_cast<u32>(table(i)), static_cast<u32>(table(i) >> 32u),
+                         moved_word});
+      }
+      commands.insert(commands.end(),
+                      {KYTY_PM4(5, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), Pm4::COMPUTE_USER_DATA_0,
+                       static_cast<u32>(table(i)), static_cast<u32>(table(i) >> 32u),
+                       0x1000u + i});
+      commands.insert(commands.end(),
+                      {KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 1u, 1u, 1u, 0x41u});
+      // A cache acquire after every dispatch, as AgcDcbAcquireMem emits it (the
+      // Pm4AcquireMemPackets form): the lookahead sees through it.
+      commands.insert(commands.end(), {0xc0065800u, 0x80000000u, 1u, 0u,
+                                       static_cast<u32>(output(i) >> 8u), 0u, 25u, 0x9000u});
+    }
+    Require(name, "acquire classification",
+            Pm4Lookahead::Classify(commands.data() + commands.size() - 8u) ==
+                Pm4Lookahead::PacketKind::Transparent,
+            "the standard ACQUIRE_MEM packet ends the lookahead window");
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      GraphicsInitJmpTables();
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      processor.GetShCtx().SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                                        .num_thread_x = 1, .num_thread_y = 1,
+                                        .num_thread_z = 1, .wave_size = 64, .user_sgpr = 3});
+      // A result accepted on stale settled pages (a store that did not unsettle its page) is
+      // counted, whichever result the dispatch then used.
+      context.GetPipelineCache().SetPrefetchReplayCheck(true);
+      Pm4Execution execution;
+      Require(name, "command stream",
+              processor.Process(execution, commands) == Pm4ProcessResult::Complete,
+              "the dispatch stream did not complete");
+      const auto read = [&](uint64_t address) {
+        cache.ReadMemory(address, sizeof(u32));
+        u32 value = 0;
+        Require(name, "output readback",
+                LibKernel::Memory::TryReadBacking(address, &value, sizeof(value)),
+                "an output could not be read back");
+        return value;
+      };
+      for (u32 i = 0; i < dispatches; i++) {
+        const auto expected = i == moved ? sentinel : 0x1000u + i;
+        const auto actual = read(output(i));
+        Require(name, "dispatch output", actual == expected,
+                "dispatch " + std::to_string(i) + " expected " + Hex(expected) + ", got " +
+                    Hex(actual));
+      }
+      Require(name, "moved table", read(moved_output) == 0x1000u + moved,
+              "the dispatch after WRITE_DATA used the V# read before it");
+      const auto stats = context.GetPipelineCache().GetPrefetchStats();
+      if (context.GetPipelineCache().PrefetchEnabled()) {
+        Require(name, "prefetch use", stats.hits != 0,
+                "no dispatch used a prefetched resource materialization (" +
+                    std::to_string(stats.submitted) + " submitted, " +
+                    std::to_string(stats.cancelled) + " cancelled, " +
+                    std::to_string(stats.unmatched) + " unmatched)");
+        Require(name, "settled pages", stats.unreplayed != 0,
+                "no dispatch used a prefetched result without a replay");
+      }
+      Require(name, "replay check", stats.replay_mismatches == 0,
+              "a result accepted on settled pages differs from its replay");
+      if (context.GetPipelineCache().PrefetchEnabled()) {
+        // Again, with every dispatch's user data predicted: the scan at the stream's start
+        // speculates a window of dispatches, which reaches the workers in one hand-off.
+        Pm4Execution again;
+        Require(name, "second command stream",
+                processor.Process(again, commands) == Pm4ProcessResult::Complete,
+                "the second dispatch stream did not complete");
+        const auto second = context.GetPipelineCache().GetPrefetchStats();
+        const auto flushes = second.flushes - stats.flushes;
+        const auto submitted = second.submitted - stats.submitted;
+        const auto flushed = second.flushed_jobs - stats.flushed_jobs;
+        Require(name, "batched hand-off",
+                flushes != 0 && flushes < submitted && flushed != 0 && flushed <= submitted,
+                "the lookahead handed its speculation over one job at a time (" +
+                    std::to_string(flushes) + " flushes for " + std::to_string(submitted) +
+                    " jobs)");
+        Require(name, "second pass hits", second.hits > stats.hits,
+                "no dispatch of the second stream used a batched worker result");
+        Require(name, "second replay check", second.replay_mismatches == 0,
+                "a result accepted on settled pages differs from its replay");
+      }
+      std::printf("[gpu]     %-32s %llu of %u materialized ahead (%llu without a replay, "
+                  "%llu stale, %llu hand-offs)\n",
+                  name, static_cast<unsigned long long>(stats.hits), dispatches,
+                  static_cast<unsigned long long>(stats.unreplayed),
+                  static_cast<unsigned long long>(stats.stale),
+                  static_cast<unsigned long long>(stats.flushes));
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "table mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "table allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -53972,6 +54283,16 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--gpu-flat-copy-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckGpuFlatCopyDependency();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--pm4-lookahead-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckPm4LookaheadPrefetch();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--dcc-clear-only") == 0) {

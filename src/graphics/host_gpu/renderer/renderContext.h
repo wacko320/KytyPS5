@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
+#include "graphics/host_gpu/renderer/cache/srtPageWatch.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessHeap.h"
@@ -59,6 +60,12 @@ public:
 	// but none of them is GPU-written, so guest memory already holds their value.
 	[[nodiscard]] bool CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
 	                                     uint64_t size) noexcept;
+	// GPU thread only (false elsewhere): no byte of the range is GPU-written, under a GPU-written
+	// image, or waiting for a download or other deferred write to publish it.
+	[[nodiscard]] bool IsGpuSettled(uint64_t vaddr, uint64_t size);
+	// GPU thread only (false elsewhere): buffer bytes the GPU wrote and the CPU has not read
+	// back, with no GPU-written image over them.
+	[[nodiscard]] bool IsGpuWrittenUnread(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	// GPU thread: see BufferCache::TryWriteGpuOrdered. False when the caller must write guest
 	// memory itself (after PrepareGpuThreadWrite).
@@ -80,11 +87,13 @@ public:
 		Common::FrameProfiler::Rec(Common::FrameProfiler::Event::GpuGuestWrite, vaddr, size);
 		if (auto* through = BeginWriteThrough(vaddr, size); through != nullptr) {
 			std::forward<Writer>(writer)(static_cast<void*>(through));
+			SrtPageWatch::Guest().Unsettle(vaddr, size);
 			m_buffer_cache.WriteThrough(vaddr, through, size);
 			return;
 		}
 		PrepareGpuThreadWrite(vaddr, size);
 		std::forward<Writer>(writer)(reinterpret_cast<void*>(vaddr));
+		SrtPageWatch::Guest().Unsettle(vaddr, size);
 		m_buffer_cache.Epoch().SyncRangeNow(vaddr, size);
 	}
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;

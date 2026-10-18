@@ -165,6 +165,17 @@ bool RenderContext::TryWriteGpuOrdered(uint64_t vaddr, const void* data, uint64_
 	       m_buffer_cache.TryWriteGpuOrdered(vaddr, data, size);
 }
 
+bool RenderContext::IsGpuWrittenUnread(uint64_t vaddr, uint64_t size) {
+	return GuestGpu::IsGpuThread() && m_buffer_cache.HasGpuDirtyBytes(vaddr, size) &&
+	       !m_texture_cache.IsRegionGpuModified(vaddr, size);
+}
+
+bool RenderContext::IsGpuSettled(uint64_t vaddr, uint64_t size) {
+	return GuestGpu::IsGpuThread() && !m_buffer_cache.HasGpuDirtyBytes(vaddr, size) &&
+	       !m_buffer_cache.HasPendingGuestWrite(vaddr, size) &&
+	       !m_texture_cache.IsRegionGpuModified(vaddr, size);
+}
+
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
@@ -188,6 +199,7 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	// A buffer that outlived an unmap of this range missed the CPU writes since (uploads skip
 	// unmapped pages, and pages left CPU-dirty do not fault): the next acquire uploads them.
 	m_buffer_cache.QueueBdaSync(vaddr, size);
+	SrtPageWatch::Guest().Unsettle(vaddr, size);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -216,6 +228,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			m_buffer_cache.InvalidateMemory(vaddr, size);
 		}
 		m_texture_cache.UnmapMemory(vaddr, size);
+		SrtPageWatch::Guest().Unsettle(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 	};

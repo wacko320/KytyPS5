@@ -9,8 +9,10 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
+#include "graphics/guest_gpu/command_processor/pm4Lookahead.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -213,6 +215,29 @@ void CommandProcessor::Reset() {
 	m_dispatch_indirect_args_base_addr = 0;
 
 	std::memset(m_const_ram, 0, sizeof(m_const_ram));
+}
+
+CommandProcessor::CommandProcessor(RenderContext& renderer, int interrupt_event_id)
+    : m_renderer(renderer), m_interrupt_event_id(interrupt_event_id) {}
+
+CommandProcessor::~CommandProcessor() = default;
+
+void CommandProcessor::CopyRegisterState(const CommandProcessor& other) {
+	m_ctx                  = other.m_ctx;
+	m_context_state_pushed = other.m_context_state_pushed;
+	if (m_context_state_pushed) {
+		m_saved_ctx = other.m_saved_ctx;
+	}
+	m_ucfg                             = other.m_ucfg;
+	m_sh_ctx                           = other.m_sh_ctx;
+	m_user_data_marker                 = other.m_user_data_marker;
+	m_index_type_and_size              = other.m_index_type_and_size;
+	m_index_buffer_size                = other.m_index_buffer_size;
+	m_index_base_addr                  = other.m_index_base_addr;
+	m_draw_indirect_args_base_addr     = other.m_draw_indirect_args_base_addr;
+	m_dispatch_indirect_args_base_addr = other.m_dispatch_indirect_args_base_addr;
+	m_num_instances                    = other.m_num_instances;
+	m_predicate_skip                   = other.m_predicate_skip;
 }
 
 void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operation) {
@@ -699,6 +724,16 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 		Pm4Execution*     previous_execution;
 	} execution_scope(*this, execution);
 
+	if (!m_lookahead_checked) {
+		m_lookahead_checked = true;
+		if (m_renderer.GetPipelineCache().PrefetchEnabled()) {
+			m_lookahead = std::make_unique<Pm4Lookahead>(m_renderer, m_interrupt_event_id);
+		}
+	}
+	// Other processors and the guest ran since the last slice.
+	if (m_lookahead != nullptr) {
+		m_lookahead->Reset();
+	}
 	// Every command-buffer slice begins an epoch: CPU writes made before it reach the buffers
 	// once here, so its read bindings only translate guest addresses (CoherenceEpoch).
 	m_renderer.GetBufferCache().Epoch().Acquire();
@@ -805,8 +840,18 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		if (m_lookahead != nullptr) {
+			const auto kind = Pm4Lookahead::Classify(packet);
+			if (kind == Pm4Lookahead::PacketKind::Draw ||
+			    kind == Pm4Lookahead::PacketKind::Dispatch) {
+				m_lookahead->OnDraw(*this, cursor.commands, cursor.offset_dw);
+			}
+		}
+		m_packet_commands = cursor.commands;
+		m_packet_offset   = cursor.offset_dw;
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		m_packet_commands = {};
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			const auto now = std::chrono::steady_clock::now();

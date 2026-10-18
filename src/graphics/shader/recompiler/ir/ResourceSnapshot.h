@@ -39,6 +39,9 @@ struct ResourceSnapshot {
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	// Guest addresses of ResourcePlan::dma_prefetches that evaluated.
 	std::vector<uint64_t>        dma_prefetch;
+	// Flat-buffer dwords the GPU fills itself, copying the guest dword at the address after the
+	// GPU work that writes it (flattened_srt holds 0 there): {dword index, guest address}.
+	std::vector<std::pair<uint32_t, uint64_t>> gpu_flat_copies;
 	UniformFill                 uniform_fill;
 };
 

@@ -11,6 +11,14 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
+// Whether the compiled walker may load [address, address + size) through the guest pointer.
+using SrtRangeCheck = bool (*)(void* userdata, uint64_t address, uint64_t size);
+
+// The compiled walker's view of SrtRuntime::raw_table_reads.
+struct SrtRawTableCheck {
+	SrtRangeCheck check    = nullptr;
+	void*         userdata = nullptr;
+};
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
@@ -23,6 +31,15 @@ struct SrtRuntime {
 	// Set when the indirect arguments are thread counts (USE_THREAD_DIMENSIONS): the workgroup
 	// size per axis, which the counts are rounded up to whole workgroups of.
 	std::span<const uint32_t> indirect_args_group_size;
+	// Whether the GPU has written a guest range that the CPU has not read back yet (GPU thread
+	// only; null elsewhere). Flat slots in ResourcePlan::gpu_copyable_flat_slots that read such a
+	// range are left to a GPU copy (ResourceSnapshot::gpu_flat_copies).
+	bool (*gpu_written)(uint64_t address, uint64_t size) = nullptr;
+	// Lets the compiled walker (ResourcePlan::srt_code) run although read_memory is set. Before
+	// loading each table level it asks whether plain loads through the guest pointer read what
+	// read_memory would (mapped, and nothing over it GPU-written or waiting to be published);
+	// when one is not, the whole walk goes through read_memory instead.
+	SrtRangeCheck raw_table_reads = nullptr;
 };
 
 class SrtReadCapture {
@@ -110,8 +127,10 @@ public:
 
 	bool Evaluate(Value value, uint32_t& result);
 	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
-	// Refreshes reachable scalar reads and active descriptor sources in one walk.
-	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
+	// Refreshes reachable scalar reads and active descriptor sources in one walk. With
+	// `gpu_copies`, GPU-written dwords of gpu_copyable_flat_slots are left 0 and listed there.
+	bool RefreshFlatBuffer(std::vector<uint32_t>&                      flat,
+	                       std::vector<std::pair<uint32_t, uint64_t>>* gpu_copies = nullptr);
 
 private:
 	SrtWalker(SrtWalker& parent, Value active_mask, bool clean = false,
@@ -124,6 +143,9 @@ private:
 	bool EvaluatePhi(const Inst& inst, uint64_t& result);
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
+	// The guest address a scalar raw read (LoadAddressU32, ReadConstBuffer) loads, unloaded.
+	bool ScalarReadAddress(const Inst& inst, const Inst& handle, const MemoryInfo& mem,
+	                       uint64_t& address, bool* out_of_bounds = nullptr);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
 
 	const ResourcePlan&              m_program;

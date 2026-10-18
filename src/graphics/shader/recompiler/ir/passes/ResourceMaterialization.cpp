@@ -15,6 +15,7 @@
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -41,7 +42,12 @@ void ReportBindlessFallback(const ResourcePlan& program, uint32_t root,
 	pcs->push_back(image.first_use_pc);
 }
 
+thread_local bool g_report_specialization_failures = true;
+
 bool SpecializationFail(std::string_view message) {
+	if (!g_report_specialization_failures) {
+		return false;
+	}
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
 	             static_cast<int>(message.size()), message.data());
 	return false;
@@ -217,14 +223,13 @@ void MarkCleanReads(const std::unordered_set<const Inst*>& planned_reads,
 		pending.assign(source->dwords.begin(), source->dwords.begin() + source->dword_count);
 	}
 	if (!extra.IsEmpty()) pending.push_back(extra);
-	std::vector<const Inst*> visited;
+	std::unordered_set<const Inst*> visited;
 	while (!pending.empty()) {
 		auto* inst = pending.back().Resolve().TryInstruction();
 		pending.pop_back();
-		if (inst == nullptr || std::ranges::find(visited, inst) != visited.end()) {
+		if (inst == nullptr || !visited.insert(inst).second) {
 			continue;
 		}
-		visited.push_back(inst);
 		if (planned_reads.contains(inst)) {
 			auto flags = inst->Flags<SrtReadFlags>();
 			flags.clean = 1u;
@@ -232,6 +237,85 @@ void MarkCleanReads(const std::unordered_set<const Inst*>& planned_reads,
 		}
 		for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
 			pending.push_back(inst->Arg(arg));
+		}
+	}
+}
+
+// Flat slots that only the shader reads: no value the CPU evaluates (descriptor dwords, indirect
+// table keys, selectors and masks, block conditions, prefetch addresses, fill values, the
+// addresses of other slots' reads) reaches them, they are not clean (strict) reads, and each is
+// one scalar guest dword read of its own, so the GPU can copy it into the flat buffer.
+void MarkGpuCopyableFlatSlots(ResourcePlan& plan) {
+	std::vector<Value> pending;
+	for (const auto& source: plan.descriptor_sources) {
+		pending.insert(pending.end(), source.dwords.begin(),
+		               source.dwords.begin() + source.dword_count);
+		if (source.indirect_descriptor.has_value()) {
+			pending.push_back(source.indirect_descriptor->key_count);
+			pending.push_back(source.indirect_descriptor->selector_first);
+			pending.push_back(source.indirect_descriptor->selector_mask);
+		}
+	}
+	for (const auto& block: plan.control_flow) {
+		pending.push_back(block.condition);
+	}
+	for (const auto& prefetch: plan.dma_prefetches) {
+		pending.insert(pending.end(), {prefetch.low, prefetch.high, prefetch.offset});
+	}
+	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i) {
+		pending.push_back(plan.uniform_fill.values[i]);
+	}
+	for (const auto& read: plan.srt_reads) {
+		if (const auto* inst = read.value.Resolve().TryInstruction(); inst != nullptr) {
+			for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+				pending.push_back(inst->Arg(arg));
+			}
+		}
+	}
+	std::vector<uint8_t>            cpu(plan.srt_reads.size(), 0u);
+	std::unordered_set<const Inst*> reached;
+	while (!pending.empty()) {
+		const auto value = pending.back().Resolve();
+		pending.pop_back();
+		const auto* inst = value.IsEmpty() ? nullptr : value.TryInstruction();
+		if (inst == nullptr || !reached.insert(inst).second) {
+			continue;
+		}
+		if (inst->GetOpcode() == ValueOpcode::ReadConst) {
+			const auto slot = inst->Arg(1).Resolve();
+			if (slot.IsImmediate() && slot.GetType() == Type::U32 && slot.U32() < cpu.size()) {
+				cpu[slot.U32()] = 1u;
+				pending.push_back(plan.srt_reads[slot.U32()].value);
+			}
+			continue;
+		}
+		for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+			pending.push_back(inst->Arg(arg));
+		}
+	}
+	std::unordered_map<const Inst*, uint32_t> slot_reads;
+	for (const auto& read: plan.srt_reads) {
+		if (const auto* inst = read.value.Resolve().TryInstruction(); inst != nullptr) {
+			slot_reads[inst]++;
+		}
+	}
+	plan.gpu_copyable_flat_slots.clear();
+	for (uint32_t slot = 0; slot < plan.srt_reads.size(); slot++) {
+		const auto* inst = plan.srt_reads[slot].value.Resolve().TryInstruction();
+		if (cpu[slot] != 0u || inst == nullptr || reached.contains(inst) ||
+		    slot_reads[inst] != 1u || plan.srt_reads[slot].flat_offset != slot ||
+		    inst->Flags<SrtReadFlags>().clean != 0u) {
+			continue;
+		}
+		const auto op    = inst->GetOpcode();
+		const auto index = inst->Flags<SrtReadFlags>().index;
+		if (index >= plan.memory_info.size() || inst->NumArgs() < 2u) {
+			continue;
+		}
+		const auto kind = plan.memory_info[index].kind;
+		if ((op == ValueOpcode::LoadAddressU32 && kind == ResourceKind::ScalarAddress) ||
+		    (op == ValueOpcode::ReadConstBuffer && kind == ResourceKind::ScalarBuffer)) {
+			plan.gpu_copyable_flat_slots.push_back(slot);
 		}
 	}
 }
@@ -1553,8 +1637,18 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	}
 	if (capture_indirect_reads || !plan.source_reads.empty())
 		plan.resource_tracking_complete &= !program.has_address_writes;
+	MarkGpuCopyableFlatSlots(plan);
 	CompileSrtWalker(plan);
 	return plan;
+}
+
+SpecializationFailureReports::SpecializationFailureReports(bool enabled)
+    : m_previous(g_report_specialization_failures) {
+	g_report_specialization_failures = enabled;
+}
+
+SpecializationFailureReports::~SpecializationFailureReports() {
+	g_report_specialization_failures = m_previous;
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
@@ -1589,7 +1683,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	SrtWalker clean(program, CleanRuntime(observed));
 	SrtWalker walker(program, observed,
 	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
-	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
+	// Flat slots whose dword the GPU wrote and the CPU has not read back: the GPU copies them,
+	// after the work that writes them, so this thread does not wait for that work.
+	snapshot.gpu_flat_copies.clear();
+	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt, &snapshot.gpu_flat_copies)) {
 		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
 		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
 	}

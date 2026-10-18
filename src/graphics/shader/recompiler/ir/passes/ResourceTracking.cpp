@@ -17,6 +17,7 @@
 #include <span>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #define XXH_INLINE_ALL
 #include <xxhash.h>
@@ -590,14 +591,13 @@ private:
 		const auto* phi = value.TryInstruction();
 		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi || m_native_cfg.blocks.empty())
 			return value;
-		std::vector<const Inst*> candidates;
-		std::vector<const Inst*> visited;
-		std::vector<const Inst*> pending {phi};
+		std::vector<const Inst*>        candidates;
+		std::unordered_set<const Inst*> visited;
+		std::vector<const Inst*>        pending {phi};
 		while (!pending.empty()) {
 			const auto* inst = pending.back();
 			pending.pop_back();
-			if (std::ranges::find(visited, inst) != visited.end()) continue;
-			visited.push_back(inst);
+			if (!visited.insert(inst).second) continue;
 			if (inst->GetOpcode() == ValueOpcode::Phi) {
 				for (size_t i = 0; i < inst->NumArgs(); ++i) {
 					const auto* arg = inst->Arg(i).Resolve().TryInstruction();
@@ -821,15 +821,16 @@ private:
 		if (value.IsImmediate()) return;
 		auto* inst = value.TryInstruction();
 		if (inst == nullptr) Fail(use_pc, "invalid typed planning value");
-		const auto cycle = std::ranges::find(m_srt_visiting, inst);
-		if (cycle != m_srt_visiting.end()) {
+		if (m_srt_visiting_set.contains(inst)) {
+			const auto cycle = std::ranges::find(m_srt_visiting, inst);
 			if (std::any_of(cycle, m_srt_visiting.end(), [](const Inst* value) {
 				return value->GetOpcode() == ValueOpcode::Phi;
 			})) return;
 			Fail(use_pc, "cyclic typed planning value without a phi");
 		}
-		if (std::ranges::find(m_srt_visited, inst) != m_srt_visited.end()) return;
+		if (m_srt_visited.contains(inst)) return;
 		m_srt_visiting.push_back(inst);
+		m_srt_visiting_set.insert(inst);
 		uint32_t memory_index = 0;
 		const auto* memory = ScalarReadMemory(*inst, memory_index);
 		DescriptorSource source;
@@ -850,7 +851,8 @@ private:
 				CollectScalarRead(inst->Arg(arg), use_pc);
 		}
 		m_srt_visiting.pop_back();
-		m_srt_visited.push_back(inst);
+		m_srt_visiting_set.erase(inst);
+		m_srt_visited.insert(inst);
 		if (memory == nullptr) return;
 		const auto offset = inst->Arg(1).Resolve();
 		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return;
@@ -1088,22 +1090,32 @@ private:
 		           : nullptr;
 	}
 
-	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) const {
+	static bool IsMemoryAccess(ValueOpcode op) {
+		return BufferAccessOf(op) != BufferAccess::None ||
+		       AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+		       ImageOpcodeInfoOf(op).access != ImageAccess::None;
+	}
+
+	// Counts the memory accesses per memory index, so ownership checks do not rescan the program:
+	// ray-tracing kernels have thousands of image accesses over millions of instructions.
+	void CountMemoryIndexUses() {
+		m_memory_index_uses.clear();
 		for (const auto* block: m_program.blocks) {
 			for (const auto& inst: *block) {
-				const auto op = inst.GetOpcode();
-				if ((BufferAccessOf(op) == BufferAccess::None &&
-				     AddressOpcodeInfoOf(op).access == AddressAccess::None &&
-				     ImageOpcodeInfoOf(op).access == ImageAccess::None) ||
-				    &inst == &owner) {
-					continue;
-				}
-				if (inst.Flags<MemoryFlags>().index == index) {
-					return false;
+				if (IsMemoryAccess(inst.GetOpcode())) {
+					++m_memory_index_uses[inst.Flags<MemoryFlags>().index];
 				}
 			}
 		}
-		return true;
+	}
+
+	// No memory access but owner uses the index.
+	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) const {
+		const auto found = m_memory_index_uses.find(index);
+		const auto uses  = found == m_memory_index_uses.end() ? 0u : found->second;
+		const bool owned =
+		    IsMemoryAccess(owner.GetOpcode()) && owner.Flags<MemoryFlags>().index == index;
+		return uses <= (owned ? 1u : 0u);
 	}
 
 	bool MakeRuntimeTableSource(const Inst& read, DescriptorSource& descriptor) {
@@ -3627,6 +3639,7 @@ private:
 	}
 
 	void PlanIndirectDescriptors() {
+		CountMemoryIndexUses();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				if ((ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None &&
@@ -4177,8 +4190,12 @@ private:
 	const ShaderWorkgroupInputInfo*            m_workgroup;
 	std::vector<Program::ScalarWrite>          m_scalar_writes;
 	std::vector<ResolvedHandle>                m_resolved_handles;
+	// The current path (ordered, for the cycle check) and sets for the lookups: scalar reads
+	// chain through thousands of instructions in large shaders.
+	std::unordered_map<uint32_t, uint32_t>     m_memory_index_uses;
 	std::vector<const Inst*>                   m_srt_visiting;
-	std::vector<const Inst*>                   m_srt_visited;
+	std::unordered_set<const Inst*>            m_srt_visiting_set;
+	std::unordered_set<const Inst*>            m_srt_visited;
 	std::vector<Inst*>                         m_scalar_reads;
 	ShaderInfo                                 m_info;
 	std::vector<DescriptorSource>              m_sources;

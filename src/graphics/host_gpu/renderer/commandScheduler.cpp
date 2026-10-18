@@ -212,14 +212,28 @@ void CommandScheduler::Wait(uint64_t tick, WaitSite site, std::source_location l
 }
 
 void CommandScheduler::PopPendingOperations() {
-	m_master.Refresh();
+	// Runs before every draw and dispatch: query the GPU only when the next operation is not
+	// known complete, and not more often than RefreshInterval. Each query is an ioctl.
+	constexpr auto RefreshInterval = std::chrono::microseconds(250);
+	bool           refreshed       = false;
 	for (;;) {
 		PendingOperation operation;
 		{
 			std::lock_guard lock(m_operation_mutex);
-			if (m_pending_operations.empty() ||
-			    !m_master.IsFree(m_pending_operations.front().tick)) {
+			if (m_pending_operations.empty()) {
 				return;
+			}
+			if (!m_master.IsFree(m_pending_operations.front().tick)) {
+				const auto now = std::chrono::steady_clock::now();
+				if (refreshed || now - m_last_refresh < RefreshInterval) {
+					return;
+				}
+				m_last_refresh = now;
+				m_master.Refresh();
+				refreshed = true;
+				if (!m_master.IsFree(m_pending_operations.front().tick)) {
+					return;
+				}
 			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();

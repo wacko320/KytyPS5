@@ -978,6 +978,22 @@ const uint8_t* TryViewGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	return GetGuestBackingView(vaddr, size, &view) ? view.pointer : nullptr;
 }
 
+bool IsGpuWrittenUnread(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	       g_gpu_resources->IsGpuWrittenUnread(vaddr, size);
+}
+
+bool IsBackingSettled(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	    !g_gpu_resources->IsGpuSettled(vaddr, size)) {
+		return false;
+	}
+	// Changes are reported by guest address: one through another alias would not be.
+	GuestBackingView view {};
+	return GetGuestBackingView(vaddr, size, &view) &&
+	       !g_guest_address_space->IsBackingAliased(vaddr, size);
+}
+
 uint64_t MappingBytesFrom(uint64_t vaddr) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 	return g_virtual_ranges->MappingBytesFrom(vaddr);
