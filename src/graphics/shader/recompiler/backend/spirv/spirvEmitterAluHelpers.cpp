@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include <array>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitAndConstant(EmitterState& state, uint32_t value, uint32_t mask) {
@@ -138,6 +140,93 @@ uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
 	state.builder.AddFunction(spv::OpSelect, TypeU32(state), selected, subnormal, sign_bits, bits);
 	state.builder.AddFunction(spv::OpBitcast, TypeF32(state), ret, selected);
 	return ret;
+}
+
+namespace {
+
+// One half, rounded to nearest even from the f32 bits with integer arithmetic (the driver's pack
+// may truncate): normal halves round their 13 dropped mantissa bits, halves below 2^-14 become
+// subnormals or zero, and overflow (including the round-up from 65504) gives infinity. NaN keeps
+// the driver's encoding h.
+uint32_t RoundHalfToNearestEven(EmitterState& state, uint32_t x, uint32_t h) {
+	const auto u32     = TypeU32(state);
+	const auto boolean = TypeBool(state);
+	const auto C       = [&](uint32_t value) { return ConstantU32(state, value); };
+	const auto Op      = [&](spv::Op op, uint32_t type, uint32_t a, uint32_t b) {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(op, type, result, a, b);
+		return result;
+	};
+	const auto Sel = [&](uint32_t condition, uint32_t a, uint32_t b) {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, u32, result, condition, a, b);
+		return result;
+	};
+	// Rounds value >> shift to nearest even (shift 1..31, as a value).
+	const auto RoundShift = [&](uint32_t value, uint32_t shift) {
+		const auto kept    = Op(spv::OpShiftRightLogical, u32, value, shift);
+		const auto mask    = Op(spv::OpISub, u32, Op(spv::OpShiftLeftLogical, u32, C(1), shift), C(1));
+		const auto rest    = Op(spv::OpBitwiseAnd, u32, value, mask);
+		const auto halfway = Op(spv::OpShiftLeftLogical, u32, C(1), Op(spv::OpISub, u32, shift, C(1)));
+		const auto odd     = Op(spv::OpINotEqual, boolean, Op(spv::OpBitwiseAnd, u32, kept, C(1)), C(0));
+		const auto up      = Op(spv::OpLogicalOr, boolean, Op(spv::OpUGreaterThan, boolean, rest, halfway),
+		                        Op(spv::OpLogicalAnd, boolean, Op(spv::OpIEqual, boolean, rest, halfway), odd));
+		return Op(spv::OpIAdd, u32, kept, Sel(up, C(1), C(0)));
+	};
+	const auto bits     = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitcast, u32, bits, x);
+	const auto sign     = Op(spv::OpBitwiseAnd, u32, Op(spv::OpShiftRightLogical, u32, bits, C(16)), C(0x8000u));
+	const auto exponent = Op(spv::OpBitwiseAnd, u32, Op(spv::OpShiftRightLogical, u32, bits, C(23)), C(0xffu));
+	const auto mantissa = Op(spv::OpBitwiseAnd, u32, bits, C(0x007fffffu));
+	// Normal: biased half exponent e = exponent - 112 in 1..30; the carry of the rounding may
+	// reach 0x7c00 (infinity), which is the RNE result.
+	const auto normal   = RoundShift(Op(spv::OpBitwiseOr, u32,
+	                                    Op(spv::OpShiftLeftLogical, u32, Op(spv::OpISub, u32, exponent, C(112)), C(23)),
+	                                    mantissa),
+	                                 C(13));
+	// Subnormal half (exponent 102..112): the significand with its implicit bit, shifted by
+	// 126 - exponent (14..24).
+	const auto subnormal =
+	    RoundShift(Op(spv::OpBitwiseOr, u32, mantissa, C(0x00800000u)), Op(spv::OpISub, u32, C(126), exponent));
+	const auto is_normal    = Op(spv::OpLogicalAnd, boolean, Op(spv::OpUGreaterThan, boolean, exponent, C(112)),
+	                             Op(spv::OpULessThan, boolean, exponent, C(143)));
+	const auto is_subnormal = Op(spv::OpLogicalAnd, boolean, Op(spv::OpUGreaterThanEqual, boolean, exponent, C(102)),
+	                             Op(spv::OpULessThanEqual, boolean, exponent, C(112)));
+	const auto overflow = Op(spv::OpLogicalAnd, boolean, Op(spv::OpUGreaterThanEqual, boolean, exponent, C(143)),
+	                         Op(spv::OpULessThan, boolean, exponent, C(255)));
+	const auto is_nan   = Op(spv::OpLogicalAnd, boolean, Op(spv::OpIEqual, boolean, exponent, C(255)),
+	                         Op(spv::OpINotEqual, boolean, mantissa, C(0)));
+	const auto is_inf   = Op(spv::OpLogicalAnd, boolean, Op(spv::OpIEqual, boolean, exponent, C(255)),
+	                         Op(spv::OpIEqual, boolean, mantissa, C(0)));
+	auto magnitude = Sel(is_normal, normal, C(0));
+	magnitude      = Sel(is_subnormal, subnormal, magnitude);
+	magnitude      = Sel(Op(spv::OpLogicalOr, boolean, overflow, is_inf), C(0x7c00u), magnitude);
+	return Sel(is_nan, h, Op(spv::OpBitwiseOr, u32, sign, magnitude));
+}
+
+} // namespace
+
+uint32_t EmitPackHalf2x16(EmitterState& state, uint32_t pair) {
+	const auto u32 = TypeU32(state);
+	const auto raw = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, u32, raw, GlslStd450(state), GLSLstd450PackHalf2x16,
+	                          pair);
+	std::array<uint32_t, 2> halves {};
+	for (uint32_t component = 0; component < 2u; component++) {
+		const auto x = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), x, pair, component);
+		const auto shifted = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpShiftRightLogical, u32, shifted, raw,
+		                          ConstantU32(state, 16u * component));
+		const auto h = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBitwiseAnd, u32, h, shifted, ConstantU32(state, 0xffffu));
+		halves[component] = RoundHalfToNearestEven(state, x, h);
+	}
+	const auto high = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpShiftLeftLogical, u32, high, halves[1], ConstantU32(state, 16u));
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitwiseOr, u32, result, halves[0], high);
+	return result;
 }
 
 uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero) {

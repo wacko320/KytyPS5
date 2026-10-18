@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 
 #include <algorithm>
 #include <fmt/format.h>
@@ -303,7 +304,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		const auto& memory = program.memory_info[index];
 		const auto kind = memory.kind;
 		if (!memory.planning_only) {
-			info.uses_lds |= kind == ResourceKind::FlatLocal;
+			info.uses_lds |= kind == ResourceKind::FlatLocal || memory.generic_aperture;
 			if (shared_access != SharedAccess::None) {
 				info.uses_lds |= kind == ResourceKind::Lds;
 				info.uses_gds |= kind == ResourceKind::Gds;
@@ -328,10 +329,16 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				info.function_scratch = true;
 				info.function_lds |= kind == ResourceKind::FlatLocal &&
 				                     program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh;
-			} else if (address_access == AddressAccess::Write && !program.untracked_writes) {
+			} else if (address_access == AddressAccess::Write && !program.untracked_writes &&
+			           !memory.aperture_only) {
 				return Fail("writable FLAT/GLOBAL addresses require GPU ownership tracking");
 			} else {
 				info.coherent_buffers |= memory.coherent;
+			}
+			// Generic FLAT lanes may reach LDS and scratch.
+			if (memory.generic_aperture && kind != ResourceKind::FlatLocal) {
+				info.function_scratch |= program.scratch_dwords != 0;
+				info.function_lds |= program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh;
 			}
 		}
 		if (buffer_access != BufferAccess::None) {
@@ -521,7 +528,14 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::ReadLane: {
 			info.subgroup_ballot  = true;
 			info.subgroup_shuffle = true;
-			if (inst.GetOpcode() == ValueOpcode::DppMoveU32) {
+			// A wave32 guest's V_READLANE reads within its own guest wave.
+			if (inst.GetOpcode() == ValueOpcode::DppMoveU32 ||
+			    (inst.GetOpcode() == ValueOpcode::ReadLane && program.wave_size == 32u)) {
+				info.subgroup_local_invocation_id = true;
+			}
+			if (inst.GetOpcode() == ValueOpcode::ReadLane &&
+			    MatchLaneReduction(inst, program.wave_size)) {
+				info.subgroup_arithmetic          = true;
 				info.subgroup_local_invocation_id = true;
 			}
 			break;
@@ -583,6 +597,16 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		for (const auto& inst: *block) {
 			Visit(program, input_info, inputs, inst);
 		}
+	}
+	// A wave32 guest outside compute, mesh and tessellation control may run in a 64-lane host
+	// subgroup (Spirv::GuestWavesShareHostSubgroup); wave-wide operations then pick the
+	// invocation's own guest wave by its subgroup lane.
+	if (program.wave_size == 32u && program.stage != ShaderType::Compute &&
+	    program.stage != ShaderType::Mesh && program.stage != ShaderType::TessellationControl &&
+	    (info.subgroup_ballot || info.subgroup_vote || info.subgroup_shuffle ||
+	     info.subgroup_arithmetic)) {
+		info.subgroup_ballot              = true;
+		info.subgroup_local_invocation_id = true;
 	}
 	for (uint32_t index = 0; index < inputs.user_data.size(); index++) {
 		if (inputs.user_data[index]) info.user_data_registers.push_back(index);

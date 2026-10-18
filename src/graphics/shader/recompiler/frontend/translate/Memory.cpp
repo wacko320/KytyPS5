@@ -592,7 +592,11 @@ void Translator::DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opc
 }
 
 void Translator::FLAT_LOAD(const Decoder::Instruction& inst) {
-	const auto      memory = MemoryInfoFromDecoded(inst);
+	auto            memory = MemoryInfoFromDecoded(inst);
+	// Segment-0 FLAT addresses select LDS or scratch per lane when their high dword is an
+	// aperture tag, however the shader built them: compilers form them from constants (GTA V's
+	// ray-tracing stack) as well as from src_shared_base / src_private_base (Rift Apart's).
+	memory.generic_aperture = memory.kind == IR::ResourceKind::Flat;
 	IR::ValueOpcode opcode;
 	const auto      bits = memory.data_bits;
 	const auto      sign = memory.data_signed;
@@ -620,7 +624,11 @@ void Translator::FLAT_LOAD(const Decoder::Instruction& inst) {
 }
 
 void Translator::FLAT_STORE(const Decoder::Instruction& inst) {
-	const auto      memory  = MemoryInfoFromDecoded(inst);
+	auto            memory  = MemoryInfoFromDecoded(inst);
+	// Segment-0 FLAT addresses select LDS or scratch per lane when their high dword is an
+	// aperture tag, however the shader built them: compilers form them from constants (GTA V's
+	// ray-tracing stack) as well as from src_shared_base / src_private_base (Rift Apart's).
+	memory.generic_aperture = memory.kind == IR::ResourceKind::Flat;
 	const auto      data_op = MemorySourceAt(inst, 0);
 	const auto      address = ReadAddressOperands(inst, 1);
 	IR::ValueOpcode opcode;

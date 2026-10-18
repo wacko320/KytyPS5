@@ -48,7 +48,7 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	} else {
 		const auto vertex =
 		    kind == Attribute::ControlOutput
-		        ? EmitLaneId(state)
+		        ? EmitHostLaneId(state)
 		        : EmitBinaryU32(state, spv::OpUDiv, address, ConstantU32(state, stride));
 		state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, vertex, attribute,
 		                          component);

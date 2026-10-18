@@ -499,6 +499,7 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
 )
 target_link_libraries(resource_tracking_tests fmt::fmt xbyak::xbyak)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
@@ -674,6 +675,13 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME shader_recompiler_loop_watchdog
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --loop-watchdog-only)
+	add_test(NAME shader_recompiler_correctness
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --case
+			ScalarApertureOperands GenericFlatReachesLdsAndScratch
+			GraphicsWave32BallotsStayInGuestWave VectorFractF16CapturedAndEdges
+			ReadFirstLaneIntoVccLoFeedsScalarCompare BufferSubwordLoadAppliesUnalignedHostOffset
+			VectorAddCarryIgnoresShiftedOutBits LoopBuiltScalarBufferAddressIgnoresShiftedOutBits
+			DsAppendAllocatesAcrossWaves32)
 	add_test(NAME graphics_pipeline_rasterization
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
 	add_test(NAME graphics_draw_offsets

@@ -229,6 +229,20 @@ uint32_t EmitConvertF64F32(EmitterState& state, uint32_t arg0) {
 	                                                  EmitFlushF32DenormToSignedZero(state, arg0));
 }
 
+// The carry is a compare on the 32-bit sum, not OpIAddCarry: RADV's ACO (seen on Mesa 25.2.8 and
+// 26.2.3) folds a shift-left by 1-4 into a carry-producing scalar add as S_LSHLn_ADD_U32, whose
+// SCC also counts the bits the shift drops, so "(x << n) + y" carried whenever the top bits of x
+// were set. A guest pointer widened from a ">> 3" field then pointed 4 GiB too high.
+uint32_t EmitIAddCarry32(EmitterState& state, uint32_t lhs, uint32_t rhs) {
+	const auto sum     = Binary(state, spv::OpIAdd, TypeU32(state), lhs, rhs);
+	const auto wrapped = Binary(state, spv::OpULessThan, TypeBool(state), sum, lhs);
+	const auto carry =
+	    Select(state, TypeU32(state), wrapped, ConstantU32(state, 1), ConstantU32(state, 0));
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Pair(state), result, sum, carry);
+	return result;
+}
+
 uint32_t EmitCompositeConstructU64(ValueEmitContext& ctx, uint32_t arg0, IR::Value arg1) {
 	arg1 = arg1.Resolve();
 	return arg1.IsImmediate() && arg1.U32() == 0u

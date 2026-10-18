@@ -401,6 +401,17 @@ uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t ballot, uint32_t
 
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane);
 
+// Whether a wave32 guest program may run in a 64-lane host subgroup: drivers need not take a
+// required subgroup size outside compute, task and mesh stages. Host lanes 32-63 are then a
+// second guest wave, so ballots, lane choices and wave-wide decisions stay within the
+// invocation's own 32 lanes. Checks use the runtime lane, so a 32-lane host subgroup is exact too.
+bool     GuestWavesShareHostSubgroup(const IR::Program& program);
+bool     GuestWavesShareHostSubgroup(const EmitterState& state);
+// 32 in host lanes 32-63, else 0.
+uint32_t EmitOwnGuestWaveBase(EmitterState& state);
+// The invocation's own 32-lane word of a host ballot.
+uint32_t EmitOwnGuestWaveWord(EmitterState& state, uint32_t ballot);
+
 inline constexpr auto EmitAddU32 = EmitNative<spv::OpIAdd, IR::Type::U32, uint32_t, uint32_t>;
 
 uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32_t rhs);

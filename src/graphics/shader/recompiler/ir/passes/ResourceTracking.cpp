@@ -3929,10 +3929,14 @@ private:
 			if (memory.kind == ResourceKind::Flat && memory.address_is_full &&
 			    IsNoncanonicalFlatAddress(inst.Arg(2), inst.Arg(inst.NumArgs() - 1))) {
 				ValidateAddressHandle(inst.Arg(0), flags.pc);
-				if (memory.data_bits != 32u || m_program.scratch_dwords == 0) {
-					Fail(flags.pc, "local FLAT access requires DWORD data and per-thread scratch storage");
+				if (memory.data_bits == 32u && m_program.scratch_dwords != 0) {
+					m_program.memory_info[flags.index].kind = ResourceKind::FlatLocal;
+					return;
 				}
-				m_program.memory_info[flags.index].kind = ResourceKind::FlatLocal;
+				// Subword or scratch-less local accesses take the generic aperture path, which
+				// routes each lane to LDS or scratch; no lane can reach guest memory.
+				m_program.memory_info[flags.index].aperture_only = true;
+				m_info.uses_dma                                  = true;
 				return;
 			}
 			if (memory.kind == ResourceKind::Scratch) {

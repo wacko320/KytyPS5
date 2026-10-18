@@ -41,7 +41,9 @@ uint32_t              EmitCompositeExtractU64(EmitterState& state, uint32_t arg0
 uint32_t              EmitCompositeExtractU32x2(EmitterState& state, uint32_t arg0, IR::Value arg1);
 inline constexpr auto EmitCompositeExtractU32x3 = EmitCompositeExtractU32x2;
 inline constexpr auto EmitCompositeExtractU32x4 = EmitCompositeExtractU32x2;
-inline constexpr auto EmitPackHalf2x16 = EmitGlsl<GLSLstd450PackHalf2x16, IR::Type::U32, uint32_t>;
+// Round-to-nearest-even: GLSL PackHalf2x16 leaves rounding to the driver (RADV truncates), but
+// RDNA2 rounds half-precision results to nearest even.
+uint32_t EmitPackHalf2x16(EmitterState& state, uint32_t pair);
 inline constexpr auto EmitPackSnorm2x16 =
     EmitGlsl<GLSLstd450PackSnorm2x16, IR::Type::U32, uint32_t>;
 inline constexpr auto EmitPackUnorm2x16 =
@@ -63,7 +65,7 @@ EMIT_NATIVE(UDiv32, OpUDiv, U32, uint32_t, uint32_t)
 EMIT_NATIVE(IAdd64, OpIAdd, U64, uint32_t, uint32_t)
 EMIT_NATIVE(ISub64, OpISub, U64, uint32_t, uint32_t)
 EMIT_NATIVE(IMul64, OpIMul, U64, uint32_t, uint32_t)
-EMIT_NATIVE(IAddCarry32, OpIAddCarry, U32x2, uint32_t, uint32_t)
+uint32_t EmitIAddCarry32(EmitterState& state, uint32_t arg0, uint32_t arg1);
 uint32_t EmitSMulHi(EmitterState& state, uint32_t arg0, uint32_t arg1);
 uint32_t EmitUMulHi(EmitterState& state, uint32_t arg0, uint32_t arg1);
 inline constexpr auto EmitIAbs32 = EmitGlsl<GLSLstd450SAbs, IR::Type::U32, uint32_t>;
@@ -233,7 +235,10 @@ inline constexpr auto EmitUndefU64 = EmitUndefU1;
 uint32_t              EmitDppMoveU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitWqmU64(EmitterState& state, uint32_t value);
-uint32_t              EmitLaneId(EmitterState& state);
+uint32_t              EmitLaneId(ValueEmitContext& ctx);
+// The host invocation's lane (the guest lane of half 0).
+uint32_t              EmitHostLaneId(EmitterState& state);
+uint32_t              EmitGuestLane(ValueEmitContext& ctx);
 uint32_t              EmitBallot(ValueEmitContext& ctx, IR::Value predicate);
 uint32_t              EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst);

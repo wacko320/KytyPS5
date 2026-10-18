@@ -81,6 +81,10 @@ struct MemoryInfo {
 	bool                    offen                                                 = false;
 	bool                    coherent                                              = false;
 	bool                    planning_only                                         = false;
+	// FLAT with segment 0: each lane's address may fall in the LDS or scratch aperture.
+	bool                    generic_aperture                                      = false;
+	// The address is provably outside canonical memory, so only the apertures can be reached.
+	bool                    aperture_only                                         = false;
 
 	[[nodiscard]] bool IsCoherentBufferPairLoad(ValueOpcode opcode) const {
 		return kind == ResourceKind::Buffer && opcode == ValueOpcode::LoadBufferU32x2 && coherent &&

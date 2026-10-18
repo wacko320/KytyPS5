@@ -76,9 +76,9 @@ BufferAddress CalculateBufferAddress(EmitterState& state, uint32_t index, uint32
 	return {offset, add(address, soffset)};
 }
 
-uint32_t BufferLane(EmitterState& state) {
-	return Binary(state, spv::OpBitwiseAnd, TypeU32(state), EmitSubgroupLocalInvocationId(state),
-	              ConstantU32(state, 63));
+// ADD_TID adds the guest lane.
+uint32_t BufferLane(ValueEmitContext& ctx) {
+	return EmitGuestLane(ctx);
 }
 
 uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
@@ -87,7 +87,7 @@ uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 	const auto stride = packed & 0x3fffu;
 	auto       index  = ctx.Arg(inst, 1);
 	if ((packed & (1u << 20u)) != 0u) {
-		index = Binary(state, spv::OpIAdd, TypeU32(state), index, BufferLane(state));
+		index = Binary(state, spv::OpIAdd, TypeU32(state), index, BufferLane(ctx));
 	}
 	const bool swizzle = stride != 0u && (packed & (1u << 14u)) != 0u;
 	return CalculateBufferAddress(state, index, ctx.Arg(inst, 2), ctx.Arg(inst, 3), mem.offset,
@@ -141,12 +141,17 @@ uint32_t GuestAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Mem
 			ctx.Fail(inst, "has no address base pair");
 			return ConstantU64(state, 0);
 		}
-		auto base_low = ctx.Arg(*handle, 0);
+		auto base_low  = ctx.Arg(*handle, 0);
+		auto base_high = ctx.Arg(*handle, 1);
 		if (mem.kind == IR::ResourceKind::ScalarAddress) {
-			base_low = Binary(state, spv::OpBitwiseAnd, TypeU32(state), base_low,
-			                  ConstantU32(state, ~3u));
+			// Scalar memory addresses are 48 bits wide, as the host's scalar path (SrtWalker's
+			// AddressMask) treats them: drop the upper bits of the high word as well.
+			base_low  = Binary(state, spv::OpBitwiseAnd, TypeU32(state), base_low,
+			                   ConstantU32(state, ~3u));
+			base_high = Binary(state, spv::OpBitwiseAnd, TypeU32(state), base_high,
+			                   ConstantU32(state, 0xffffu));
 		}
-		const auto base = PackU64(state, base_low, ctx.Arg(*handle, 1));
+		const auto base = PackU64(state, base_low, base_high);
 		address         = Binary(state, spv::OpIAdd, TypeU64(state), base,
 		                         Unary(state, spv::OpUConvert, TypeU64(state), low));
 	}
@@ -702,6 +707,112 @@ void StoreLocalFlat(ValueEmitContext& ctx, const IR::Inst& inst) {
 	});
 }
 
+// A segment-0 FLAT address selects LDS or per-lane scratch when its high dword is an aperture
+// tag; the low dword is then the byte offset within it. Other addresses reach guest memory.
+struct GenericAddress {
+	uint32_t address     = 0;
+	uint32_t local       = 0;
+	uint32_t lds         = 0;
+	uint32_t scratch     = 0;
+	uint32_t memory      = 0;
+	bool     has_scratch = false;
+};
+
+GenericAddress ResolveGenericAddress(ValueEmitContext& ctx, const IR::Inst& inst,
+                                     const IR::MemoryInfo& mem) {
+	auto&          state = ctx.state;
+	GenericAddress result;
+	result.address  = GuestAddress(ctx, inst, mem);
+	result.local    = Unary(state, spv::OpUConvert, TypeU32(state), result.address);
+	const auto high = Unary(state, spv::OpUConvert, TypeU32(state),
+	                        Binary(state, spv::OpShiftRightLogical, TypeU64(state), result.address,
+	                               ConstantU64(state, 32)));
+	const auto active     = ctx.Arg(inst, inst.NumArgs() - 1);
+	const auto is_lds     = Binary(state, spv::OpIEqual, TypeBool(state), high,
+	                               ConstantU32(state, Decoder::SharedApertureHigh));
+	const auto is_scratch = Binary(state, spv::OpIEqual, TypeBool(state), high,
+	                               ConstantU32(state, Decoder::PrivateApertureHigh));
+	result.has_scratch    = state.program.scratch_dwords != 0u;
+	result.lds            = AndCondition(state, active, is_lds);
+	result.scratch        = AndCondition(state, active, is_scratch);
+	result.memory         = AndCondition(
+        state, active,
+        Unary(state, spv::OpLogicalNot, TypeBool(state),
+              Binary(state, spv::OpLogicalOr, TypeBool(state), is_lds, is_scratch)));
+	return result;
+}
+
+uint32_t LocalElementIndex(EmitterState& state, const MemoryResourceAccess& resource,
+                           uint32_t address) {
+	return Binary(state, spv::OpShiftRightLogical, TypeU32(state), address,
+	              ConstantU32(state, std::countr_zero(resource.element_bits / 8u)));
+}
+
+uint32_t LoadLocal(ValueEmitContext& ctx, IR::MemoryInfo mem, IR::ResourceKind kind,
+                   uint32_t address, uint32_t bits) {
+	mem.kind            = kind;
+	const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+	const auto index    = LocalElementIndex(ctx.state, resource, address);
+	return EmitValueOrZeroIfCondition(
+	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
+		    return bits == 32u ? LoadWordInBounds(ctx, resource, index)
+		                       : LoadSubwordInBounds(ctx, resource, address, index, bits, false);
+	    });
+}
+
+void StoreLocal(ValueEmitContext& ctx, IR::MemoryInfo mem, IR::ResourceKind kind, uint32_t address,
+                uint32_t bits, uint32_t data) {
+	mem.kind            = kind;
+	const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+	const auto index    = LocalElementIndex(ctx.state, resource, address);
+	EmitIfCondition(ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
+		if (bits == 32u) {
+			StoreWordInBounds(ctx, resource, index, data);
+		} else {
+			StoreSubwordInBounds(ctx, mem, resource, address, index, bits, data);
+		}
+	});
+}
+
+// Each lane reads LDS, scratch or guest memory by its own address.
+uint32_t LoadGeneric(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                     uint32_t bits) {
+	auto&      state   = ctx.state;
+	const auto generic = ResolveGenericAddress(ctx, inst, mem);
+	auto       value   = LoadBda(ctx, generic.address, generic.memory, bits, mem.coherent);
+	const auto merge   = [&](uint32_t local) {
+		value = Binary(state, spv::OpBitwiseOr, TypeU32(state), value, local);
+	};
+	merge(EmitValueOrZeroIfCondition(state, generic.lds, [&]() {
+		return LoadLocal(ctx, mem, IR::ResourceKind::Lds, generic.local, bits);
+	}));
+	if (generic.has_scratch) {
+		merge(EmitValueOrZeroIfCondition(state, generic.scratch, [&]() {
+			return LoadLocal(ctx, mem, IR::ResourceKind::Scratch, generic.local, bits);
+		}));
+	}
+	return value;
+}
+
+// Lanes outside the apertures store through the BDA page table, which only untracked writes
+// allow; ShaderInfoCollection rejects such stores otherwise.
+void StoreGeneric(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                  uint32_t bits) {
+	const auto generic = ResolveGenericAddress(ctx, inst, mem);
+	const auto data    = ctx.Arg(inst, inst.NumArgs() - 2);
+	if (ctx.state.program.untracked_writes && !mem.aperture_only) {
+		StoreBda(ctx, generic.address, generic.memory, bits, data);
+	}
+	EmitIfCondition(ctx.state, generic.lds, [&]() {
+		StoreLocal(ctx, mem, IR::ResourceKind::Lds, generic.local, bits, data);
+	});
+	if (generic.has_scratch) {
+		EmitIfCondition(ctx.state, generic.scratch, [&]() {
+			StoreLocal(ctx, mem, IR::ResourceKind::Scratch, generic.local, bits, data);
+		});
+	}
+}
+
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                        const MemoryResourceAccess& resource, uint32_t data) {
 	if (resource.object_pointer == 0u) return;
@@ -995,7 +1106,7 @@ std::array<uint32_t, 8> IndirectBufferArgs(ValueEmitContext& ctx, const IR::Inst
 		    : Binary(state, spv::OpIAdd, TypeU32(state), offset, immediate);
 	}
 	return {ctx.Arg(handle, 0), ctx.Arg(handle, 1), ctx.Arg(handle, 2), ctx.Arg(handle, 3),
-	        ctx.Arg(inst, 1), offset, ctx.Arg(inst, 3), BufferLane(state)};
+	        ctx.Arg(inst, 1), offset, ctx.Arg(inst, 3), BufferLane(ctx)};
 }
 
 IndirectBufferAccess PrepareIndirectBuffer(EmitterState& state,
@@ -1513,6 +1624,19 @@ void DefineGetBdaPointer(EmitterState& state) {
 	    address);
 	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, packed,
 	                                  ConstantU32(state, BufferCache::CACHING_PAGEBITS));
+	// Garbage addresses (e.g. from threads past a dispatch's thread count) must not index past
+	// the page table: an out-of-range read there can hang the GPU instead of faulting.
+	const auto table_length = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), table_length,
+	                          state.bda_pagetable_variable, 0);
+	const auto in_range =
+	    Binary(state, spv::OpULessThan, TypeBool(state), page64,
+	           Unary(state, spv::OpUConvert, type, table_length));
+	const auto lookup_label = state.builder.AllocateId();
+	const auto outer_label  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, outer_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, in_range, lookup_label, outer_label);
+	EmitLabel(state, lookup_label);
 	const auto page          = Unary(state, spv::OpUConvert, TypeU32(state), page64);
 	const auto entry_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state, 64),
@@ -1538,9 +1662,15 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 
 	EmitLabel(state, merge_label);
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpPhi, type, result, ConstantU64(state, 0), fault_label,
+	const auto looked_up = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpPhi, type, looked_up, ConstantU64(state, 0), fault_label,
 	                          available, available_label);
+	state.builder.AddFunction(spv::OpBranch, outer_label);
+
+	EmitLabel(state, outer_label);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpPhi, type, result, ConstantU64(state, 0), entry_label,
+	                          looked_up, merge_label);
 	state.builder.AddFunction(spv::OpReturnValue, result);
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }
@@ -1681,10 +1811,22 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto high   = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
-	const auto count = Binary(state, spv::OpIAdd, TypeU32(state),
-	                          Unary(state, spv::OpBitCount, TypeU32(state), low),
-	                          Unary(state, spv::OpBitCount, TypeU32(state), high));
-	const auto first = ctx.FirstLane(ballot);
+	// Two guest waves sharing the host subgroup each make their own allocation.
+	const bool shared = GuestWavesShareHostSubgroup(state);
+	const auto count =
+	    shared ? Unary(state, spv::OpBitCount, TypeU32(state), EmitOwnGuestWaveWord(state, ballot))
+	           : Binary(state, spv::OpIAdd, TypeU32(state),
+	                    Unary(state, spv::OpBitCount, TypeU32(state), low),
+	                    Unary(state, spv::OpBitCount, TypeU32(state), high));
+	auto first = 0u;
+	if (shared) {
+		first = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpExtInst, TypeU32(state), first, GlslStd450(state),
+		                          GLSLstd450FindILsb, EmitOwnGuestWaveWord(state, ballot));
+		first = EmitAddU32(state, first, EmitOwnGuestWaveBase(state));
+	} else {
+		first = ctx.FirstLane(ballot);
+	}
 	const auto source_lane =
 	    state.lane_count == 2
 	        ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), first, ConstantU32(state, 31))
@@ -1781,6 +1923,8 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		value = LoadWideShared(ctx, inst, shared_components);
 	else if (mem.kind == IR::ResourceKind::ScalarAddress)
 		value = LoadBdaDword(ctx, GuestAddress(ctx, inst, mem));
+	else if (mem.generic_aperture && address_info.access == IR::AddressAccess::Read)
+		value = LoadGeneric(ctx, inst, mem, address_info.data_bits);
 	else if (address_info.access == IR::AddressAccess::Read &&
 	         mem.kind != IR::ResourceKind::Scratch)
 		value = LoadBda(ctx, GuestAddress(ctx, inst, mem), ctx.Arg(inst, inst.NumArgs() - 1),
@@ -1804,6 +1948,8 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		StoreLocalFlat(ctx, inst);
 	else if (mem.kind == IR::ResourceKind::IndirectBuffer)
 		StoreIndirectBuffer(ctx, inst, std::max(buffer_components, 1u));
+	else if (mem.generic_aperture && IR::AddressOpcodeInfoOf(op).access == IR::AddressAccess::Write)
+		StoreGeneric(ctx, inst, mem, IR::AddressOpcodeInfoOf(op).data_bits);
 	else if (IR::AddressOpcodeInfoOf(op).access == IR::AddressAccess::Write &&
 	         mem.kind != IR::ResourceKind::Scratch)
 		StoreBda(ctx, GuestAddress(ctx, inst, mem), ctx.Arg(inst, inst.NumArgs() - 1),

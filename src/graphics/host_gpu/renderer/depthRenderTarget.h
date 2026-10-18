@@ -11,8 +11,17 @@
 
 namespace Libs::Graphics {
 
+struct GraphicContext;
+
 // Without a stencil plane, Hi-Stencil fields are inactive. An active plane is compatible when
 // Hi-Stencil is disabled or HTile backing is present.
+// The host format for a guest depth format: its depth format, or with stencil the first of the
+// policy's stencil formats the device supports as a depth target at that sample count
+// (eUndefined when none is).
+[[nodiscard]] vk::Format ResolveHostDepthAttachmentFormat(GraphicContext&          graphics,
+                                                          const DepthFormatPolicy& policy,
+                                                          bool has_stencil, uint32_t samples);
+
 inline constexpr bool depth_htile_stencil_acceleration_compatible(bool has_stencil, bool has_htile,
                                                                   bool htile_stencil_disabled) {
 	return !has_stencil || htile_stencil_disabled || has_htile;

@@ -1783,6 +1783,168 @@ constexpr uint32_t EncodeExp1(uint32_t src0, uint32_t src1, uint32_t src2,
          ((src3 & 0xffu) << 24u);
 }
 
+ 
+// A MUBUF dword load with no VGPR address is wave-uniform. When it feeds a descriptor word, the
+// load is evaluated at dispatch like a scalar buffer load instead of failing resource tracking.
+void TestUniformBufferLoadFeedsDescriptor() {
+  // s[4:7] = {s12, s13 | stride 4, 1 record, 0x16204}
+  // buffer_load_dword v1, off, s[4:7], 0
+  // s[0:3] = {s8, s9 | stride 4, readfirstlane(v1), 0x16204}
+  // buffer_store_dword v2, v0, s[0:3], 0 idxen
+  const uint32_t shader[] = {
+      0xbe84030cu, 0x8805ff0du, 0x00040000u, 0xbe860381u, 0xbe8703ffu,
+      0x00016204u, 0xe0300000u, 0x80010100u, 0xbf8c3f70u, 0x7e040501u,
+      0xbe800308u, 0x8801ff09u, 0x00040000u, 0xbe8303ffu, 0x00016204u,
+      0x7e040280u, 0xe0702000u, 0x80000200u, 0xbf810000u,
+  };
+  alignas(16) static uint32_t count = 7;
+  alignas(16) static uint32_t target[16] = {};
+  const auto count_address = reinterpret_cast<uint64_t>(&count);
+  const auto target_address = reinterpret_cast<uint64_t>(target);
+  std::array<uint32_t, 16> user_data{};
+  user_data[8] = static_cast<uint32_t>(target_address);
+  user_data[9] = static_cast<uint32_t>(target_address >> 32u);
+  user_data[12] = static_cast<uint32_t>(count_address);
+  user_data[13] = static_cast<uint32_t>(count_address >> 32u);
+
+  static ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = 1;
+  compute.threads_num[2] = 1;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &compute;
+  options.user_data = user_data;
+
+  const auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto store = std::ranges::find_if(
+      result.resources.buffers, [&](const auto &descriptor) {
+        return descriptor.dwords[0] == user_data[8];
+      });
+  Check(store != result.resources.buffers.end(),
+        "uniform-load descriptor was not materialized");
+  Check(store->dwords[2] == count,
+        "descriptor NUM_RECORDS did not use the uniform buffer load");
+}
+
+// V_MOVRELD writes v[1 + m0] and v[2 + m0] in a loop whose uniform counter is bounded by a
+// constant loop test, so it cannot reach the descriptor words kept in v24-v27. Folding the
+// impossible relative-write candidates keeps the descriptor loop-invariant; with a bound from
+// user data the candidates cannot be ruled out and resource tracking must still reject it.
+void TestBoundedRelativeWritesKeepDescriptorsInvariant() {
+  //   v26 = s8, v25 = s9, v24 = 16, v27 = 0x16204, v23 = bound, s2 = 0
+  // loop:
+  //   v_cmp_lt_u32 vcc, s2, v23 ; s_cbranch_vccz done
+  //   m0 = 2 * s2++ ; v_movreld_b32 v1, v0 ; v_movreld_b32 v2, v0 ; s_branch loop
+  // done:
+  //   s[4:7] = readfirstlane(v26, v25, v24, v27)
+  //   buffer_store_dword v1, v0, s[4:7], 0 idxen
+  const auto shader = [](uint32_t bound) {
+    return std::array<uint32_t, 24>{
+        0x7e340208u, 0x7e320209u, 0x7e300290u, 0x7e3602ffu, 0x00016204u,
+        bound,       0x7e020280u, 0x7e040280u, 0xbe820380u, 0x7d822e02u,
+        0xbf860006u, 0x8f038102u, 0x81028102u, 0xbefc0303u, 0x7e028500u,
+        0x7e048500u, 0xbf82fff8u, 0x7e08051au, 0x7e0a0519u, 0x7e0c0518u,
+        0x7e0e051bu, 0xe0702000u, 0x80010100u, 0xbf810000u};
+  };
+  constexpr uint32_t bound_constant = 0x7e2e0284u;  // v_mov_b32 v23, 4
+  constexpr uint32_t bound_user_data = 0x7e2e020cu; // v_mov_b32 v23, s12
+  alignas(16) static uint32_t target[64] = {};
+  const auto target_address = reinterpret_cast<uint64_t>(target);
+  static std::array<uint32_t, 16> user_data{};
+  user_data[8] = static_cast<uint32_t>(target_address);
+  user_data[9] = static_cast<uint32_t>(target_address >> 32u);
+  static ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = 1;
+  compute.threads_num[2] = 1;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &compute;
+  options.user_data = user_data;
+
+  const auto bounded = shader(bound_constant);
+  const auto result = RecompileForTest(bounded, options);
+  CheckSpirvBinaryValidates(result.spirv);
+  // The loop watchdog adds a continue-block exit to the loop merge; the module stays valid.
+  auto watchdog_options = options;
+  watchdog_options.loop_watchdog_limit = 1000;
+  CheckSpirvBinaryValidates(RecompileForTest(bounded, watchdog_options).spirv);
+  const auto store = std::ranges::find_if(
+      result.resources.buffers, [&](const auto &descriptor) {
+        return descriptor.dwords[0] == user_data[8];
+      });
+  Check(store != result.resources.buffers.end() && store->dwords[2] == 16u,
+        "bounded relative writes did not keep the descriptor loop-invariant");
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  static const auto unbounded = shader(bound_user_data);
+  static const auto unbounded_options = options;
+  ExpectFatal([] { (void)RecompileForTest(unbounded, unbounded_options); },
+              "unbounded relative writes were assumed to miss the descriptor");
+#endif
+}
+
+// A uniform branch on user data picks the store descriptor's base; dword 1 ORs the stride into
+// the selected high word. The shader writes memory, but the branch condition reads none, so the
+// host can evaluate the selection before the dispatch. A condition loaded from memory cannot be
+// evaluated that way in a writing shader and must still be rejected.
+void TestDescriptorSelectedByUniformBranchInWritingShader() {
+  //   s12 = s2 (or s_load_dword s12, s[4:5], 0)
+  //   s_cmp_lg_u32 0, s12 ; s_cbranch_scc0 other
+  //   s[8:9] = s3, s0 ; s_branch join
+  // other: s[8:9] = s6, s1
+  // join: s10 = 64 ; s11 = 0x16204 ; s_bitset1_b32 s9, 18
+  //   buffer_store_dword v1, v0, s[8:11], 0 idxen
+  static const uint32_t from_user_data[] = {
+      0xbe8c0302u, 0xbf070c80u, 0xbf840003u, 0xbe880303u, 0xbe890300u, 0xbf820002u,
+      0xbe880306u, 0xbe890301u, 0xbe8a03c0u, 0xbe8b03ffu, 0x00016204u, 0xbe891d92u,
+      0x7e020280u, 0xe0702000u, 0x80020100u, 0xbf810000u};
+  static const uint32_t from_memory[] = {
+      0xf4000302u, 0xfa000000u, 0xbf8cc07fu, 0xbf070c80u, 0xbf840003u, 0xbe880303u,
+      0xbe890300u, 0xbf820002u, 0xbe880306u, 0xbe890301u, 0xbe8a03c0u, 0xbe8b03ffu,
+      0x00016204u, 0xbe891d92u, 0x7e020280u, 0xe0702000u, 0x80020100u, 0xbf810000u};
+  alignas(16) static uint32_t first[64] = {};
+  alignas(16) static uint32_t second[64] = {};
+  alignas(16) static uint32_t condition = 1;
+  static ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = 1;
+  compute.threads_num[2] = 1;
+  const auto run = [&](uint32_t selector, uint64_t expected) {
+    static std::array<uint32_t, 16> user_data{};
+    const auto a = reinterpret_cast<uint64_t>(first);
+    const auto b = reinterpret_cast<uint64_t>(second);
+    user_data[2] = selector;
+    user_data[3] = static_cast<uint32_t>(a);
+    user_data[0] = static_cast<uint32_t>(a >> 32u);
+    user_data[6] = static_cast<uint32_t>(b);
+    user_data[1] = static_cast<uint32_t>(b >> 32u);
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.input_info.compute = &compute;
+    options.user_data = user_data;
+    const auto result = RecompileForTest(from_user_data, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    Check(result.resources.buffers.size() == 1u, "selected descriptor was not materialized");
+    const auto &words = result.resources.buffers[0].dwords;
+    Check(words[0] == static_cast<uint32_t>(expected) &&
+              words[1] == (static_cast<uint32_t>(expected >> 32u) | (1u << 18u)),
+          "uniform branch selected the wrong descriptor base");
+  };
+  run(1, reinterpret_cast<uint64_t>(first));
+  run(0, reinterpret_cast<uint64_t>(second));
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  static std::array<uint32_t, 16> memory_user_data{};
+  memory_user_data[4] = static_cast<uint32_t>(reinterpret_cast<uint64_t>(&condition));
+  memory_user_data[5] = static_cast<uint32_t>(reinterpret_cast<uint64_t>(&condition) >> 32u);
+  static auto memory_options = MakeCompileOptions(ShaderType::Compute);
+  memory_options.input_info.compute = &compute;
+  memory_options.user_data = memory_user_data;
+  ExpectFatal([] { (void)RecompileForTest(from_memory, memory_options); },
+              "memory-dependent descriptor selection was evaluated before a writing dispatch");
+#endif
+}
+
 void TestNewShaderRecompilerSMovB32() {
   const uint32_t shader[] = {
       EncodeSMovB32(0, 129), // s_mov_b32 s0, 1
@@ -2270,8 +2432,9 @@ void TestNewShaderRecompilerScalarVectorAlu() {
         "V_BCNT_U32_B32 did not lower to bit-count-add IR");
   Check(SpirvContainsOpcode(result.spirv, 128),
         "SPIR-V binary does not contain OpIAdd");
-  Check(SpirvContainsOpcode(result.spirv, 149),
-        "SPIR-V binary does not contain OpIAddCarry");
+  // Carries come from an unsigned compare of the sum, never OpIAddCarry (spirvEmitterAlu.cpp).
+  Check(!SpirvContainsOpcode(result.spirv, 149) && SpirvContainsOpcode(result.spirv, 176),
+        "SPIR-V binary emits a carry through OpIAddCarry, not OpULessThan");
   Check(SpirvContainsOpcode(result.spirv, 129),
         "SPIR-V binary does not contain OpFAdd");
   Check(SpirvContainsOpcode(result.spirv, 132),
@@ -3265,8 +3428,9 @@ void TestNewShaderRecompilerMoreAluFamilies() {
         "SPIR-V binary does not contain GLSL.std.450 Ldexp");
   Check(SpirvContainsOpcode(result.spirv, 128),
         "SPIR-V binary does not contain OpIAdd");
-  Check(SpirvContainsOpcode(result.spirv, 149),
-        "SPIR-V binary does not contain OpIAddCarry");
+  // Carries come from an unsigned compare of the sum, never OpIAddCarry (spirvEmitterAlu.cpp).
+  Check(!SpirvContainsOpcode(result.spirv, 149) && SpirvContainsOpcode(result.spirv, 176),
+        "SPIR-V binary emits a carry through OpIAddCarry, not OpULessThan");
   Check(SpirvContainsOpcode(result.spirv, 130),
         "SPIR-V binary does not contain OpISub");
   Check(SpirvContainsOpcode(result.spirv, 132),
@@ -10619,6 +10783,80 @@ void TestCapturedBufferAtomicsX2() {
   }
 }
 
+// A wave reduction as compilers write it for RDNA: with every lane enabled, v_max_u32 over a DPP
+// row_shr scan (1, 2, 4, 8) of each row of 16 lanes, then v_readlane of each row's last lane
+// (wave32: lanes 15 and 31), or, after V_PERMLANEX16 adds the other row's last lane, of each row
+// pair's last lane (wave64: lanes 31 and 63). A partly filled host subgroup lacks lanes the scan
+// and v_readlane would read, so each read becomes a native subgroup reduction; the same code with
+// a different last shift stays a scan. A wave32 pixel shader shares its 64-lane host subgroup with
+// another guest wave, so each of its reads reduces both 32-lane halves and keeps its own.
+// Two loop exits through separate tails before the loop merge (upstream PR #640): emitted either
+// through the dispatcher or with a structured selection, never as merge-free loop-control branches.
+void TestNewShaderRecompilerCfgLoopExitTailSelection() {
+  const uint32_t shader[] = {
+      EncodeSopc(0x0a, 0, 129),    // loop: s_cmp_lt_u32 s0, 1
+      EncodeSopp(0x04, 4),         // exit through tail A, not the loop merge
+      EncodeSopc(0x0a, 1, 129),    // second exit condition
+      EncodeSopp(0x04, 4),         // exit through tail B
+      EncodeSop2(0x00, 0, 0, 129), // loop work
+      EncodeSopp(0x02, 0xfffau),   // backedge -> loop
+      EncodeSMovB32(2, 129),       // tail A
+      EncodeSopp(0x02, 2),         // tail A -> merge
+      EncodeSMovB32(3, 129),       // tail B
+      EncodeSopp(0x02, 0),         // tail B -> merge
+      0xbf810000u,                 // common loop merge
+  };
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto result = RecompileForTest(shader, options);
+  Check(result.program.dispatcher_fallback || SpirvContainsOpcode(result.spirv, 247),
+        "loop exit tails were emitted as merge-free loop-control branches");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestWaveRowReduction() {
+  const auto native_reductions = [](uint32_t last_control, bool row_pairs) {
+    std::vector<uint32_t> shader = {
+        row_pairs ? EncodeSop1(0x04, 126, 193) : EncodeSMovB32(126, 193), // s_mov_b64 exec, -1
+        EncodeVop2(0x14, 1, 250, 0), EncodeVop2Dpp(0, 0x111), // v_max_u32 v1, v0 row_shr:1, v0
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x112), // v_max_u32 v1, v1 row_shr:2, v1
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x114),
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, last_control),
+    };
+    const uint32_t lanes[2] = {row_pairs ? 31u : 15u, row_pairs ? 63u : 31u};
+    if (row_pairs) {
+      shader.insert(shader.end(), {
+          EncodeVop3Word0(0x378, 2), EncodeVop3Word1(256 + 1, 193, 193), // v_permlanex16_b32 v2, v1, -1, -1
+          EncodeVop2(0x14, 1, 256 + 1, 2),                              // v_max_u32 v1, v1, v2
+      });
+    }
+    shader.insert(shader.end(), {
+        EncodeVop3Word0(0x360, 2), EncodeVop3Word1(256 + 1, 128 + lanes[0], 0), // v_readlane_b32 s2
+        EncodeVop3Word0(0x360, 3), EncodeVop3Word1(256 + 1, 128 + lanes[1], 0), // v_readlane_b32 s3
+        EncodeSop2(0x09, 4, 2, 3),                    // s_max_u32 s4, s2, s3
+        EncodeVop1(0x01, 2, 4),                       // v_mov_b32 v2, s4
+        EncodeExp0(0x00, 0xf), EncodeExp1(2, 2, 2, 2), // exp mrt0
+        0xbf810000u,
+    });
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.wave_size = row_pairs ? 64 : 32;
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    size_t found = 0;
+    for (auto at = source.find("OpGroupNonUniformUMax"); at != std::string::npos;
+         at = source.find("OpGroupNonUniformUMax", at + 1)) {
+      found++;
+    }
+    return found;
+  };
+  Check(native_reductions(0x118, false) == 4,
+        "a DPP row scan read at lanes 15 and 31 did not become two row reductions per guest wave");
+  Check(native_reductions(0x118, true) == 2,
+        "a DPP row scan with V_PERMLANEX16 read at lanes 31 and 63 did not become two reductions");
+  Check(native_reductions(0x117, false) == 0 && native_reductions(0x117, true) == 0,
+        "a scan with the wrong last shift was taken for a lane reduction");
+}
+
 void TestNewShaderRecompilerBranchConditionForms() {
   struct Case {
     uint32_t opcode;
@@ -16255,9 +16493,10 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x02, 0xfffcu),   // continue/backedge
       EncodeSopp(0x01),
   };
+  // The s_add_u32 carry is an unsigned compare of the sum (spirvEmitterAlu.cpp EmitIAddCarry32).
   auto structured_result = compile("structured-phi", structured_phi,
-                                         {.words = 174,
-                                          .instructions = 49,
+                                         {.words = 206,
+                                          .instructions = 55,
                                           .phis = 1,
                                           .labels = 8,
                                           .loop_merges = 1,
@@ -16275,8 +16514,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvBlockSourceMapping(structured_result);
   const auto structured_repeat =
       compile("structured-phi-repeat", structured_phi,
-              {.words = 174,
-               .instructions = 49,
+              {.words = 206,
+               .instructions = 55,
                .phis = 1,
                .labels = 8,
                .loop_merges = 1,
@@ -16491,6 +16730,9 @@ int main() {
   TestRepeatedExportsHaveOneInterface();
   TestNewShaderRecompilerSpirvSizeBaselines();
   TestDemandDrivenSpirvDeclarations();
+  TestUniformBufferLoadFeedsDescriptor();
+  TestBoundedRelativeWritesKeepDescriptorsInvariant();
+  TestDescriptorSelectedByUniformBranchInWritingShader();
   TestNewShaderRecompilerSMovB32();
   TestShaderStageBarriers();
   TestVertexBufferGrouping();
@@ -16594,6 +16836,8 @@ int main() {
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
+  TestWaveRowReduction();
+  TestNewShaderRecompilerCfgLoopExitTailSelection();
   TestDisabledDebugBranches();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();

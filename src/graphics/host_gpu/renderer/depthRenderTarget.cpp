@@ -105,11 +105,8 @@ static vk::StencilOpState ConvertStencilState(
 	        state.compareMask, state.writeMask, reference};
 }
 
-[[nodiscard]] static vk::Format ResolveHostDepthAttachmentFormat(const CommandBuffer&     buffer,
-                                                                 const DepthFormatPolicy& policy,
-                                                                 bool     has_stencil,
-                                                                 uint32_t samples) {
-	auto&      graphics         = buffer.GetGraphics();
+vk::Format ResolveHostDepthAttachmentFormat(GraphicContext& graphics, const DepthFormatPolicy& policy,
+                                            bool has_stencil, uint32_t samples) {
 	const auto required_samples = vulkan_sample_count(samples);
 	const auto supports         = [&](vk::Format format) {
 		vk::ImageFormatProperties properties {};
@@ -191,7 +188,8 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 		DepthFatal("unsupported depth/stencil format pair");
 	}
 	const auto ideal_format = DepthAttachmentFormat(*policy, has_stencil);
-	const auto format = ResolveHostDepthAttachmentFormat(buffer, *policy, has_stencil, samples);
+	const auto format =
+	    ResolveHostDepthAttachmentFormat(buffer.GetGraphics(), *policy, has_stencil, samples);
 	if (format == vk::Format::eUndefined) {
 		DepthFatal("no host depth/stencil format supports required usage for %s",
 		           vk::to_string(ideal_format).c_str());

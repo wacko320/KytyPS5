@@ -13,6 +13,9 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 // PS5 flat stack addresses use these SH_MEM_BASES aperture tags in VA[63:32].
 constexpr uint32_t PrivateApertureHigh = 0x70000000u;
 constexpr uint32_t SharedApertureHigh = 0x80000000u;
+// An aperture spans the 2^48 bytes below its tag: SRC_*_LIMIT is the tag with this low half set
+// in VA[63:32] and all ones in VA[31:0].
+constexpr uint32_t ApertureLimitLow16 = 0x0000ffffu;
 
 enum class Family {
 	Unknown,
@@ -755,8 +758,11 @@ enum class OperandKind {
 	Scc,
 	M0,
 	PopsExitingWaveId,
+	// SRC_{SHARED,PRIVATE}_{BASE,LIMIT}: 64-bit aperture bounds; a 32-bit read yields VA[63:32].
 	SharedBase,
+	SharedLimit,
 	PrivateBase,
+	PrivateLimit,
 	Null,
 	Vgpr,
 };

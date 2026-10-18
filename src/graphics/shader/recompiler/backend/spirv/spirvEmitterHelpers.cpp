@@ -227,7 +227,7 @@ uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, u
 	const auto low = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, active_ballot, 0);
 	uint32_t mask = low;
-	if (state.program.wave_size == 64u) {
+	if (state.program.wave_size == 64u || GuestWavesShareHostSubgroup(state)) {
 		const auto high     = state.builder.AllocateId();
 		const auto in_high  = state.builder.AllocateId();
 		const auto selected = state.builder.AllocateId();
@@ -252,10 +252,38 @@ uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, u
 	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), hit, mask, bit);
 	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), active, hit,
 	                          ConstantU32(state, 0));
-	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), in_range, lane,
-	                          ConstantU32(state, state.program.wave_size));
+	state.builder.AddFunction(
+	    spv::OpULessThan, TypeBool(state), in_range, lane,
+	    ConstantU32(state, GuestWavesShareHostSubgroup(state) ? 64u : state.program.wave_size));
 	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), ret, active, in_range);
 	return ret;
+}
+
+bool GuestWavesShareHostSubgroup(const IR::Program& program) {
+	// Compute and mesh pipelines require the guest's subgroup size and tessellation control
+	// lanes are invocation ids; other graphics stages take the driver's size (RADV: 64).
+	const auto stage = program.stage;
+	return program.wave_size == 32u && stage != ShaderType::Compute && stage != ShaderType::Mesh &&
+	       stage != ShaderType::TessellationControl;
+}
+
+bool GuestWavesShareHostSubgroup(const EmitterState& state) {
+	return state.lane_count == 1 && GuestWavesShareHostSubgroup(state.program);
+}
+
+uint32_t EmitOwnGuestWaveBase(EmitterState& state) {
+	return EmitBinaryU32(state, spv::OpBitwiseAnd, EmitSubgroupLocalInvocationId(state),
+	                     ConstantU32(state, 32));
+}
+
+uint32_t EmitOwnGuestWaveWord(EmitterState& state, uint32_t ballot) {
+	const auto low  = state.builder.AllocateId();
+	const auto high = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
+	const auto upper = Binary(state, spv::OpINotEqual, TypeBool(state), EmitOwnGuestWaveBase(state),
+	                          ConstantU32(state, 0));
+	return Select(state, TypeU32(state), upper, high, low);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
