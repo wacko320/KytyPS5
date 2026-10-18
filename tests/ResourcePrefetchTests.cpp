@@ -1425,6 +1425,56 @@ void TestKeyedBuildQueue() {
         "shutdown ran a queued build or accepted a new one");
 }
 
+// TakeStarted (precompiles): a build no worker started is dropped, not built by the requester;
+// a running one is waited for; WaitIdle returns once nothing is queued or running.
+void TestKeyedBuildQueueTakeStarted() {
+  using Queue = Libs::Graphics::KeyedBuildQueue<int>;
+  std::mutex mutex;
+  std::condition_variable changed;
+  bool release = false;
+  bool started = false;
+  bool ran_queued = false;
+  std::vector<int> disposed;
+  Queue queue(1, 4, [&](int &value) { disposed.push_back(value); }, 10);
+  Check(queue.Submit(1, [&] {
+          std::unique_lock lock(mutex);
+          started = true;
+          changed.notify_all();
+          changed.wait(lock, [&] { return release; });
+          return 10;
+        }),
+        "gated build was refused");
+  {
+    std::unique_lock lock(mutex);
+    changed.wait(lock, [&] { return started; });
+  }
+  Check(queue.Submit(2, [&] {
+          ran_queued = true;
+          return 20;
+        }),
+        "queued build was refused");
+  Check(!queue.TakeStarted(2).has_value() && !ran_queued && !queue.Contains(2),
+        "TakeStarted built a queued build instead of dropping it");
+  std::optional<int> waited;
+  std::thread taker([&] { waited = queue.TakeStarted(1); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  Check(!waited.has_value(), "TakeStarted handed over a running build before it finished");
+  {
+    std::lock_guard lock(mutex);
+    release = true;
+  }
+  changed.notify_all();
+  taker.join();
+  Check(waited == 10, "TakeStarted did not wait for the running build");
+  Check(queue.Submit(3, [] { return 30; }), "build was refused");
+  queue.WaitIdle();
+  Check(queue.Contains(3) && queue.GetStats().built == 2 && queue.GetStats().dropped == 1,
+        "WaitIdle returned before the build finished, or the statistics are wrong");
+  queue.Shutdown();
+  Check(disposed == std::vector<int>{30} && !ran_queued,
+        "shutdown did not dispose of the untaken result");
+}
+
 int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bench") == 0) {
     Bench();
@@ -1436,6 +1486,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   TestKeyedBuildQueue();
+  TestKeyedBuildQueueTakeStarted();
   TestReplicaEvaluatesLikeThePlan();
   TestOutputsDoNotDependOnPriorContents();
   TestSpeculationMatchesSerial();

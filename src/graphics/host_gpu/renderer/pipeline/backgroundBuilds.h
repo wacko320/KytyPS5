@@ -23,10 +23,12 @@
 namespace Libs::Graphics {
 
 // Lowers the calling thread's scheduling priority, for work nothing waits on yet.
-inline void LowerBackgroundBuildPriority() {
+inline void LowerBackgroundBuildPriority(int nice = 5) {
 #if defined(__linux__)
 	// Linux applies nice values per thread.
-	setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 5);
+	setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), nice);
+#else
+	(void)nice;
 #endif
 }
 
@@ -41,11 +43,11 @@ public:
 	using Build   = std::function<Result()>;
 	using Dispose = std::function<void(Result&)>;
 
-	// At most `max_threads` workers (started on demand) and `max_entries` builds queued,
-	// running or finished but not taken.
-	KeyedBuildQueue(uint32_t max_threads, uint32_t max_entries, Dispose dispose)
+	// At most `max_threads` workers (started on demand, at nice value `nice` on Linux) and
+	// `max_entries` builds queued, running or finished but not taken.
+	KeyedBuildQueue(uint32_t max_threads, uint32_t max_entries, Dispose dispose, int nice = 5)
 	    : m_max_threads(std::max(max_threads, 1u)), m_max_entries(std::max(max_entries, 1u)),
-	      m_dispose(std::move(dispose)) {}
+	      m_nice(nice), m_dispose(std::move(dispose)) {}
 	~KeyedBuildQueue() { Shutdown(); }
 	KeyedBuildQueue(const KeyedBuildQueue&)            = delete;
 	KeyedBuildQueue& operator=(const KeyedBuildQueue&) = delete;
@@ -72,24 +74,20 @@ public:
 
 	// The build's result, waiting for it or building it here when needed; nullopt when no build
 	// has this key.
-	std::optional<Result> Take(uint64_t key) {
+	std::optional<Result> Take(uint64_t key) { return Take(key, true); }
+
+	// As Take, but a build no worker started yet is dropped instead (nullopt): for builds the
+	// requester has a cheaper way to make itself.
+	std::optional<Result> TakeStarted(uint64_t key) { return Take(key, false); }
+
+	// Until no build is queued or running.
+	void WaitIdle() {
 		std::unique_lock lock(m_mutex);
-		auto entry = Find(key);
-		if (entry == m_entries.end()) return std::nullopt;
-		if (entry->state == State::Queued) {
-			std::erase(m_queue, key);
-			auto build = std::move(entry->build);
-			m_entries.erase(entry);
-			m_stats.stolen++;
-			lock.unlock();
-			return build();
-		}
-		entry->claimed = true; // not evicted while this waits
-		m_done.wait(lock, [&] { return entry->state == State::Finished; });
-		auto result = std::move(entry->result);
-		m_entries.erase(entry);
-		m_stats.taken++;
-		return result;
+		m_done.wait(lock, [&] {
+			return m_stopped || std::ranges::none_of(m_entries, [](const Entry& entry) {
+				       return entry.state != State::Finished;
+			       });
+		});
 	}
 
 	// Stops the workers after their current build, drops queued builds and disposes of results
@@ -119,6 +117,7 @@ public:
 		uint64_t taken    = 0; // handed over finished or after a wait
 		uint64_t stolen   = 0; // still queued when taken: built by the requester
 		uint64_t disposed = 0; // finished but never taken
+		uint64_t dropped  = 0; // still queued when TakeStarted asked for it
 	};
 	[[nodiscard]] Stats GetStats() const {
 		std::lock_guard lock(m_mutex);
@@ -126,6 +125,30 @@ public:
 	}
 
 private:
+	std::optional<Result> Take(uint64_t key, bool build_queued) {
+		std::unique_lock lock(m_mutex);
+		auto entry = Find(key);
+		if (entry == m_entries.end()) return std::nullopt;
+		if (entry->state == State::Queued) {
+			std::erase(m_queue, key);
+			auto build = std::move(entry->build);
+			m_entries.erase(entry);
+			if (!build_queued) {
+				m_stats.dropped++;
+				return std::nullopt;
+			}
+			m_stats.stolen++;
+			lock.unlock();
+			return build();
+		}
+		entry->claimed = true; // not evicted while this waits
+		m_done.wait(lock, [&] { return entry->state == State::Finished; });
+		auto result = std::move(entry->result);
+		m_entries.erase(entry);
+		m_stats.taken++;
+		return result;
+	}
+
 	enum class State { Queued, Running, Finished };
 	struct Entry {
 		uint64_t              key = 0;
@@ -154,7 +177,7 @@ private:
 	}
 
 	void Work() {
-		LowerBackgroundBuildPriority();
+		LowerBackgroundBuildPriority(m_nice);
 		std::unique_lock lock(m_mutex);
 		for (;;) {
 			m_idle++;
@@ -179,6 +202,7 @@ private:
 
 	const uint32_t           m_max_threads;
 	const uint32_t           m_max_entries;
+	const int                m_nice;
 	Dispose                  m_dispose;
 	mutable std::mutex       m_mutex;
 	std::condition_variable  m_work;
