@@ -32,6 +32,7 @@
 #include "libs/agc.h"
 #include "spirv-tools/libspirv.hpp"
 #include "xxhash.h"
+#include "CfgPathPrograms.h"
 
 #include <algorithm>
 #include <array>
@@ -9846,6 +9847,216 @@ void TestCfgSiblingSharedExit() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// Path equivalence of goto elimination: the structured graph, interpreted with its route
+// variables, must execute the same guest instructions as the native graph under the same
+// branch decisions. Each native block is an s_cmp and a terminator; a decision is a function of
+// the block and how often it ran, so the two graphs see the same choices on every visit.
+std::vector<uint32_t> EncodeCfgPathBlocks(const std::vector<CfgPathBlock> &blocks) {
+  std::vector<uint32_t> code;
+  for (uint32_t index = 0; index < blocks.size(); index++) {
+    const auto &block = blocks[index];
+    code.push_back(EncodeSopc(0x06, index % 100u, 128)); // s_cmp_eq_u32 s[index], 0
+    const auto offset = static_cast<uint32_t>(2 * static_cast<int32_t>(block.target) -
+                                              2 * static_cast<int32_t>(index) - 2);
+    switch (block.kind) {
+    case CfgPathBlock::Next: code.push_back(EncodeSopp(0x00)); break;       // s_nop
+    case CfgPathBlock::Cond: code.push_back(EncodeSopp(0x05, offset)); break; // s_cbranch_scc1
+    case CfgPathBlock::Jump: code.push_back(EncodeSopp(0x02, offset)); break; // s_branch
+    case CfgPathBlock::End: {
+      // Decoding stops at an s_endpgm no earlier branch passes; such an exit jumps to the last.
+      const bool passed = std::any_of(blocks.begin(), blocks.begin() + index, [&](const auto &other) {
+        return other.kind != CfgPathBlock::Next && other.kind != CfgPathBlock::End &&
+               other.target == index + 1;
+      });
+      const auto last = static_cast<uint32_t>(blocks.size() - 1);
+      code.push_back(index == last || passed
+                         ? EncodeSopp(0x01) // s_endpgm
+                         : EncodeSopp(0x02, static_cast<uint32_t>(2 * (last - index) - 2)));
+      break;
+    }
+    }
+  }
+  return code;
+}
+
+// The guest instructions a graph executes, up to limit, with decisions from seed.
+std::vector<uint32_t> TraceCfgPath(const ShaderRecompiler::CFG::Graph &graph,
+                                   const ShaderRecompiler::CFG::Graph &native, uint64_t seed,
+                                   size_t limit) {
+  namespace CFG = ShaderRecompiler::CFG;
+  using Op = CFG::ConditionExpression::Op;
+  std::unordered_map<uint32_t, uint32_t> first_of, last_of;
+  for (const auto &block : native.blocks) {
+    if (block.inst_begin == block.inst_end) continue;
+    first_of[block.inst_begin] = block.id;
+    last_of[block.inst_end] = block.id;
+  }
+  std::unordered_map<uint32_t, uint32_t> visits;
+  const auto decide = [&](uint32_t block) {
+    CfgPathRandom random{seed ^ (uint64_t{block} << 32u) ^ visits[block]};
+    return (random() & 1u) != 0;
+  };
+  std::unordered_map<uint32_t, bool> variables;
+  const auto evaluate = [&](auto &&self, uint32_t index) -> bool {
+    const auto &value = graph.expressions.at(index);
+    switch (value.op) {
+    case Op::Constant: return value.lhs != 0;
+    case Op::Variable: return variables[value.lhs];
+    case Op::Native: std::abort();
+    case Op::Not: return !self(self, value.lhs);
+    case Op::Or: return self(self, value.lhs) || self(self, value.rhs);
+    }
+    std::abort();
+  };
+  std::vector<uint32_t> executed;
+  auto current = graph.entry_block;
+  for (size_t steps = 0; steps < limit * 64 && executed.size() < limit; steps++) {
+    const auto &block = graph.blocks.at(current);
+    for (auto inst = block.inst_begin; inst < block.inst_end; inst++) {
+      executed.push_back(inst);
+      if (const auto found = first_of.find(inst); found != first_of.end()) visits[found->second]++;
+    }
+    for (const auto &assignment : block.assignments) {
+      const bool value = graph.expressions.at(assignment.expression).op == Op::Native
+                             ? decide(last_of.at(block.inst_end))
+                             : evaluate(evaluate, assignment.expression);
+      variables[assignment.variable] = value;
+    }
+    const auto &term = block.terminator;
+    if (term.kind == CFG::TerminatorKind::Return) break;
+    Check(term.kind == CFG::TerminatorKind::Branch ||
+              term.kind == CFG::TerminatorKind::ConditionalBranch,
+          "path trace reached an unsupported terminator");
+    bool taken = true;
+    if (term.kind == CFG::TerminatorKind::ConditionalBranch) {
+      taken = term.expression != UINT32_MAX ? evaluate(evaluate, term.expression)
+                                            : decide(block.id);
+    }
+    current = taken ? term.true_block : term.false_block;
+  }
+  if (executed.size() > limit) executed.resize(limit);
+  return executed;
+}
+
+// Returns false, describing the program, when goto elimination changes an executed path.
+bool CheckCfgPaths(const std::vector<uint32_t> &code, std::span<const uint32_t> decision_seeds,
+                   std::string *failure, uint32_t *structured_count = nullptr) {
+  using namespace ShaderRecompiler;
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(std::span<const uint32_t>{code}, decoded);
+  const auto native = CFG::BuildGraph(decoded);
+  if (native.unsupported || native.irreducible) return true;
+  const auto structured = CFG::Structurize(native);
+  if (structured.unsupported) return true;
+  if (structured_count != nullptr) ++*structured_count;
+  for (const auto seed : decision_seeds) {
+    if (TraceCfgPath(native, native, seed, 600) != TraceCfgPath(structured, native, seed, 600)) {
+      *failure = "decision seed " + std::to_string(seed);
+      return false;
+    }
+  }
+  return true;
+}
+
+void TestCfgGotoEliminationPreservesPaths() {
+  std::vector<uint32_t> seeds;
+  for (uint32_t seed = 0; seed < 24; seed++) seeds.push_back(seed * 7919u + 1u);
+  uint32_t structured = 0;
+  uint32_t failures = 0;
+  for (uint32_t program = 0; program < 6000; program++) {
+    const auto blocks = RandomCfgProgram(program);
+    std::string failure;
+    if (!CheckCfgPaths(EncodeCfgPathBlocks(blocks), seeds, &failure, &structured)) {
+      std::string shape;
+      for (uint32_t index = 0; index < blocks.size(); index++) {
+        static constexpr const char *kinds[] = {"next", "cond", "jump", "end"};
+        shape += std::to_string(index) + ":" + kinds[blocks[index].kind];
+        if (blocks[index].kind == CfgPathBlock::Cond || blocks[index].kind == CfgPathBlock::Jump)
+          shape += "->" + std::to_string(blocks[index].target);
+        shape += " ";
+      }
+      if (failures++ < 3)
+        std::fprintf(stderr, "program %u (%s): %s\n", program, failure.c_str(), shape.c_str());
+    }
+  }
+  if (failures != 0) std::fprintf(stderr, "%u of %u programs changed a path\n", failures, structured);
+  Check(failures == 0, "goto elimination changed an executed path");
+  Check(structured > 3000, "too few path-check programs structured");
+}
+
+// A linked call's ladder of callees, each returning past the others. The caller spills its table
+// pointer s[16:17] to lanes 0-1 of v42; every callee but the last spills s9 over lane 0, and
+// the last restores the pointer, loads a V# through it and reads through that. No callee runs
+// after another, so the restored pointer, and with it the V#, is the caller's. Goto
+// elimination must keep the returns off the paths into the later callees: a path from a
+// return into the last callee merges the other spills into the restored pointer, and resource
+// tracking turns the read into a GPU-selected (indirect) one.
+void TestCfgLadderKeepsCalleeDescriptors() {
+  constexpr uint32_t kCallees = 10;
+  // VOP3 v_writelane_b32 / v_readlane_b32.
+  const auto lane = [](uint32_t opcode, uint32_t dst, uint32_t src, uint32_t index) {
+    return std::array<uint32_t, 2>{0xd4000000u | (opcode << 16u) | dst, src | ((128u + index) << 9u)};
+  };
+  std::vector<uint32_t> code;
+  const auto append = [&](std::array<uint32_t, 2> words) { code.insert(code.end(), words.begin(), words.end()); };
+  append(lane(0x361, 42, 16, 0)); // v_writelane_b32 v42, s16, 0
+  append(lane(0x361, 42, 17, 1)); // v_writelane_b32 v42, s17, 1
+  std::vector<size_t> skips, returns;
+  for (uint32_t callee = 0; callee < kCallees; callee++) {
+    code.push_back(EncodeSopc(0x06, 8, 128 + callee)); // s_cmp_eq_u32 s8, callee
+    skips.push_back(code.size());
+    code.push_back(EncodeSopp(0x04));                  // s_cbranch_scc0 next test
+    if (callee + 1 < kCallees) {
+      append(lane(0x361, 42, 9, 0));                   // v_writelane_b32 v42, s9, 0
+    } else {
+      append(lane(0x360, 16, 256 + 42, 0));            // v_readlane_b32 s16, v42, 0
+      append(lane(0x360, 17, 256 + 42, 1));            // v_readlane_b32 s17, v42, 1
+      code.push_back(EncodeSmem0(0x02, 40, 8));        // s_load_dwordx4 s[40:43], s[16:17], 0
+      code.push_back(0xfa000000u);
+      code.push_back(EncodeSopp(0x0c, 0));             // s_waitcnt 0
+      code.push_back(EncodeSmem0(0x0c, 16, 20));       // s_buffer_load_dwordx16 s[16:31], s[40:43], 0
+      code.push_back(0xfa000000u);
+      code.push_back(EncodeSopp(0x0c, 0));             // s_waitcnt 0
+      code.push_back(EncodeVop1(0x01, 2, 31));         // v_mov_b32 v2, s31
+      code.push_back(EncodeMubuf0(0x1c, 0, false));    // buffer_store_dword v2, off, s[4:7], 0
+      code.push_back(EncodeMubuf1(2, 1, 0));
+    }
+    returns.push_back(code.size());
+    code.push_back(EncodeSopp(0x02));                  // s_branch join
+    code[skips.back()] |= static_cast<uint32_t>(code.size() - skips.back() - 1u);
+  }
+  for (const auto at : returns) code[at] |= static_cast<uint32_t>(code.size() - at - 1u) & 0xffffu;
+  code.push_back(EncodeSopp(0x01)); // join: s_endpgm
+
+  alignas(16) static uint32_t data[16] = {};
+  alignas(16) static uint32_t descriptor[4] = {};
+  const auto address = reinterpret_cast<uint64_t>(data);
+  descriptor[0] = static_cast<uint32_t>(address);
+  descriptor[1] = static_cast<uint32_t>(address >> 32u);
+  descriptor[2] = 64u;
+  descriptor[3] = 0x00016204u;
+  std::array<uint32_t, 20> user_data{};
+  std::copy_n(descriptor, 4, user_data.begin() + 4); // s[4:7]: the V# the last callee stores through
+  const auto table = reinterpret_cast<uint64_t>(descriptor);
+  user_data[16] = static_cast<uint32_t>(table);
+  user_data[17] = static_cast<uint32_t>(table >> 32u);
+  static ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = 1;
+  compute.threads_num[2] = 1;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &compute;
+  options.user_data = user_data;
+  const auto translated = ShaderRecompiler::TranslateProgram(code, options);
+  const auto &memory = translated.program.memory_info;
+  Check(std::ranges::any_of(memory, [](const auto &info) {
+          return info.kind == ShaderRecompiler::IR::ResourceKind::ScalarBuffer;
+        }) && std::ranges::none_of(memory, [](const auto &info) {
+          return info.kind == ShaderRecompiler::IR::ResourceKind::IndirectBuffer;
+        }),
+        "a callee's V# merged with the values other callees return with");
+}
+
 void TestNewShaderRecompilerCfgNestedTailEarlyExit() {
   const uint32_t shader[] = {
       EncodeSopc(0x06, 0, 0), // preceding outer condition
@@ -12514,6 +12725,95 @@ void TestTypedSpirvSerialization() {
   check_serialization(spv::StorageClassPrivate, spv::FunctionControlMaskNone,
                       spv::DecorationRelaxedPrecision, GLSLstd450FAbs, -1,
                       0x80000000u);
+}
+
+void TestSpirvAlignmentMaskSplit() {
+  // x & -2^k (k = 1..6) becomes x - (x & (2^k - 1)), which keeps NIR's
+  // multiple-of-2^k rules (and their unbounded trailing-zero walks) off the
+  // mask; other masks stay as they are.
+  ShaderRecompiler::Spirv::Builder builder;
+  builder.RequireCapability(spv::CapabilityShader);
+  builder.RequireCapability(spv::CapabilityInt64);
+  builder.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
+  const auto void_type = builder.Type(spv::OpTypeVoid);
+  const auto function_type = builder.Type(spv::OpTypeFunction, void_type);
+  const auto u32 = builder.Type(spv::OpTypeInt, 32u, 0u);
+  const auto u64 = builder.Type(spv::OpTypeInt, 64u, 0u);
+  const auto pointer = builder.Type(spv::OpTypePointer, spv::StorageClassPrivate, u32);
+  const auto variable = builder.DefineGlobalVariable(pointer, spv::StorageClassPrivate);
+  const auto align4 = builder.Constant(spv::OpConstant, u32, 0xfffffffcu);
+  const auto align64 = builder.Constant(spv::OpConstant, u64, 0xffffffc0u, 0xffffffffu);
+  const auto align2 = builder.Constant(spv::OpConstant, u32, 0xfffffffeu);
+  const auto align128 = builder.Constant(spv::OpConstant, u32, 0xffffff80u);
+  const auto low16 = builder.Constant(spv::OpConstant, u32, 0xffffu);
+  const auto all = builder.Constant(spv::OpConstant, u32, 0xffffffffu);
+  const auto function = builder.AllocateId();
+  builder.AddEntryPoint(spv::ExecutionModelGLCompute, function, "main", {});
+  builder.AddExecutionMode(function, spv::ExecutionModeLocalSize, 1u, 1u, 1u);
+  builder.AddFunction(spv::OpFunction, void_type, function, spv::FunctionControlMaskNone,
+                      function_type);
+  builder.AddFunction(spv::OpLabel, builder.AllocateId());
+  const auto x = builder.AllocateId();
+  builder.AddFunction(spv::OpLoad, u32, x, variable);
+  const auto wide = builder.AllocateId();
+  builder.AddFunction(spv::OpUConvert, u64, wide, x);
+  std::vector<uint32_t> results;
+  const auto And = [&](uint32_t type, uint32_t lhs, uint32_t rhs) {
+    const auto id = builder.AllocateId();
+    builder.AddFunction(spv::OpBitwiseAnd, type, id, lhs, rhs);
+    results.push_back(id);
+    return id;
+  };
+  And(u32, x, align4);
+  And(u64, wide, align64);
+  And(u32, align2, x); // the constant on the left
+  And(u32, x, align128);
+  And(u32, x, low16);
+  const auto kept = And(u32, x, all);
+  builder.AddFunction(spv::OpStore, variable, kept);
+  builder.AddFunction(spv::OpReturn);
+  builder.AddFunction(spv::OpFunctionEnd);
+  Check(builder.SplitAlignmentMasks() == 3u,
+        "alignment-mask split rewrote the wrong number of masks");
+  const auto binary = builder.Build();
+  CheckSpirvBinaryValidates(binary);
+  // Each result id must be defined exactly once, by an ISub of x and x & low bits for the
+  // split masks, and by the original BitwiseAnd for the others.
+  std::map<uint32_t, std::vector<uint32_t>> defs;
+  std::map<uint64_t, uint32_t> constant_ids;
+  for (size_t offset = 5; offset < binary.size();) {
+    const auto words = binary[offset] >> spv::WordCountShift;
+    const auto op = binary[offset] & spv::OpCodeMask;
+    if (op == spv::OpConstant) {
+      const uint64_t high = words == 5 ? uint64_t{binary[offset + 4]} << 32u : 0u;
+      constant_ids[(uint64_t{binary[offset + 1]} << 40u) ^ (binary[offset + 3] | high)] =
+          binary[offset + 2];
+    }
+    if (op == spv::OpBitwiseAnd || op == spv::OpISub) {
+      defs[binary[offset + 2]] = {op, binary[offset + 3], binary[offset + 4]};
+    }
+    offset += words;
+  }
+  const auto Low = [&](uint32_t type, uint64_t value) {
+    return constant_ids[(uint64_t{type} << 40u) ^ value];
+  };
+  const auto CheckSplit = [&](uint32_t result, uint32_t value, uint32_t type, uint64_t low) {
+    const auto& def = defs[result];
+    Check(def.size() == 3 && def[0] == spv::OpISub && def[1] == value,
+          "split mask is not value minus its low bits");
+    const auto& remainder = defs[def[2]];
+    Check(remainder.size() == 3 && remainder[0] == spv::OpBitwiseAnd && remainder[1] == value &&
+              Low(type, low) != 0u && remainder[2] == Low(type, low),
+          "split mask's low bits are not value & (2^k - 1)");
+  };
+  CheckSplit(results[0], x, u32, 3u);
+  CheckSplit(results[1], wide, u64, 63u);
+  CheckSplit(results[2], x, u32, 1u);
+  for (size_t index = 3; index < results.size(); index++) {
+    const auto& def = defs[results[index]];
+    Check(def.size() == 3 && def[0] == spv::OpBitwiseAnd && def[1] == x,
+          "a mask outside -2 .. -64 was rewritten");
+  }
 }
 
 void TestDeferredSpirvPhiPatching() {
@@ -16976,6 +17276,7 @@ int main() {
   TestShaderFeatureCollection();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();
+  TestSpirvAlignmentMaskSplit();
   TestCompilerStageInputOwnership();
   TestSpirvRepeatedEmission();
   TestSpirvConditionVotes();
@@ -17068,6 +17369,8 @@ int main() {
   for (const bool scalar_key : {false, true}) TestBoundedMaterialBufferStores(scalar_key);
   TestNativeDescriptorProvenanceKeepsGpuSelection();
   TestCfgSiblingSharedExit();
+  TestCfgGotoEliminationPreservesPaths();
+  TestCfgLadderKeepsCalleeDescriptors();
   TestNewShaderRecompilerCfgNestedTailEarlyExit();
   TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections();
   TestNewShaderRecompilerCfgAlternatingSharedReturns();

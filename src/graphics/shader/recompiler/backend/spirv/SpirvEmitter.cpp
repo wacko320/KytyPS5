@@ -240,6 +240,7 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
 	                            "main", state.interface_variables);
 
+	state.builder.SplitAlignmentMasks();
 	return state.builder.Build();
 }
 

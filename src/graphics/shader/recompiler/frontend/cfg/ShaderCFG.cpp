@@ -3,6 +3,7 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <unordered_map>
 #include <fmt/format.h>
 #include <iterator>
 #include <deque>
@@ -1066,6 +1067,7 @@ public:
 					if (value.header == target && source.Dominates(target, block.id))
 						node->target = value.label;
 				}
+				if (target != block.id + 1u) m_far_gotos[node->target]++;
 				m_gotos.push_back(node);
 			};
 			const auto& term = block.terminator;
@@ -1206,6 +1208,12 @@ private:
 		node->condition = condition;
 		return node;
 	}
+	// Whether the statement holds a break that leaves a loop enclosing it.
+	static bool ExitsLoop(const Node* node) {
+		if (node->kind == Kind::Break) return true;
+		if (node->kind == Kind::Loop) return false;
+		return std::ranges::any_of(node->children, [](const Node* child) { return ExitsLoop(child); });
+	}
 	Node* Outward(Node* node) {
 		auto* parent = node->parent;
 		auto* target = node->target;
@@ -1290,6 +1298,57 @@ private:
 			return;
 		}
 		auto* parent = node->parent;
+		const auto skips_label = [&] {
+			for (auto it = std::next(node->position); it != target->position; ++it) {
+				if ((*it)->kind == Kind::Label) return true;
+			}
+			return false;
+		};
+		// The run-once loop ending right before the target, which earlier gotos to it extend.
+		auto* loop = m_exit_loops[target];
+		if (loop != nullptr && (loop->parent != parent || std::next(loop->position) != target->position))
+			loop = nullptr;
+		if (Ordered(node, target) &&
+		    (loop != nullptr || (m_far_gotos[target] >= ChainedGotos && skips_label()))) {
+			// Several gotos jump to this target over labels other gotos still reach: a call's
+			// ladder of callees, each returning past the others. Wrapping the skipped range in a
+			// selection nests those labels, and every earlier goto to the target wraps the rest
+			// again, one level per link: N callees nest N deep, and NIR re-runs its whole
+			// optimization loop once per level. Instead the range becomes the body of a loop that
+			// runs once, the goto a break out of it, and each earlier goto to the target extends
+			// the same loop back to itself: one level for any number of callees. A break leaves
+			// the rest of the range off its path, as the selection did; a route variable tested
+			// per run would keep a path from each callee into the others, merging their values:
+			// resource tracking then sees several V#s for a callee's load and makes it indirect
+			// (Rift Apart's ray-tracing kernels rendered wrong that way). A break the range
+			// holds for an enclosing loop would retarget to this one, so such a range keeps the
+			// selection. A target with fewer such gotos (an if/else has one) also keeps the
+			// selection pair, which resource tracking evaluates through.
+			// The loop takes the goto's own callee too, back to the previous goto to the target:
+			// a callee left in front of the loop would share the loop's entry with the paths
+			// into the later callees.
+			auto first = node->position;
+			while (first != parent->children.begin()) {
+				const auto* previous = *std::prev(first);
+				if (previous->kind == Kind::Goto && previous->target == target) break;
+				--first;
+			}
+			const auto last = loop != nullptr ? loop->position : target->position;
+			if (std::none_of(first, last, [&](Node* child) { return ExitsLoop(child); })) {
+				if (loop == nullptr) {
+					loop = Insert(parent, target->position, Kind::Loop);
+					loop->condition = 0;
+					m_exit_loops[target] = loop;
+				}
+				auto* exit = Insert(parent, node->position, Kind::Break);
+				exit->condition = node->condition;
+				if (first == node->position) first = exit->position;
+				Erase(node);
+				loop->children.splice(loop->children.begin(), parent->children, first, loop->position);
+				Adopt(loop);
+				return;
+			}
+		}
 		if (Ordered(node, target)) {
 			auto* selection = Insert(parent, node->position, Kind::If);
 			selection->condition = Expression(ExprOp::Not, node->condition);
@@ -1428,7 +1487,9 @@ private:
 					const auto& previous = m_graph.blocks[current];
 					const bool empty = previous.inst_begin == previous.inst_end &&
 					                   previous.assignments.empty();
-					const auto header = empty ? current : Advance(current);
+					// A loop that runs once gets its back edge only in SPIR-V, where its header
+					// must not have Phis: give it a header of its own.
+					const auto header = empty && node->condition != 0 ? current : Advance(current);
 					const auto body = Allocate();
 					const auto merge = Allocate();
 					Branch(header, body);
@@ -1486,6 +1547,13 @@ private:
 	std::deque<Node> m_nodes;
 	Node* m_root = nullptr;
 	std::vector<Node*> m_gotos;
+	// Per label, the gotos to it that are not a fall-through to the next block. From
+	// ChainedGotos on, forward gotos to it over other labels break out of one loop instead
+	// (fewer keep the selections, as a handful of early exits nest only a few deep).
+	static constexpr uint32_t ChainedGotos = 8;
+	std::unordered_map<const Node*, uint32_t> m_far_gotos;
+	// Per such label, the run-once loop ending right before it.
+	std::unordered_map<const Node*, Node*> m_exit_loops;
 	std::vector<uint32_t> m_route_expressions;
 	std::vector<uint32_t> m_order;
 };

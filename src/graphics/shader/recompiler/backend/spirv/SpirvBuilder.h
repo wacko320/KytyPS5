@@ -85,6 +85,15 @@ public:
 	DeferredPhi AddDeferredPhi(uint32_t type, uint32_t result, size_t incoming_count);
 	void        PatchDeferredPhi(DeferredPhi phi, size_t incoming, uint32_t value, uint32_t parent);
 
+	// Rewrites each scalar `x & -2^k` (k = 1..6) in the functions as `x - (x & (2^k - 1))`. The
+	// result is the same, but NIR's algebraic pass no longer matches the masks against its
+	// `iand(a(is_unsigned_multiple_of_2^k), -2^k)` rules. Those rules query the number of known
+	// trailing zero bits of `a`, walking a's whole iadd/iand/bcsel/phi ancestry, and the pass
+	// clears that analysis' cache after every rewrite: with the guest's register file chained
+	// through per-write exec selects, the walks made RADV's compile time quadratic in the size
+	// of large shaders. Returns the number of masks rewritten.
+	uint32_t SplitAlignmentMasks();
+
 	[[nodiscard]] std::vector<uint32_t> Build() const;
 
 private:

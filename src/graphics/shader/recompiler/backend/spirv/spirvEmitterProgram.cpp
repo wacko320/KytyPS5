@@ -7,6 +7,7 @@
 #include <functional>
 #include <optional>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -113,7 +114,11 @@ void EmitReturn(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
-void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
+// repeat_header: the loop this continue block leaves without repeating, if it does. SPIR-V
+// still wants the loop's back edge, so the branch to the merge becomes a constant false
+// conditional back to the header.
+void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
+                              const IR::Block* repeat_header) {
 	const auto& term       = block->terminator;
 	const auto  emit_merge = [&]() {
 		if (term.loop_header) {
@@ -171,6 +176,11 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				return;
 			}
 			emit_merge();
+			if (repeat_header != nullptr && target == repeat_header->terminator.merge_block) {
+				ctx.state.builder.AddFunction(spv::OpBranchConditional, ConstantBool(ctx.state, false),
+				                              repeat_header->Definition(), target->Definition());
+				return;
+			}
 			ctx.state.builder.AddFunction(spv::OpBranch, target->Definition());
 			return;
 		}
@@ -383,6 +393,17 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 void EmitStructuredFunction(ValueEmitContext& ctx) {
 	const auto& program = ctx.state.program;
 	StructuredFunctionState structured;
+	// Loops that run once: their continue block branches straight to the merge.
+	std::unordered_map<const IR::Block*, const IR::Block*> run_once;
+	for (const auto* block: program.blocks) {
+		const auto& term = block->terminator;
+		if (term.loop_header && term.merge_block != nullptr && term.continue_block != nullptr &&
+		    term.continue_block != block &&
+		    term.continue_block->terminator.kind == CFG::TerminatorKind::Branch &&
+		    term.continue_block->terminator.true_block == term.merge_block) {
+			run_once.emplace(term.continue_block, block);
+		}
+	}
 	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];
@@ -390,7 +411,8 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 			EmitStructuredInstruction(lane, structured, inst);
 		});
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
-		EmitStructuredTerminator(ctx, block);
+		const auto repeat = run_once.find(block);
+		EmitStructuredTerminator(ctx, block, repeat != run_once.end() ? repeat->second : nullptr);
 	}
 	PatchStructuredPhis(ctx, structured);
 }

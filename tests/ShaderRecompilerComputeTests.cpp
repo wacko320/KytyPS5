@@ -73,7 +73,10 @@
 #error "classic framebuffer/render-pass cache must remain deleted"
 #endif
 
+#include "CfgPathPrograms.h"
+
 #include <algorithm>
+#include <deque>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -1342,6 +1345,8 @@ struct TestCase {
   std::vector<u32> expected_storage_image_r32ui;
   std::vector<std::string> required_spirv;
   std::vector<std::string> forbidden_spirv;
+  // When set, the deepest nesting of selection and loop constructs the SPIR-V may have.
+  u32 max_construct_depth = 0;
   ShaderComputeInputInfo compute_info = [] {
     ShaderComputeInputInfo info{};
     info.lds_size_dwords = 1024;
@@ -1632,6 +1637,28 @@ void CheckRectListShaders() {
   ValidateSpirv(name, position_only.evaluation);
 }
 
+// The deepest nesting of structured constructs: each OpSelectionMerge or OpLoopMerge opens one,
+// closed at its merge block's label.
+u32 SpirvConstructDepth(const std::vector<u32> &spirv) {
+  std::vector<u32> open;
+  u32 deepest = 0;
+  for (size_t offset = 5; offset < spirv.size();) {
+    const auto words = spirv[offset] >> 16u;
+    const auto op = spirv[offset] & 0xffffu;
+    if (words == 0) break;
+    if (op == spv::OpLabel) {
+      std::erase(open, spirv[offset + 1]);
+    } else if (op == spv::OpSelectionMerge || op == spv::OpLoopMerge) {
+      open.push_back(spirv[offset + 1]);
+      deepest = std::max(deepest, static_cast<u32>(open.size()));
+    } else if (op == spv::OpFunctionEnd) {
+      open.clear();
+    }
+    offset += words;
+  }
+  return deepest;
+}
+
 void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
   std::vector<u32> result_types(spirv[3]);
   for (size_t offset = 5; offset < spirv.size();) {
@@ -1646,6 +1673,11 @@ void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
               "emitted a redundant bitcast between identical SPIR-V types");
     }
     offset += words.size();
+  }
+  if (test.max_construct_depth != 0 && SpirvConstructDepth(spirv) > test.max_construct_depth) {
+    Fail(test.name, "SPIR-V structure",
+         "constructs nest " + std::to_string(SpirvConstructDepth(spirv)) + " deep, more than " +
+             std::to_string(test.max_construct_depth));
   }
   if (test.required_spirv.empty() && test.forbidden_spirv.empty()) {
     return;
@@ -32342,6 +32374,185 @@ TestCase LinkedCallInLoop(u32 padding) {
   return test;
 }
 
+// A call with a ladder of twelve callees, each returning past the others: the matching one runs
+// once (a pointer outside the table runs none). The ladder's returns are a chain of forward
+// gotos to one target over the other callees' labels; the structurizer keeps it flat.
+TestCase LinkedCallLadder(u32 selected) {
+  using O = ShaderOpcode;
+  namespace D = ShaderRecompiler::Decoder;
+  constexpr u32 kCallees = 12;
+  const auto callee_address = [](u32 index) {
+    return 0x0000000100000000ull + uint64_t{index} * 0x1000u;
+  };
+  const uint64_t pointer =
+      selected < kCallees ? callee_address(selected) : 0x0000000300000000ull;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 7);
+  code.push_back(EncodeSmem0(0x09, 20, 0)); // s_buffer_load_dwordx2 s[20:21], s[0:3], 16
+  code.push_back(EncodeSmem1(16, 0x7d));
+  code.push_back(EncodeSopp(0x0c, 0));      // s_waitcnt 0
+  code.push_back(EncodeSop1(0x04, 30, 20)); // s_mov_b64 s[30:31], s[20:21]
+  code.push_back(EncodeSop1(0x21, 30, 30)); // s_swappc_b64 s[30:31], s[30:31]
+  code.push_back(EncodeVop2(0x25, 1, InlineU32(1), 1)); // v1 += 1 after the return
+  AppendStoreVgpr(&code, 1, 0);
+  AppendEnd(&code);
+
+  std::map<uint64_t, std::vector<u32>> callees;
+  std::vector<uint64_t> targets;
+  for (u32 index = 0; index < kCallees; index++) {
+    auto &body = callees[callee_address(index)];
+    // v1 = v1 * 4 + index + 1 tells which callees ran and in which order.
+    body.push_back(EncodeVop2(0x25, 1, Vgpr(1), 1));               // v1 += v1
+    body.push_back(EncodeVop2(0x25, 1, Vgpr(1), 1));               // v1 += v1
+    body.push_back(EncodeVop2(0x25, 1, InlineU32(index + 1), 1)); // v1 += index + 1
+    body.push_back(EncodeSop1(0x20, 0, 30));                       // s_setpc_b64 s[30:31]
+    targets.push_back(callee_address(index));
+  }
+  const D::ReadGuestWords read = [&](uint64_t address, std::span<uint32_t> words) {
+    std::fill(words.begin(), words.end(), 0u);
+    for (const auto &[base, body] : callees) {
+      if (address >= base && address < base + body.size() * 4u) {
+        const auto first = (address - base) / 4u;
+        std::copy_n(body.begin() + first,
+                    std::min<size_t>(words.size(), body.size() - first),
+                    words.begin());
+      }
+    }
+    return true;
+  };
+  const auto analysis = D::AnalyzeCalls(code, 64);
+  Require("LinkedCallLadder", "call analysis",
+          analysis.failure.empty() && analysis.sites.size() == 1u, analysis.failure);
+  auto linked = D::LinkCalls(code, analysis, std::vector<std::vector<uint64_t>>{targets}, read);
+  Require("LinkedCallLadder", "call linking", linked.failure.empty(), linked.failure);
+
+  TestCase test;
+  test.name = selected == 0      ? "LinkedCallLadderFirst"
+              : selected == 9    ? "LinkedCallLadderNinth"
+              : selected == 11   ? "LinkedCallLadderLast"
+                                 : "LinkedCallLadderMiss";
+  test.code = std::move(linked.code);
+  test.pc_overrides = std::move(linked.overrides);
+  test.initial = {0x55555555u, 0, 0, 0, static_cast<u32>(pointer),
+                  static_cast<u32>(pointer >> 32u)};
+  test.expected = test.initial;
+  test.expected[0] = (selected < kCallees ? 7u * 4u + selected + 1u : 7u) + 1u;
+  // Nested, the ladder would need a level per callee.
+  test.max_construct_depth = 3;
+  test.opcodes = {O::V_MOV_B32,    O::S_BUFFER_LOAD_DWORDX2, O::S_WAITCNT,
+                  O::S_MOV_B64,    O::S_BRANCH,              O::S_CMP_EQ_U32,
+                  O::S_CBRANCH_SCC0, O::V_ADD_NC_U32,
+                  O::BUFFER_STORE_DWORD, O::S_NOP,           O::S_ENDPGM};
+  return test;
+}
+
+TestCase LinkedCallLadderFirst() { return LinkedCallLadder(0); }
+TestCase LinkedCallLadderNinth() { return LinkedCallLadder(9); }
+TestCase LinkedCallLadderLast() { return LinkedCallLadder(11); }
+TestCase LinkedCallLadderMiss() { return LinkedCallLadder(12); }
+
+// A random CfgPathPrograms.h program on the GPU: every block mixes its index into v1, and every
+// conditional block steps a scalar LCG and branches on one of its bits; a fuel counter, spent
+// before each backward branch, ends long runs. Running the blocks on the CPU gives the expected
+// v1 and fuel, so goto elimination, translation and the driver are checked together on ladders,
+// loops and shared exits.
+TestCase CfgPathProgram(u32 seed) {
+  using O = ShaderOpcode;
+  constexpr u32 kLcg = 20, kFuel = 21, kBit = 22, kFuelStart = 300;
+  constexpr u32 kMultiplier = 1103515245u, kIncrement = 12345u;
+  constexpr u32 kExit = UINT32_MAX;
+  const auto blocks = RandomCfgProgram(seed);
+  std::vector<u32> code;
+  code.push_back(EncodeSmem0(0x08, kLcg, 0)); // s_buffer_load_dword s20, s[0:3], 0
+  code.push_back(EncodeSmem1(0, 0x7d));
+  code.push_back(EncodeSopp(0x0c, 0)); // s_waitcnt 0
+  AppendSMovLiteral(&code, kFuel, kFuelStart);
+  AppendVMovU32(&code, 1, 7);
+  // Every cycle has a backward branch; those spend fuel first.
+  const auto backward = [](const CfgPathBlock &block, u32 index) {
+    return (block.kind == CfgPathBlock::Cond || block.kind == CfgPathBlock::Jump) &&
+           block.target <= index;
+  };
+  std::vector<size_t> starts;
+  std::vector<std::pair<size_t, u32>> branches; // branch word, target block
+  const auto branch = [&](u32 opcode, u32 target) {
+    branches.emplace_back(code.size(), target);
+    code.push_back(EncodeSopp(opcode, 0));
+  };
+  for (u32 index = 0; index < blocks.size(); index++) {
+    starts.push_back(code.size());
+    code.push_back(EncodeVop1(0x01, 2, Vgpr(1)));       // v2 = v1
+    code.push_back(EncodeVop2(0x25, 1, Vgpr(1), 1));    // v1 += v1
+    code.push_back(EncodeVop2(0x25, 1, Vgpr(2), 1));    // v1 += v2
+    code.push_back(EncodeVop2(0x25, 1, 255, 1));        // v1 += index + 1
+    code.push_back(index + 1u);
+    const auto &block = blocks[index];
+    if (backward(block, index)) {
+      code.push_back(EncodeSop2(0x01, kFuel, kFuel, InlineU32(1))); // s_sub_u32 fuel, fuel, 1
+      code.push_back(EncodeSopc(0x06, kFuel, InlineU32(0)));        // s_cmp_eq_u32 fuel, 0
+      branch(0x05, kExit);                                          // s_cbranch_scc1 exit
+    }
+    switch (block.kind) {
+    case CfgPathBlock::Next: break;
+    case CfgPathBlock::Jump: branch(0x02, block.target); break; // s_branch
+    case CfgPathBlock::End: branch(0x02, kExit); break;
+    case CfgPathBlock::Cond:
+      code.push_back(EncodeSop2(0x26, kLcg, 255, kLcg));            // s_mul_i32 lcg, A, lcg
+      code.push_back(kMultiplier);
+      code.push_back(EncodeSop2(0x00, kLcg, 255, kLcg));            // s_add_u32 lcg, C, lcg
+      code.push_back(kIncrement);
+      code.push_back(EncodeSop2(0x20, kBit, kLcg, InlineU32(16)));  // s_lshr_b32 bit, lcg, 16
+      code.push_back(EncodeSop2(0x0e, kBit, kBit, InlineU32(1)));   // s_and_b32 bit, bit, 1
+      code.push_back(EncodeSopc(0x06, kBit, InlineU32(1)));         // s_cmp_eq_u32 bit, 1
+      branch(0x05, block.target);                                   // s_cbranch_scc1 target
+      break;
+    }
+  }
+  const auto exit = code.size();
+  AppendStoreVgpr(&code, 1, 0);
+  AppendStoreSgpr(&code, kFuel, 1);
+  AppendEnd(&code);
+  for (const auto &[word, target] : branches) {
+    const auto destination = target == kExit ? exit : starts.at(target);
+    code[word] |= static_cast<u32>(static_cast<int32_t>(destination) -
+                                   static_cast<int32_t>(word) - 1) & 0xffffu;
+  }
+
+  CfgPathRandom random{seed * 0x9e37u + 1u};
+  const u32 initial_lcg = random();
+  u32 lcg = initial_lcg, fuel = kFuelStart, path = 7;
+  for (u32 index = 0; index < blocks.size();) {
+    path = path * 3u + index + 1u;
+    const auto &block = blocks[index];
+    if (backward(block, index) && --fuel == 0) break;
+    if (block.kind == CfgPathBlock::End) break;
+    if (block.kind == CfgPathBlock::Jump) {
+      index = block.target;
+      continue;
+    }
+    if (block.kind == CfgPathBlock::Next) {
+      index++;
+      continue;
+    }
+    lcg = lcg * kMultiplier + kIncrement;
+    index = ((lcg >> 16u) & 1u) != 0 ? block.target : index + 1;
+  }
+
+  static std::deque<std::string> names;
+  names.push_back("CfgPathProgram" + std::to_string(seed));
+  TestCase test;
+  test.name = names.back().c_str();
+  test.code = std::move(code);
+  test.initial = {initial_lcg, 0x55555555u};
+  test.expected = {path, fuel};
+  test.opcodes = {O::S_BUFFER_LOAD_DWORD, O::S_WAITCNT, O::S_MOV_B32, O::V_MOV_B32,
+                  O::V_ADD_NC_U32, O::S_SUB_U32, O::S_MUL_I32, O::S_ADD_U32,
+                  O::S_LSHR_B32, O::S_AND_B32, O::S_CMP_EQ_U32, O::S_CBRANCH_SCC1,
+                  O::S_BRANCH, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase LinkedCallSelectsCalleeA() { return LinkedCallSelectsCallee(0); }
 TestCase LinkedCallSelectsCalleeB() { return LinkedCallSelectsCallee(1); }
 TestCase LinkedCallSkipsUnknownPointer() { return LinkedCallSelectsCallee(2); }
@@ -43726,6 +43937,11 @@ std::vector<TestCase> MakeCases() {
   AddCase(LinkedCallSelectsCalleeA);
   AddCase(LinkedCallSelectsCalleeB);
   AddCase(LinkedCallSkipsUnknownPointer);
+  AddCase(LinkedCallLadderFirst);
+  AddCase(LinkedCallLadderNinth);
+  AddCase(LinkedCallLadderLast);
+  AddCase(LinkedCallLadderMiss);
+  for (u32 seed = 0; seed < 300; seed++) cases.push_back(CfgPathProgram(seed));
   AddCase(LinkedCallReachesFarCallee);
   AddCase(LinkedCallInLoopNear);
   AddCase(LinkedCallInLoopReachesAcrossCallee);

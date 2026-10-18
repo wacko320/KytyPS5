@@ -3,7 +3,9 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
+#include <unordered_map>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
@@ -206,6 +208,75 @@ void Builder::PatchDeferredPhi(DeferredPhi phi, size_t incoming, uint32_t value,
 	m_functions[value_word]  = value;
 	m_functions[parent_word] = parent;
 	m_unpatched_phi_incomings--;
+}
+
+uint32_t Builder::SplitAlignmentMasks() {
+	EXIT_IF(m_unpatched_phi_incomings != 0);
+	std::unordered_map<uint32_t, uint32_t> int_widths; // OpTypeInt id -> width
+	struct IntConstant {
+		uint32_t type  = 0;
+		uint64_t value = 0;
+	};
+	std::unordered_map<uint32_t, IntConstant> constants;
+	for (size_t offset = 0; offset < m_declarations.size();) {
+		const auto* words = &m_declarations[offset];
+		const auto  count = words[0] >> spv::WordCountShift;
+		const auto  op    = static_cast<spv::Op>(words[0] & spv::OpCodeMask);
+		if (op == spv::OpTypeInt && (words[2] == 32u || words[2] == 64u)) {
+			int_widths.emplace(words[1], words[2]);
+		} else if (op == spv::OpConstant) {
+			if (const auto width = int_widths.find(words[1]); width != int_widths.end()) {
+				const uint64_t high = width->second == 64u ? uint64_t {words[4]} << 32u : 0u;
+				constants.emplace(words[2], IntConstant {words[1], words[3] | high});
+			}
+		}
+		offset += count;
+	}
+	// The mask's low bits for x & mask when mask is -2^k, k = 1..6; 0 otherwise.
+	const auto LowBits = [&](uint32_t type, uint32_t operand) -> uint64_t {
+		const auto constant = constants.find(operand);
+		if (constant == constants.end() || constant->second.type != type) {
+			return 0;
+		}
+		const auto width = int_widths.at(type);
+		const auto mask  = width == 64u ? ~uint64_t {0} : uint64_t {0xffffffffu};
+		const auto align = (~constant->second.value + 1u) & mask;
+		return std::has_single_bit(align) && align >= 2u && align <= 64u ? align - 1u : 0u;
+	};
+	std::vector<uint32_t> functions;
+	functions.reserve(m_functions.size());
+	uint32_t rewritten = 0;
+	for (size_t offset = 0; offset < m_functions.size();) {
+		const auto* words = &m_functions[offset];
+		const auto  count = words[0] >> spv::WordCountShift;
+		offset += count;
+		if (static_cast<spv::Op>(words[0] & spv::OpCodeMask) == spv::OpBitwiseAnd && count == 5u &&
+		    int_widths.contains(words[1])) {
+			const auto type   = words[1];
+			const auto result = words[2];
+			auto       value  = words[3];
+			auto       low    = LowBits(type, words[4]);
+			if (low == 0u) {
+				value = words[4];
+				low   = LowBits(type, words[3]);
+			}
+			if (low != 0u) {
+				const auto low_constant =
+				    int_widths.at(type) == 64u
+				        ? Constant(spv::OpConstant, type, static_cast<uint32_t>(low), 0u)
+				        : Constant(spv::OpConstant, type, static_cast<uint32_t>(low));
+				const auto remainder = AllocateId();
+				AppendInstruction(functions, spv::OpBitwiseAnd, type, remainder, value,
+				                  low_constant);
+				AppendInstruction(functions, spv::OpISub, type, result, value, remainder);
+				rewritten++;
+				continue;
+			}
+		}
+		functions.insert(functions.end(), words, words + count);
+	}
+	m_functions = std::move(functions);
+	return rewritten;
 }
 
 std::vector<uint32_t> Builder::Build() const {
