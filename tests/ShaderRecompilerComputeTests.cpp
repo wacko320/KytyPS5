@@ -11377,6 +11377,98 @@ public:
   }
 
 
+  // Programs compiled ahead for predicted dispatches (PipelineCache::PrecompileDispatch): a
+  // prediction with the dispatch's exact inputs hands its program and pipeline over, and the
+  // dispatch runs it; one whose ProgramKey differs (here the async-compute bit of the static key)
+  // is never used, and the dispatch compiles its own.
+  void CheckPrecompiledDispatch() {
+    constexpr const char* name = "PrecompiledDispatch";
+    constexpr uintptr_t base = 0x0000000204a00000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr auto output = base + 0x4000;
+    const auto make_code = [](u32 value) {
+      std::vector<u32> code{EncodeSMovB32(20, 255), value, EncodeVop1(0x01, 1, 20),
+                            EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(1, 0, 0)};
+      AppendEnd(&code);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+          {.type = Prospero::ShaderBinaryType::kCs,
+           .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+      return code;
+    };
+    const auto mispredicted = make_code(41);
+    const auto predicted = make_code(73);
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "precompile fixture allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x3, 0x10, physical, size) == 0 && mapped == reinterpret_cast<void*>(base),
+        "precompile fixture mapping failed");
+    std::memset(mapped, 0, size);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto& cache = context.GetBufferCache();
+      auto& pipelines = context.GetPipelineCache();
+      auto& shaders = processor.GetShCtx();
+      ShaderBufferResource out{};
+      out.UpdateAddress48(output);
+      out.fields[2] = 4;
+      out.fields[3] = DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      const auto run = [&](const std::vector<u32>& code, bool predict_async, u32 expected) {
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                             .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 4});
+        for (u32 i = 0; i < 4; ++i)
+          shaders.SetCsUserSgpr(i, out.fields[i], HW::UserSgprType::Unknown);
+        shaders.SetCsWaveSize(Pm4::ComputeWaveSize(0x41u));
+        pipelines.PrecompileDispatch(shaders, processor.GetCtx().GetShaderRegisters(), 0x41u,
+                                     predict_async, {1, 1, 1}, std::nullopt);
+        pipelines.WaitForPrecompiles();
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+        cache.ReadMemory(output, sizeof(u32));
+        u32 actual = 0;
+        Require(name, "dispatch result",
+                LibKernel::Memory::TryReadBacking(output, &actual, sizeof(actual)) &&
+                    actual == expected,
+                fmt::format("the dispatch wrote {} instead of {}", actual, expected));
+      };
+      const auto before = pipelines.GetPrecompileStats();
+      run(mispredicted, true, 41);
+      const auto after_miss = pipelines.GetPrecompileStats();
+      Require(name, "mispredicted program unused",
+              after_miss.submitted == before.submitted + 1 && after_miss.hits == before.hits &&
+                  after_miss.misses == before.misses + 1,
+              fmt::format("submitted {} hits {} misses {} after a mispredicted precompile",
+                          after_miss.submitted - before.submitted, after_miss.hits - before.hits,
+                          after_miss.misses - before.misses));
+      run(predicted, false, 73);
+      const auto after_hit = pipelines.GetPrecompileStats();
+      Require(name, "predicted program taken",
+              after_hit.submitted == after_miss.submitted + 1 &&
+                  after_hit.hits == after_miss.hits + 1 && after_hit.misses == after_miss.misses,
+              fmt::format("submitted {} hits {} misses {} after an exact precompile",
+                          after_hit.submitted - after_miss.submitted,
+                          after_hit.hits - after_miss.hits,
+                          after_hit.misses - after_miss.misses));
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "precompile fixture release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRelinkedCallReusesPlan() {
     constexpr const char* name = "RelinkedCallReusesPlan";
     constexpr uintptr_t base = 0x0000000204900000ull;
@@ -57710,6 +57802,7 @@ int main(int argc, char **argv) {
     vulkan.CheckGpuCommandLane();
     vulkan.CheckScalarLeafCall();
     vulkan.CheckRelinkedCallReusesPlan();
+    vulkan.CheckPrecompiledDispatch();
     CheckAgcSystemTable(vulkan.RuntimeRenderer());
     CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
@@ -58323,6 +58416,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuCommandLane();
   vulkan.CheckScalarLeafCall();
   vulkan.CheckRelinkedCallReusesPlan();
+  vulkan.CheckPrecompiledDispatch();
   vulkan.CheckPartialUnmapSync();
   vulkan.CheckWritebackAfterSplitSubmit(false);
   vulkan.CheckWritebackAfterSplitSubmit(true);

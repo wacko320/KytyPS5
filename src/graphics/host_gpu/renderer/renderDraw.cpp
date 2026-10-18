@@ -835,7 +835,7 @@ static void SetDrawDebugPhase(CommandBuffer& buffer, uint64_t submit_id, const D
 	                    draw.instance_count, draw.first_instance);
 }
 
-static bool GetDrawTopology(const HW::UserConfig& ucfg, vk::PrimitiveTopology& topology) {
+bool GetDrawTopology(const HW::UserConfig& ucfg, vk::PrimitiveTopology& topology) {
 
 	topology = vk::PrimitiveTopology::ePointList;
 
@@ -945,8 +945,37 @@ static bool IsIndirectDrawTopology(Prospero::PrimitiveType type) {
 	}
 }
 
+bool DrawPixelStageInputs(const HW::Context& ctx, const HW::Shader& shaders, bool speculative,
+                          DrawPixelInputs& inputs) {
+	const auto& shader_regs  = ctx.GetShaderRegisters();
+	inputs.color_output_mask = DrawColorOutputMask(ctx);
+	inputs.ps_active         = shaders.GetPs().ps_regs.data_addr != 0 &&
+	                   (inputs.color_output_mask != 0 ||
+	                    PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
+	inputs.target_export_mapping = {};
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		const auto& rt = ctx.GetRenderTarget(slot);
+		if ((inputs.color_output_mask & (1u << slot)) != 0 && rt.base.addr != 0) {
+			if (speculative) {
+				const auto format = TextureTryGetRenderTargetFormat(
+				    rt.info.format, rt.info.channel_type, rt.info.channel_order);
+				if (!format) {
+					return false;
+				}
+				inputs.target_export_mapping[slot] = format->export_mapping;
+			} else {
+				inputs.target_export_mapping[slot] =
+				    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
+				                                 rt.info.channel_order)
+				        .export_mapping;
+			}
+		}
+	}
+	return true;
+}
+
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
-                           uint32_t color_output_mask, DrawRenderState& state) {
+                           const DrawPixelInputs& inputs, DrawRenderState& state) {
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -956,17 +985,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 
 	state.programs      = {};
 	state.ps_input_info = {};
-	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
-	    target_export_mapping {};
-	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-		const auto& rt = ctx.GetRenderTarget(slot);
-		if ((color_output_mask & (1u << slot)) != 0 && rt.base.addr != 0) {
-			target_export_mapping[slot] =
-			    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
-			                                 rt.info.channel_order)
-			        .export_mapping;
-		}
-	}
+	const auto& target_export_mapping = inputs.target_export_mapping;
 	auto& pipeline_cache = buffer.GetContext().GetPipelineCache();
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
@@ -979,17 +998,16 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
-	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
-	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
+	DrawPixelInputs pixel_inputs;
+	(void)DrawPixelStageInputs(buffer.GetRegisters(), buffer.GetShaders(), false, pixel_inputs);
+	const auto color_output_mask = pixel_inputs.color_output_mask;
 	// RefreshShaders resets the programs and the stage inputs the draw uses, and
 	// ResolveRenderColorTarget each target it counts; the depth target is only filled in.
 	state.color_count = 0;
 	state.depth_info  = {};
 
-	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
-	                  (color_output_mask != 0 ||
-	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
-	RefreshShaders(buffer, draw, color_output_mask, state);
+	state.ps_active = pixel_inputs.ps_active;
+	RefreshShaders(buffer, draw, pixel_inputs, state);
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {

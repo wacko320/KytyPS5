@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
+#include <optional>
 
 namespace Libs::Graphics {
 
@@ -29,6 +30,11 @@ class Context;
 // Whether the registers ask for a depth or stencil copy draw (DB_RENDER_OVERRIDE forcing the read
 // surface's state into a different write surface): RenderExecutor::DepthStencilCopy runs it.
 [[nodiscard]] bool DepthStencilCopyRequested(const HW::Context& hw);
+
+// The depth attachment a draw with these registers would bind, as its pipeline sees it (no
+// format: none), for a predicted draw; nullopt where the draw would not get one it can use.
+[[nodiscard]] std::optional<PipelineDepthTarget> PredictPipelineDepthTarget(GraphicContext& graphics,
+                                                                            const HW::Context& hw);
 
 inline constexpr bool depth_htile_stencil_acceleration_compatible(bool has_stencil, bool has_htile,
                                                                   bool htile_stencil_disabled) {

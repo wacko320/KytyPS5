@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <thread>
 #include <type_traits>
@@ -99,6 +100,15 @@ struct PipelineVertexInputState {
 	bool operator==(const PipelineVertexInputState&) const = default;
 };
 
+// A color attachment as a graphics pipeline sees it (PipelineDepthTarget: the depth one).
+struct PipelineColorTarget {
+	uint32_t                        slot    = 0;
+	vk::Format                      format  = vk::Format::eUndefined;
+	uint32_t                        samples = 0;
+	Prospero::ColorComponentMapping export_mapping;
+	Prospero::BufferFormat          guest_format = Prospero::BufferFormat::kInvalid;
+};
+
 struct ShaderProgram {
 	uint64_t         id     = 0;
 	vk::ShaderModule module = nullptr;
@@ -167,6 +177,28 @@ public:
 	void BeginPrefetchBatch();
 	void FlushPrefetch();
 	[[nodiscard]] ResourcePrefetcher::Stats GetPrefetchStats() const;
+	// Programs compiled ahead: for a draw or dispatch the lookahead predicted, the stages whose
+	// programs are not cached yet are translated and compiled on low-priority workers (and a
+	// compute stage's pipeline built). The draw takes a worker's program only for its exact
+	// ProgramKey, specialization and push-data cursor, waiting for it when it is being built;
+	// a misprediction is only wasted work. GPU thread.
+	void PrecompileDraw(const HW::Context& context, const HW::Shader& shaders,
+	                    const HW::UserConfig& user_config);
+	// `indirect_args_address`: set for an indirect dispatch, else `workgroup_counts` are the
+	// direct dispatch's.
+	void PrecompileDispatch(const HW::Shader& shaders, const HW::ShaderRegisters& sh, uint32_t mode,
+	                        bool async_compute, const std::array<uint32_t, 3>& workgroup_counts,
+	                        std::optional<uint64_t> indirect_args_address);
+	struct PrecompileStats {
+		uint64_t submitted = 0; // stages handed to the workers
+		uint64_t hits      = 0; // new permutations taken from a worker
+		uint64_t misses    = 0; // new permutations compiled on the GPU thread
+		uint64_t wasted    = 0; // worker stages dropped (unused, or only their plan used)
+		uint64_t pipeline_hits = 0; // graphics pipelines taken from a worker
+	};
+	[[nodiscard]] PrecompileStats GetPrecompileStats() const;
+	// Tests: until no precompile is queued or running.
+	void WaitForPrecompiles();
 	// Guest programs translated to IR so far: a new shader, a relinked call, a bindless retry.
 	[[nodiscard]] uint64_t TranslationCount() const;
 	// See ResourcePrefetcher::MemoryOps::replay_check: on from the start in debug builds.
@@ -199,6 +231,16 @@ private:
 	struct GraphicsPipelineKeyHash {
 		std::size_t operator()(const GraphicsPipelineKey& key) const;
 	};
+
+	static bool BuildGraphicsPipelineKey(GraphicContext&                     graphics,
+	                                     std::span<const PipelineColorTarget> colors,
+	                                     const PipelineDepthTarget&          depth,
+	                                     const ShaderVertexInputInfo&        vs_input_info,
+	                                     const HW::Context&                  ctx,
+	                                     Prospero::PrimitiveType             primitive_type,
+	                                     const ShaderPixelInputInfo*         ps_input_info,
+	                                     vk::PrimitiveTopology topology, bool primitive_restart_enable,
+	                                     GraphicsPipelineKey& key, bool speculative);
 
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
@@ -248,6 +290,14 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+// Whether CreatePipelineInternal creates these without stopping the emulator: for pipelines built
+// ahead from predicted state.
+[[nodiscard]] bool CanCreatePipeline(GraphicContext& graphics, const PipelineRenderingState& rendering,
+                                     const PipelineVertexInputState&        vertex_input,
+                                     std::span<const ShaderVertexInputInfo> vertex_info,
+                                     const ShaderPixelInputInfo*            ps_input_info,
+                                     const PipelineStaticParameters&        static_params);
+[[nodiscard]] bool CanCreatePipeline(GraphicContext& graphics, const ShaderComputeInputInfo& input_info);
 // Identifies what CreatePipelineInternal builds for a compute program from this SPIR-V: equal keys
 // create equal pipelines.
 uint64_t ComputePipelineBuildKey(const ShaderRecompiler::IR::CompiledShaderInfo& program,

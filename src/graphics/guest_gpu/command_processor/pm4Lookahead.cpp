@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <optional>
 
 namespace Libs::Graphics {
 
@@ -218,6 +219,7 @@ void Pm4Lookahead::Scan() {
 			case PacketKind::Transparent: break;
 			case PacketKind::Draw:
 				m_window.push_back({m_scan, cache.PrefetchDraw(shadow.GetShCtx(), shadow.GetUcfg())});
+				cache.PrecompileDraw(shadow.GetCtx(), shadow.GetShCtx(), shadow.GetUcfg());
 				break;
 			case PacketKind::Dispatch: {
 				// The dispatch initiator's wave size is written just before the program is read.
@@ -242,6 +244,16 @@ void Pm4Lookahead::Scan() {
 				                                                      group_count(2, cs.num_thread_z)}
 				                           : std::array<uint32_t, 3> {};
 				m_window.push_back({m_scan, cache.PrefetchDispatch(shadow.GetShCtx(), groups)});
+				// An indirect dispatch's arguments address, as CommandProcessor computes it.
+				std::optional<uint64_t> args;
+				if (!direct) {
+					const bool long_form = (header & ~1u) == 0xc0021600u;
+					const auto base      = shadow.GetDispatchIndirectArgsBaseAddress();
+					args = long_form ? packet[1] | (static_cast<uint64_t>(packet[2]) << 32u)
+					                 : (base == 0 ? 0 : base + packet[1]);
+				}
+				cache.PrecompileDispatch(shadow.GetShCtx(), shadow.GetCtx().GetShaderRegisters(),
+				                         mode, shadow.IsAsyncComputeQueue(), groups, args);
 				break;
 			}
 			case PacketKind::Barrier:

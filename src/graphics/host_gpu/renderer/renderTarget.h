@@ -10,6 +10,13 @@ namespace Libs::Graphics {
 
 static constexpr uint32_t RENDER_COLOR_ATTACHMENTS_MAX = 8;
 
+// The depth attachment as a graphics pipeline sees it.
+struct PipelineDepthTarget {
+	vk::Format format            = vk::Format::eUndefined; // eUndefined: none
+	uint32_t   samples           = 0;
+	bool       depth_test_enable = false;
+};
+
 struct RenderAttachment {
 	vk::ImageView           image_view    = nullptr;
 	vk::ImageLayout         image_layout  = vk::ImageLayout::eUndefined;

@@ -160,6 +160,12 @@ enum class Kind : uint8_t { Sum, Max };
 	X(PlainMaterializations, Count, Sum, "materialize: without prefetch")                          \
 	X(PlainMaterializeTime, Ticks, Sum, "materialize: without prefetch, time")                         \
 	X(SettleChecks, Count, Sum, "materialize: page settle checks")                                 \
+	X(PrecompileSubmitted, Count, Sum, "precompile: new programs handed to workers")               \
+	X(PrecompileHits, Count, Sum, "precompile: new programs taken from a worker")                  \
+	X(PrecompileWaitTime, Ticks, Sum, "precompile: GPU thread waiting for a worker")                   \
+	X(PrecompileMisses, Count, Sum, "precompile: new programs compiled on the GPU thread")         \
+	X(PrecompilePipelineHits, Count, Sum, "precompile: graphics pipelines taken from a worker")    \
+	X(PrecompileWasted, Count, Sum, "precompile: worker programs dropped unused")                  \
 	X(SettleCheckTime, Ticks, Sum, "materialize: page settle checks, time")                            \
 	X(WritebackRecords, Count, Sum, "writeback: record calls")                                     \
 	X(WritebackBytes, Bytes, Sum, "writeback: bytes copied")                                       \

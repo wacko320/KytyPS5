@@ -40,6 +40,19 @@ class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
 
+// What a draw's pixel stage compiles with, from its registers: the targets it writes, whether
+// the pixel shader runs, and each written target's export mapping.
+struct DrawPixelInputs {
+	uint32_t color_output_mask = 0;
+	bool     ps_active         = false;
+	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX> target_export_mapping {};
+};
+// Speculative (a predicted draw): false for a target format the real draw stops the emulator on.
+bool DrawPixelStageInputs(const HW::Context& ctx, const HW::Shader& shaders, bool speculative,
+                          DrawPixelInputs& inputs);
+// The host topology of the draw's primitive type; false for a draw that is not drawn.
+bool GetDrawTopology(const HW::UserConfig& ucfg, vk::PrimitiveTopology& topology);
+
 enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
 	DrawIndex,

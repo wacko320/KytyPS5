@@ -252,25 +252,21 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	return desc;
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r) {
-	KYTY_PROFILER_FUNCTION();
-	const auto& hw          = buffer.GetRegisters();
+// The registers enable depth or stencil (they may still have no attachment bound).
+static bool DepthTargetActive(const HW::Context& hw) {
 	const auto& z           = hw.GetDepthRenderTarget();
 	const auto& rc          = hw.GetRenderControl();
 	const auto& dc          = hw.GetDepthControl();
-	const auto& sc          = hw.GetStencilControl();
-	const auto& sm          = hw.GetStencilMask();
 	const bool  has_stencil = z.stencil_info.format != Prospero::StencilFormat::kInvalid;
 	const bool depth_active = dc.z_enable || dc.depth_bounds_enable ||
 	                          rc.depth_clear_enable || rc.copy_depth_to_color;
 	const bool stencil_active =
 	    has_stencil && (dc.stencil_enable || rc.stencil_clear_enable || rc.copy_stencil_to_color);
-	if (!depth_active && !stencil_active) {
-		return;
-	}
-	const bool attachment_unbound =
-	    z.z_info.format == Prospero::DepthFormat::kInvalid &&
+	return depth_active || stencil_active;
+}
+
+static bool DepthAttachmentUnbound(const HW::DepthRenderTarget& z) {
+	return z.z_info.format == Prospero::DepthFormat::kInvalid &&
 	    z.stencil_info.format == Prospero::StencilFormat::kInvalid && z.z_info.num_samples == 0 &&
 	    z.z_info.texture_compatibility == Prospero::TextureCompatiblePlaneCompression::kDisable &&
 	    !z.z_info.expclear_enabled && !z.z_info.partially_resident && z.z_info.max_mip_level == 0 &&
@@ -286,6 +282,43 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	    // presence alone must not manufacture a depth attachment.
 	    !z.z_info.htile_acceleration && z.shading_rate_encoding == 0 && z.size.x_max == 0 &&
 	    z.size.y_max == 0;
+}
+
+std::optional<PipelineDepthTarget> PredictPipelineDepthTarget(GraphicContext&    graphics,
+                                                              const HW::Context& hw) {
+	const auto& z = hw.GetDepthRenderTarget();
+	if (!DepthTargetActive(hw) || DepthAttachmentUnbound(z)) {
+		return PipelineDepthTarget {};
+	}
+	const bool has_stencil = z.stencil_info.format != Prospero::StencilFormat::kInvalid;
+	const auto samples     = render_sample_count(z.z_info.num_samples);
+	const auto* policy     = FindDepthFormatPolicy(z.z_info.format);
+	if (samples == 0 || policy == nullptr) {
+		return std::nullopt;
+	}
+	const auto format = ResolveHostDepthAttachmentFormat(graphics, *policy, has_stencil, samples);
+	if (format == vk::Format::eUndefined) {
+		return std::nullopt;
+	}
+	return PipelineDepthTarget {.format            = format,
+	                            .samples           = samples,
+	                            .depth_test_enable = hw.GetDepthControl().z_enable};
+}
+
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
+void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r) {
+	KYTY_PROFILER_FUNCTION();
+	const auto& hw          = buffer.GetRegisters();
+	const auto& z           = hw.GetDepthRenderTarget();
+	const auto& rc          = hw.GetRenderControl();
+	const auto& dc          = hw.GetDepthControl();
+	const auto& sc          = hw.GetStencilControl();
+	const auto& sm          = hw.GetStencilMask();
+	const bool  has_stencil = z.stencil_info.format != Prospero::StencilFormat::kInvalid;
+	if (!DepthTargetActive(hw)) {
+		return;
+	}
+	const bool attachment_unbound = DepthAttachmentUnbound(z);
 	if (attachment_unbound) {
 		static std::atomic_bool logged = false;
 		if (!logged.exchange(true, std::memory_order_relaxed)) {

@@ -25,6 +25,7 @@
 #include <bit>
 #include <limits>
 #include <span>
+#include <optional>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -141,7 +142,7 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 	}
 }
 
-static vk::BlendFactor GetBlendFactor(uint32_t factor) {
+static std::optional<vk::BlendFactor> TryBlendFactor(uint32_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
 		case Prospero::BlendFactor::kZero: return vk::BlendFactor::eZero;
 		case Prospero::BlendFactor::kOne: return vk::BlendFactor::eOne;
@@ -164,21 +165,33 @@ static vk::BlendFactor GetBlendFactor(uint32_t factor) {
 		case Prospero::BlendFactor::kConstantAlpha: return vk::BlendFactor::eConstantAlpha;
 		case Prospero::BlendFactor::kOneMinusConstantAlpha:
 			return vk::BlendFactor::eOneMinusConstantAlpha;
-		default: EXIT("unknown factor: %u\n", factor);
+		default: return std::nullopt;
 	}
-	return vk::BlendFactor::eZero;
 }
 
-static vk::BlendOp GetBlendOp(uint32_t op) {
+static vk::BlendFactor GetBlendFactor(uint32_t factor) {
+	if (const auto converted = TryBlendFactor(factor)) {
+		return *converted;
+	}
+	EXIT("unknown factor: %u\n", factor);
+}
+
+static std::optional<vk::BlendOp> TryBlendOp(uint32_t op) {
 	switch (static_cast<Prospero::BlendOp>(op)) {
 		case Prospero::BlendOp::kAdd: return vk::BlendOp::eAdd;
 		case Prospero::BlendOp::kSubtract: return vk::BlendOp::eSubtract;
 		case Prospero::BlendOp::kMin: return vk::BlendOp::eMin;
 		case Prospero::BlendOp::kMax: return vk::BlendOp::eMax;
 		case Prospero::BlendOp::kReverseSubtract: return vk::BlendOp::eReverseSubtract;
-		default: EXIT("unknown op: %u\n", op);
+		default: return std::nullopt;
 	}
-	return vk::BlendOp::eAdd;
+}
+
+static vk::BlendOp GetBlendOp(uint32_t op) {
+	if (const auto converted = TryBlendOp(op)) {
+		return *converted;
+	}
+	EXIT("unknown op: %u\n", op);
 }
 
 static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descriptor_bindings,
@@ -193,8 +206,11 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 	}
 }
 
-static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                                   std::span<const vk::DescriptorSetLayoutBinding> bindings) {
+// Whether the bindings fit the device's descriptor limits; exits when they do not, unless
+// `check_only`.
+static bool DescriptorLimitsFit(GraphicContext&                                 graphics,
+                                std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                                bool                                            check_only) {
 	const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
 	uint64_t descriptor_count = 0;
 	uint64_t storage_buffers = 0;
@@ -210,6 +226,9 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 				stage_resources[stage] += binding.descriptorCount;
 			if (stage_buffers[stage] > limits.maxPerStageDescriptorStorageBuffers ||
 			    stage_resources[stage] > limits.maxPerStageResources) {
+				if (check_only) {
+					return false;
+				}
 				EXIT("native descriptor stage %u exceeds device limits: buffers=%" PRIu64
 				     "/%u resources=%" PRIu64 "/%u\n", stage, stage_buffers[stage],
 				     limits.maxPerStageDescriptorStorageBuffers, stage_resources[stage], limits.maxPerStageResources);
@@ -217,8 +236,22 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 		}
 	}
 	if (storage_buffers > limits.maxDescriptorSetStorageBuffers) {
+		if (check_only) {
+			return false;
+		}
 		EXIT("native storage-buffer descriptors exceed device limit: %" PRIu64 "/%u\n",
 		     storage_buffers, limits.maxDescriptorSetStorageBuffers);
+	}
+	(void)descriptor_count;
+	return true;
+}
+
+static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                   std::span<const vk::DescriptorSetLayoutBinding> bindings) {
+	(void)DescriptorLimitsFit(graphics, bindings, false);
+	uint64_t descriptor_count = 0;
+	for (const auto& binding: bindings) {
+		descriptor_count += binding.descriptorCount;
 	}
 	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
 
@@ -614,6 +647,79 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (tess_eval_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
 	}
+}
+
+bool CanCreatePipeline(GraphicContext& graphics, const PipelineRenderingState& rendering,
+                       const PipelineVertexInputState&        vertex_input,
+                       std::span<const ShaderVertexInputInfo> vertex_info,
+                       const ShaderPixelInputInfo*            ps_input_info,
+                       const PipelineStaticParameters&        static_params) {
+	const auto& vs_input_info = vertex_info.front();
+	if (!vs_input_info.stage || (ps_input_info != nullptr && !ps_input_info->stage)) {
+		return false;
+	}
+	const bool mesh = vs_input_info.stage.program->stage == ShaderType::Mesh;
+	if ((mesh && !graphics.mesh_shader_enabled) ||
+	    (static_params.provoking_vtx_last && !graphics.provoking_vertex_last_enabled)) {
+		return false;
+	}
+	if (!mesh && vertex_info.size() == 1 &&
+	    static_params.topology == vk::PrimitiveTopology::ePatchList && ps_input_info != nullptr &&
+	    ps_input_info->input_num > ShaderVertexInputInfo::RES_MAX) {
+		return false;
+	}
+	for (uint32_t index = 0; index < vertex_input.attribute_count; index++) {
+		const auto& resource      = vs_input_info.resources[index];
+		const auto  raw_format    = resource.RawFormat();
+		const auto  registers_num = vs_input_info.resources_dst[index].registers_num;
+		if (registers_num < 1 || registers_num > 4) {
+			return false;
+		}
+		if (raw_format != kTemporaryVertexAttribFormat113 &&
+		    raw_format != kTemporaryPs5BufferFormat121 &&
+		    (VulkanFormat(resource.Format()) == vk::Format::eUndefined ||
+		     ShaderRecompiler::Format::GetFormatInfo(resource.Format()).component_count == 0)) {
+			return false;
+		}
+	}
+	for (uint32_t i = 0; i < rendering.color_count; i++) {
+		if ((static_params.color_mask[i] & ~0x0fu) != 0 ||
+		    !TryBlendFactor(static_params.color_srcblend[i]) ||
+		    !TryBlendFactor(static_params.color_destblend[i]) ||
+		    !TryBlendOp(static_params.color_comb_fcn[i]) ||
+		    (static_params.separate_alpha_blend[i] &&
+		     (!TryBlendFactor(static_params.alpha_srcblend[i]) ||
+		      !TryBlendFactor(static_params.alpha_destblend[i]) ||
+		      !TryBlendOp(static_params.alpha_comb_fcn[i])))) {
+			return false;
+		}
+	}
+	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
+	for (const auto& stage: vertex_info) {
+		AddLayoutBindings(descriptor_bindings, *stage.stage.program,
+		                  NativeShaderStage(stage.logical_stage));
+	}
+	if (ps_input_info != nullptr) {
+		AddLayoutBindings(descriptor_bindings, *ps_input_info->stage.program,
+		                  vk::ShaderStageFlagBits::eFragment);
+	}
+	bool bindless = ps_input_info != nullptr && UsesBindlessHeap(*ps_input_info->stage.program);
+	for (const auto& stage: vertex_info) {
+		bindless |= UsesBindlessHeap(*stage.stage.program);
+	}
+	return DescriptorLimitsFit(graphics, descriptor_bindings, true) &&
+	       (!bindless || graphics.bindless_heap_layout != nullptr);
+}
+
+bool CanCreatePipeline(GraphicContext& graphics, const ShaderComputeInputInfo& input_info) {
+	if (!input_info.stage) {
+		return false;
+	}
+	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
+	AddLayoutBindings(descriptor_bindings, *input_info.stage.program,
+	                  vk::ShaderStageFlagBits::eCompute);
+	return DescriptorLimitsFit(graphics, descriptor_bindings, true) &&
+	       (!UsesBindlessHeap(*input_info.stage.program) || graphics.bindless_heap_layout != nullptr);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
