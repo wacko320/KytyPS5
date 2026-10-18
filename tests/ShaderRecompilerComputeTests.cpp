@@ -49839,6 +49839,8 @@ std::vector<TestCase> MakeCases() {
   AddRayTracingCases(cases);
   cases.push_back(BvhIntersections(true, true, 1));
   cases.push_back(BvhIntersections(true, true, 0, true));
+  for (int kind : {0, 4, 5}) cases.push_back(BvhIntersections(true, false, 0, false, kind));
+  cases.push_back(BvhIntersections(true, true, 0, false, 5));
   for (bool barycentrics : {false, true}) {
     for (bool sorted : {false, true}) {
       cases.push_back(BvhIntersections(barycentrics, sorted));
@@ -57532,6 +57534,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, FlatStackApertures(64));
     RunCase(&vulkan, BvhIntersections(true, true, 1));
     RunCase(&vulkan, BvhIntersections(true, true, 0, true));
+    for (int kind : {0, 4, 5}) RunCase(&vulkan, BvhIntersections(true, false, 0, false, kind));
+    RunCase(&vulkan, BvhIntersections(true, true, 0, false, 5));
     for (bool barycentrics : {false, true}) {
       for (bool sorted : {false, true}) {
         RunCase(&vulkan, BvhIntersections(barycentrics, sorted));

@@ -83,12 +83,18 @@ TestCase FlatStackApertures(u32 wave_size) {
   return test;
 }
 
-TestCase BvhIntersections(bool barycentrics, bool sorted, u32 grow = 0, bool wide = false) {
+// uniform_kind >= 0: every lane intersects the same node (of that kind) with its own ray, as a
+// wave that walks its BVH together does.
+TestCase BvhIntersections(bool barycentrics, bool sorted, u32 grow = 0, bool wide = false,
+                          int uniform_kind = -1) {
   TestCase test;
   test.name = barycentrics ? (sorted ? "BvhBarycentricSorted" : "BvhBarycentricUnsorted")
                           : (sorted ? "BvhTriangleIdSorted" : "BvhTriangleIdUnsorted");
   if (grow != 0) test.name = "BvhBoxExitGrowth";
   if (wide) test.name = "Bvh64HighNodePointers";
+  if (uniform_kind == 0) test.name = "BvhUniformTriangleNode";
+  if (uniform_kind == 4) test.name = "BvhUniformFp16BoxNode";
+  if (uniform_kind == 5) test.name = sorted ? "BvhUniformFp32BoxNodeSorted" : "BvhUniformFp32BoxNode";
   constexpr u32 NodeStart = 1024, OutputStart = 512, LaneCount = 32;
   constexpr uint64_t GuestBase = 0x10000;
   const u32 node_base = wide ? 1u << 29 : 0;
@@ -129,7 +135,7 @@ TestCase BvhIntersections(bool barycentrics, bool sorted, u32 grow = 0, bool wid
   const std::array<std::array<float, 2>, 4> origins{{{0, 0}, {1, 0}, {.5f, 1.5f}, {-.25f, 1}}};
   std::array<std::array<u32, 4>, LaneCount> expected{};
   for (u32 lane = 0; lane < LaneCount; ++lane) {
-    const auto kind = lane % 8;
+    const u32 kind = uniform_kind >= 0 ? static_cast<u32>(uniform_kind) : lane % 8;
     const auto input = lane * 16;
     data[input] = kind < 4 ? kind : kind == 4 ? 12 : kind == 5 ? 21 : kind == 6 ? 6 : 0x1000;
     data[input + 1] = bits(6);
@@ -152,7 +158,17 @@ TestCase BvhIntersections(bool barycentrics, bool sorted, u32 grow = 0, bool wid
       expected[lane] = kind == 6 ? std::array<u32, 4>{Invalid, Invalid, Invalid, Invalid}
                                  : std::array<u32, 4>{Infinity, bits(1), Invalid, 0};
     }
-    if (lane >= 8 && lane < 12) {
+    if (uniform_kind >= 0) {
+      if (lane >= 8 && lane < 12) {
+        data[input + 2] = 0x7fc00000; // invalid ray origin
+        expected[lane] = kind < 4 ? std::array<u32, 4>{Infinity, bits(1), Invalid, 0}
+                                  : std::array<u32, 4>{Invalid, Invalid, Invalid, Invalid};
+      } else if (kind >= 4 && lane >= 16 && lane < 20) {
+        data[input + 1] = bits(2); // the extent keeps only the nearest child
+        expected[lane] = sorted ? std::array<u32, 4>{children[1], Invalid, Invalid, Invalid}
+                                : std::array<u32, 4>{Invalid, children[1], Invalid, Invalid};
+      }
+    } else if (lane >= 8 && lane < 12) {
       data[input + 2] = 0x7fc00000; // invalid ray origin
       expected[lane] = {Infinity, bits(1), Invalid, 0};
     } else if (lane == 12 || lane == 13) {
@@ -204,7 +220,8 @@ TestCase BvhIntersections(bool barycentrics, bool sorted, u32 grow = 0, bool wid
     std::copy(expected[lane].begin(), expected[lane].end(),
               test.expected.begin() + OutputStart + lane * 4);
     auto bounded = expected[lane];
-    if (lane % 8 == 5) bounded = {Invalid, Invalid, Invalid, Invalid};
+    if ((uniform_kind >= 0 ? static_cast<u32>(uniform_kind) : lane % 8) == 5)
+      bounded = {Invalid, Invalid, Invalid, Invalid};
     if (lane >= 20) bounded = {0x12345678, 0x12345679, 0x1234567a, 0x1234567b};
     std::copy(bounded.begin(), bounded.end(),
               test.expected.begin() + OutputStart + LaneCount * 4 + lane * 4);

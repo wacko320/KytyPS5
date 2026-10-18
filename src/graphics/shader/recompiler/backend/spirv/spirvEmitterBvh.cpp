@@ -24,13 +24,22 @@ constexpr uint32_t NodeWords = 28;
 using Words = std::array<uint32_t, NodeWords>;
 
 // Loads count dwords from a host pointer as 16-byte vectors; nodes are 64-byte aligned.
+// BVH memory is read-only to the traversal: a node whose address is uniform then loads through
+// the scalar cache.
 void LoadBlock(EmitterState& s, uint32_t host, uint32_t count, uint32_t* words) {
 	const auto vec4 = TypeU32Vector(s, 4);
+	const auto block = s.builder.DecoratedType(
+	    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+	                        {spv::OpMemberDecorate, {0, spv::DecorationNonWritable}},
+	                        {spv::OpDecorate, {spv::DecorationBlock}}}, vec4);
+	const auto block_pointer = TypePointer(s, spv::StorageClassPhysicalStorageBuffer, block);
 	const auto pointer_type = TypePointer(s, spv::StorageClassPhysicalStorageBuffer, vec4);
 	for (uint32_t offset = 0; offset < count; offset += 4) {
 		const auto address = offset == 0 ? host
 		    : Binary(s, spv::OpIAdd, TypeU64(s), host, ConstantU64(s, offset * 4u));
-		const auto pointer = Unary(s, spv::OpConvertUToPtr, pointer_type, address);
+		const auto base = Unary(s, spv::OpConvertUToPtr, block_pointer, address);
+		const auto pointer = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, base, ConstantU32(s, 0));
 		const auto value = s.builder.AllocateId();
 		s.builder.AddFunction(spv::OpLoad, vec4, value, pointer, spv::MemoryAccessAlignedMask, 16u);
 		for (uint32_t i = 0; i < 4; ++i) words[offset + i] = Extract(s, TypeU32(s), value, i);
@@ -176,15 +185,17 @@ std::array<std::array<uint32_t, 6>, 4> Bounds(EmitterState& s, const Words& word
 	return result;
 }
 
-uint32_t Boxes(EmitterState& s, const Words& words, uint32_t half,
-               uint32_t grow, uint32_t sort, uint32_t extent, const Vec3& origin, const Vec3& inverse) {
+// The children's slab tests: their entry distances, and whether the ray hits each. Without
+// growth (grow 0, the common case) the exit distance needs no rounding.
+struct ChildHits {
+	std::array<uint32_t, 4> entry, hit;
+};
+ChildHits SlabTests(EmitterState& s, const std::array<std::array<uint32_t, 6>, 4>& bounds,
+                    uint32_t grow, uint32_t extent, const Vec3& origin, const Vec3& inverse,
+                    const Vec3& forward) {
 	const auto f = TypeF32(s), u = TypeU32(s), b = TypeBool(s);
 	const auto zero = ConstantF32Value(s, 0.0f);
-	std::array<uint32_t, 4> depths, indices;
-	Vec3 forward;
-	for (uint32_t axis = 0; axis < 3; ++axis)
-		forward[axis] = Binary(s, spv::OpFOrdGreaterThanEqual, b, inverse[axis], zero);
-	const auto bounds = Bounds(s, words, half);
+	ChildHits result;
 	for (uint32_t child = 0; child < 4; ++child) {
 		const auto& box = bounds[child];
 		Vec3 near, far;
@@ -200,67 +211,97 @@ uint32_t Boxes(EmitterState& s, const Words& words, uint32_t half,
 		    EmitGlsl<GLSLstd450FMax, IR::Type::F32>(s, near[0], near[1]), near[2]);
 		const auto exit = EmitGlsl<GLSLstd450FMin, IR::Type::F32>(s,
 		    EmitGlsl<GLSLstd450FMin, IR::Type::F32>(s, far[0], far[1]), far[2]);
-		// Valid hits have nonnegative exit distance. Saturate ULP growth at +infinity.
-		const auto bits = Unary(s, spv::OpBitcast, u, Select(s, f,
-		    Binary(s, spv::OpFOrdEqual, b, exit, zero), zero, exit));
-		const auto grown_bits = EmitGlsl<GLSLstd450UMin, IR::Type::U32>(s,
-		    Binary(s, spv::OpIAdd, u, bits, grow), ConstantU32(s, 0x7f800000));
-		const auto grown = Unary(s, spv::OpBitcast, f, grown_bits);
 		auto hit = Binary(s, spv::OpLogicalAnd, b,
 		    Binary(s, spv::OpFOrdGreaterThanEqual, b, exit, zero),
 		    Binary(s, spv::OpFOrdLessThan, b, entry, extent));
-		hit = Binary(s, spv::OpLogicalAnd, b, hit,
-		    Binary(s, spv::OpFOrdLessThanEqual, b, entry, grown));
-		depths[child] = Unary(s, spv::OpBitcast, u, Select(s, f, hit,
-		    Select(s, f, Binary(s, spv::OpFOrdGreaterThan, b, entry, zero), entry, zero),
-		    ConstantF32(s, 0x7f800000)));
-		indices[child] = Select(s, u, hit, words[child], ConstantU32(s, ~0u));
+		uint32_t limit = exit;
+		if (grow != 0) {
+			// Valid hits have nonnegative exit distance. Saturate ULP growth at +infinity.
+			const auto bits = Unary(s, spv::OpBitcast, u, Select(s, f,
+			    Binary(s, spv::OpFOrdEqual, b, exit, zero), zero, exit));
+			const auto grown_bits = EmitGlsl<GLSLstd450UMin, IR::Type::U32>(s,
+			    Binary(s, spv::OpIAdd, u, bits, grow), ConstantU32(s, 0x7f800000));
+			limit = Unary(s, spv::OpBitcast, f, grown_bits);
+		}
+		// With no growth, entry <= exit is the same test: for a nonnegative exit the grown
+		// bound is the exit itself (-0 compares as +0).
+		result.hit[child] = Binary(s, spv::OpLogicalAnd, b, hit,
+		    Binary(s, spv::OpFOrdLessThanEqual, b, entry, limit));
+		result.entry[child] = entry;
 	}
-	// A select network keeps the original child order when sorting is disabled.
-	constexpr std::array<std::pair<uint32_t, uint32_t>, 5> network {{{0,1}, {2,3}, {0,2}, {1,3}, {1,2}}};
-	for (size_t step = 0; step < network.size(); ++step) {
-		const auto [a, c] = network[step];
-		const auto swap = Binary(s, spv::OpLogicalAnd, b, sort,
-		    Binary(s, spv::OpUGreaterThan, b, depths[a], depths[c]));
-		const auto depth = depths[a], index = indices[a];
-		const auto later = [&](uint32_t position) {
-			return std::ranges::any_of(std::span(network).subspan(step + 1), [=](auto pair) {
-				return pair.first == position || pair.second == position;
-			});
-		};
-		if (later(a)) depths[a] = Select(s, u, swap, depths[c], depth);
-		if (later(c)) depths[c] = Select(s, u, swap, depth, depths[c]);
-		indices[a] = Select(s, u, swap, indices[c], index);
-		indices[c] = Select(s, u, swap, index, indices[c]);
-	}
-	return Vector(s, TypeU32Vector(s, 4), indices);
+	return result;
 }
 
-} // namespace
+uint32_t Boxes(EmitterState& s, const Words& words, uint32_t half, uint32_t grow, uint32_t sort,
+               uint32_t extent, const Vec3& origin, const Vec3& inverse) {
+	const auto f = TypeF32(s), u = TypeU32(s), b = TypeBool(s);
+	const auto vec4 = TypeU32Vector(s, 4);
+	const auto zero = ConstantF32Value(s, 0.0f);
+	Vec3 forward;
+	for (uint32_t axis = 0; axis < 3; ++axis)
+		forward[axis] = Binary(s, spv::OpFOrdGreaterThanEqual, b, inverse[axis], zero);
+	const auto bounds = Bounds(s, words, half);
+	// Two versions of the tests, by the descriptor's (uniform) growth.
+	const auto grown_label = s.builder.AllocateId(), plain_label = s.builder.AllocateId();
+	const auto tests_merge = s.builder.AllocateId();
+	const auto grows = Binary(s, spv::OpINotEqual, b, grow, ConstantU32(s, 0));
+	s.builder.AddFunction(spv::OpSelectionMerge, tests_merge, spv::SelectionControlMaskNone);
+	s.builder.AddFunction(spv::OpBranchConditional, grows, grown_label, plain_label);
+	EmitLabel(s, grown_label);
+	const auto grown = SlabTests(s, bounds, grow, extent, origin, inverse, forward);
+	const auto grown_exit = s.current_label;
+	s.builder.AddFunction(spv::OpBranch, tests_merge);
+	EmitLabel(s, plain_label);
+	const auto plain = SlabTests(s, bounds, 0, extent, origin, inverse, forward);
+	const auto plain_exit = s.current_label;
+	s.builder.AddFunction(spv::OpBranch, tests_merge);
+	EmitLabel(s, tests_merge);
+	std::array<uint32_t, 4> entry, hit, indices;
+	for (uint32_t child = 0; child < 4; ++child) {
+		entry[child] = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpPhi, f, entry[child], grown.entry[child], grown_exit,
+		                      plain.entry[child], plain_exit);
+		hit[child] = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpPhi, b, hit[child], grown.hit[child], grown_exit,
+		                      plain.hit[child], plain_exit);
+	}
+	for (uint32_t child = 0; child < 4; ++child)
+		indices[child] = Select(s, u, hit[child], words[child], ConstantU32(s, ~0u));
+	const auto unsorted = Vector(s, vec4, indices);
+	// Sorting is a descriptor bit: the depths and the network are only built when it is set.
+	return EmitValueOrDefaultIfCondition(s, sort, vec4, unsorted, [&] {
+		std::array<uint32_t, 4> depths, sorted = indices;
+		for (uint32_t child = 0; child < 4; ++child) {
+			depths[child] = Unary(s, spv::OpBitcast, u, Select(s, f, hit[child],
+			    Select(s, f, Binary(s, spv::OpFOrdGreaterThan, b, entry[child], zero), entry[child],
+			           zero),
+			    ConstantF32(s, 0x7f800000)));
+		}
+		constexpr std::array<std::pair<uint32_t, uint32_t>, 5> network {{{0,1}, {2,3}, {0,2}, {1,3}, {1,2}}};
+		for (size_t step = 0; step < network.size(); ++step) {
+			const auto [a, c] = network[step];
+			const auto swap = Binary(s, spv::OpUGreaterThan, b, depths[a], depths[c]);
+			const auto later = [&](uint32_t position) {
+				return std::ranges::any_of(std::span(network).subspan(step + 1), [=](auto pair) {
+					return pair.first == position || pair.second == position;
+				});
+			};
+			const auto depth = depths[a];
+			if (later(a)) depths[a] = EmitGlsl<GLSLstd450UMin, IR::Type::U32>(s, depth, depths[c]);
+			if (later(c)) depths[c] = EmitGlsl<GLSLstd450UMax, IR::Type::U32>(s, depth, depths[c]);
+			const auto index = sorted[a];
+			sorted[a] = Select(s, u, swap, sorted[c], index);
+			sorted[c] = Select(s, u, swap, index, sorted[c]);
+		}
+		return Vector(s, vec4, sorted);
+	});
+}
 
-void DefineBvhIntersect(EmitterState& s) {
-	if (!s.program.info.bvh) return;
-	const auto u = TypeU32(s), f = TypeF32(s), b = TypeBool(s), wide = TypeU64(s);
-	const auto vec4 = TypeU32Vector(s, 4), vec3 = TypeF32Vector(s, 3);
-	const auto signature = s.builder.Type(spv::OpTypeFunction, vec4, vec4, wide, f, vec3, vec3, vec3);
-	s.bvh_intersect_function = s.builder.AllocateId();
-	s.builder.AddName(s.bvh_intersect_function, "bvh_intersect");
-	s.builder.AddFunction(spv::OpFunction, vec4, s.bvh_intersect_function,
-	                      spv::FunctionControlMaskNone, signature);
-	std::array<uint32_t, 6> args;
-	const std::array types {vec4, wide, f, vec3, vec3, vec3};
-	for (uint32_t i = 0; i < args.size(); ++i) {
-		args[i] = s.builder.AllocateId();
-		s.builder.AddFunction(spv::OpFunctionParameter, types[i], args[i]);
-	}
-	EmitLabel(s, s.builder.AllocateId());
-	const auto descriptor = args[0], node = args[1], extent = args[2];
-	Vec3 origin, direction, inverse;
-	for (uint32_t i = 0; i < 3; ++i) {
-		origin[i] = Extract(s, f, args[3], i);
-		direction[i] = Extract(s, f, args[4], i);
-		inverse[i] = Extract(s, f, args[5], i);
-	}
+// The intersection of each lane's ray with `node` of the BVH `descriptor`.
+uint32_t Intersect(EmitterState& s, uint32_t descriptor, uint32_t node, uint32_t extent,
+                   const Vec3& origin, const Vec3& direction, const Vec3& inverse) {
+	const auto u = TypeU32(s), b = TypeBool(s), wide = TypeU64(s);
+	const auto vec4 = TypeU32Vector(s, 4);
 	std::array<uint32_t, 4> words;
 	for (uint32_t i = 0; i < 4; ++i) words[i] = Extract(s, u, descriptor, i);
 	const auto and_bits = [&](uint32_t value, uint32_t mask) {
@@ -286,9 +327,11 @@ void DefineBvhIntersect(EmitterState& s) {
 	const auto last_address =
 	    Binary(s, spv::OpIAdd, wide, base,
 	           Binary(s, spv::OpShiftLeftLogical, wide, last_index, ConstantU32(s, 6)));
-	auto valid = Binary(s, spv::OpIEqual, b, shr(words[3], 28), ConstantU32(s, 8));
+	// The node's checks are kept apart from the ray's: the node is often the same in every lane
+	// (wave-wide traversal), and its fetch should then branch on a uniform condition.
+	auto node_valid = Binary(s, spv::OpIEqual, b, shr(words[3], 28), ConstantU32(s, 8));
 	const auto require = [&](uint32_t condition) {
-		valid = Binary(s, spv::OpLogicalAnd, b, valid, condition);
+		node_valid = Binary(s, spv::OpLogicalAnd, b, node_valid, condition);
 	};
 	require(Binary(s, spv::OpULessThanEqual, b, kind, ConstantU32(s, 5)));
 	// The size field bounds box nodes only: GTA V sizes its BLAS descriptors to the box nodes and
@@ -301,12 +344,15 @@ void DefineBvhIntersect(EmitterState& s) {
 	require(Binary(s, spv::OpINotEqual, b, base, ConstantU64(s, 0)));
 	require(Binary(s, spv::OpULessThan, b, last_address, ConstantU64(s, uint64_t {1} << 48)));
 	// NaN inputs and an infinite origin are invalid; |origin| < inf rejects both at once.
-	require(Unary(s, spv::OpLogicalNot, b, Unary(s, spv::OpIsNan, b, extent)));
+	auto ray_valid = Unary(s, spv::OpLogicalNot, b, Unary(s, spv::OpIsNan, b, extent));
 	for (uint32_t i = 0; i < 3; ++i) {
 		for (const auto value: {direction[i], inverse[i]})
-			require(Unary(s, spv::OpLogicalNot, b, Unary(s, spv::OpIsNan, b, value)));
-		require(Binary(s, spv::OpFOrdLessThan, b, EmitGlsl<GLSLstd450FAbs, IR::Type::F32>(s, origin[i]),
-		               ConstantF32(s, 0x7f800000)));
+			ray_valid = Binary(s, spv::OpLogicalAnd, b, ray_valid,
+			                   Unary(s, spv::OpLogicalNot, b, Unary(s, spv::OpIsNan, b, value)));
+		ray_valid = Binary(s, spv::OpLogicalAnd, b, ray_valid,
+		                   Binary(s, spv::OpFOrdLessThan, b,
+		                          EmitGlsl<GLSLstd450FAbs, IR::Type::F32>(s, origin[i]),
+		                          ConstantF32(s, 0x7f800000)));
 	}
 	const std::array triangle_invalid {ConstantU32(s, 0x7f800000), ConstantU32(s, 0x3f800000),
 	                                  ConstantU32(s, ~0u), ConstantU32(s, 0)};
@@ -316,7 +362,7 @@ void DefineBvhIntersect(EmitterState& s) {
 	for (uint32_t i = 0; i < 4; ++i)
 		invalid_words[i] = Select(s, u, triangle, triangle_invalid[i], box_invalid[i]);
 	const auto invalid = Vector(s, vec4, invalid_words);
-	const auto result = EmitValueOrDefaultIfCondition(s, valid, vec4, invalid, [&] {
+	const auto result = EmitValueOrDefaultIfCondition(s, node_valid, vec4, invalid, [&] {
 		// One page lookup serves a whole node, and its words load as 16-byte vectors before any
 		// branch, so a box costs one memory round trip instead of one per child. A node is
 		// 64-byte aligned: only a box32's second block can start a new page.
@@ -359,6 +405,73 @@ void DefineBvhIntersect(EmitterState& s) {
 			return value;
 		});
 	});
+	const auto bvec4 = s.builder.Type(spv::OpTypeVector, b, 4u);
+	const auto keep = Vector(s, bvec4, std::array {ray_valid, ray_valid, ray_valid, ray_valid});
+	const auto value = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpSelect, vec4, value, keep, result, invalid);
+	return value;
+}
+
+} // namespace
+
+void DefineBvhIntersect(EmitterState& s) {
+	if (!s.program.info.bvh) return;
+	const auto u = TypeU32(s), f = TypeF32(s), b = TypeBool(s), wide = TypeU64(s);
+	const auto vec4 = TypeU32Vector(s, 4), vec3 = TypeF32Vector(s, 3);
+	const auto signature = s.builder.Type(spv::OpTypeFunction, vec4, vec4, wide, f, vec3, vec3, vec3);
+	s.bvh_intersect_function = s.builder.AllocateId();
+	s.builder.AddName(s.bvh_intersect_function, "bvh_intersect");
+	s.builder.AddFunction(spv::OpFunction, vec4, s.bvh_intersect_function,
+	                      spv::FunctionControlMaskNone, signature);
+	std::array<uint32_t, 6> args;
+	const std::array types {vec4, wide, f, vec3, vec3, vec3};
+	for (uint32_t i = 0; i < args.size(); ++i) {
+		args[i] = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpFunctionParameter, types[i], args[i]);
+	}
+	EmitLabel(s, s.builder.AllocateId());
+	const auto descriptor = args[0], node = args[1], extent = args[2];
+	Vec3 origin, direction, inverse;
+	for (uint32_t i = 0; i < 3; ++i) {
+		origin[i] = Extract(s, f, args[3], i);
+		direction[i] = Extract(s, f, args[4], i);
+		inverse[i] = Extract(s, f, args[5], i);
+	}
+	// A wave that walks its BVH together tests every lane's ray against one node: then the node
+	// is fetched and decoded once, as uniform values (scalar loads), instead of per lane.
+	s.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+	s.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
+	s.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
+	const auto scope = ConstantU32(s, spv::ScopeSubgroup);
+	const auto first = [&](uint32_t type, uint32_t value) {
+		const auto result = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpGroupNonUniformBroadcastFirst, type, result, scope, value);
+		return result;
+	};
+	const auto first_descriptor = first(vec4, descriptor), first_node = first(wide, node);
+	auto same = Binary(s, spv::OpIEqual, b, node, first_node);
+	for (uint32_t i = 0; i < 4; ++i)
+		same = Binary(s, spv::OpLogicalAnd, b, same,
+		              Binary(s, spv::OpIEqual, b, Extract(s, u, descriptor, i),
+		                     Extract(s, u, first_descriptor, i)));
+	const auto uniform = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpGroupNonUniformAll, b, uniform, scope, same);
+	const auto uniform_label = s.builder.AllocateId(), lane_label = s.builder.AllocateId();
+	const auto merge = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+	s.builder.AddFunction(spv::OpBranchConditional, uniform, uniform_label, lane_label);
+	EmitLabel(s, uniform_label);
+	const auto uniform_value =
+	    Intersect(s, first_descriptor, first_node, extent, origin, direction, inverse);
+	const auto uniform_exit = s.current_label;
+	s.builder.AddFunction(spv::OpBranch, merge);
+	EmitLabel(s, lane_label);
+	const auto lane_value = Intersect(s, descriptor, node, extent, origin, direction, inverse);
+	const auto lane_exit = s.current_label;
+	s.builder.AddFunction(spv::OpBranch, merge);
+	EmitLabel(s, merge);
+	const auto result = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpPhi, vec4, result, uniform_value, uniform_exit, lane_value, lane_exit);
 	s.builder.AddFunction(spv::OpReturnValue, result);
 	s.builder.AddFunction(spv::OpFunctionEnd);
 }
