@@ -877,6 +877,7 @@ void WindowRun() {
 
 	g_window->Run();
 	Common::LockGuard lock(g_window->render_context->GetMutex());
+	g_window->render_context->GetPipelineCache().StopBackgroundBuilds();
 	g_window->render_context->GetPipelineCache().Save();
 }
 

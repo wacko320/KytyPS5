@@ -199,6 +199,10 @@ public:
 	[[nodiscard]] PrecompileStats GetPrecompileStats() const;
 	// Tests: until no precompile is queued or running.
 	void WaitForPrecompiles();
+	// Stops the workers that build ahead (sibling builds, precompiles) after their current build,
+	// and logs the precompile statistics. Any thread: at exit, where the cache itself is not
+	// destroyed, so no worker still uses the device when it goes.
+	void StopBackgroundBuilds();
 	// Guest programs translated to IR so far: a new shader, a relinked call, a bindless retry.
 	[[nodiscard]] uint64_t TranslationCount() const;
 	// See ResourcePrefetcher::MemoryOps::replay_check: on from the start in debug builds.

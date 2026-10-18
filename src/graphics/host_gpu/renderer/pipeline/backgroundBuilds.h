@@ -91,7 +91,7 @@ public:
 	}
 
 	// Stops the workers after their current build, drops queued builds and disposes of results
-	// nobody took. Later submissions are refused.
+	// nobody took. Later submissions are refused. Any thread.
 	void Shutdown() {
 		std::vector<std::thread> threads;
 		{
@@ -103,13 +103,15 @@ public:
 		m_work.notify_all();
 		for (auto& thread: threads) thread.join();
 		std::lock_guard lock(m_mutex);
-		for (auto& entry: m_entries) {
+		// A requester waiting in Take (another thread) still takes its entry.
+		std::erase_if(m_entries, [&](Entry& entry) {
+			if (entry.claimed) return false;
 			if (entry.state == State::Finished && entry.result && m_dispose) {
 				m_dispose(*entry.result);
 				m_stats.disposed++;
 			}
-		}
-		m_entries.clear();
+			return true;
+		});
 	}
 
 	struct Stats {

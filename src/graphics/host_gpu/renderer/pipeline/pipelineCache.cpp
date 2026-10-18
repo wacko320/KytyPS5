@@ -1235,7 +1235,7 @@ struct PipelineCache::ProgramCache {
 		    precompiled->push_cursor == push_data_cursor &&
 		    precompiled->specialization == entry->second.specialization) {
 			entry->second.permutations.push_back(AdoptPermutation(*precompiled));
-			precompile_stats.hits++;
+			precompile_hits.fetch_add(1, std::memory_order_relaxed);
 			Common::FrameProfiler::Add(Common::FrameProfiler::Counter::PrecompileHits);
 		} else {
 			if (precompiled) {
@@ -1250,7 +1250,7 @@ struct PipelineCache::ProgramCache {
 			entry->second.permutations.push_back(CompilePermutation(
 			    stage_name, options, std::move(translated), entry->second.specialization,
 			    push_data_cursor, entry->second.FunctionCode(), table_linked_compute));
-			precompile_stats.misses++;
+			precompile_misses.fetch_add(1, std::memory_order_relaxed);
 			Common::FrameProfiler::Add(Common::FrameProfiler::Counter::PrecompileMisses);
 		}
 		entry->second.permutations.back().plan_generation = entry->second.plan_generation;
@@ -1665,7 +1665,7 @@ struct PipelineCache::ProgramCache {
 		for (const auto hash: hashes) {
 			precompile_bundles[hash] = bundle;
 		}
-		precompile_stats.submitted += hashes.size();
+		precompile_submitted.fetch_add(hashes.size(), std::memory_order_relaxed);
 		Common::FrameProfiler::Add(Common::FrameProfiler::Counter::PrecompileSubmitted,
 		                           hashes.size());
 		return true;
@@ -1873,7 +1873,11 @@ struct PipelineCache::ProgramCache {
 	std::array<std::unordered_set<uint64_t>, 3>      precompile_known;
 	uint64_t                                         precompile_known_generation = 0;
 	uint64_t                                         next_precompile_bundle      = 0;
-	PrecompileStats                                  precompile_stats;
+	// Read by any thread (PipelineCache::GetPrecompileStats).
+	std::atomic<uint64_t>                            precompile_submitted {0};
+	std::atomic<uint64_t>                            precompile_hits {0};
+	std::atomic<uint64_t>                            precompile_misses {0};
+	std::atomic<uint64_t>                            precompile_pipeline_hits {0};
 	std::atomic<uint64_t>                            precompile_wasted {0};
 	vk::PipelineCache                                precompile_driver_cache = nullptr;
 	// Declared after everything its workers use, so it stops first.
@@ -1935,13 +1939,6 @@ PipelineCache::~PipelineCache() {
 	// Workers use the device and the driver cache: they stop before either goes.
 	m_background_builds->Shutdown();
 	m_program_cache->StopPrecompiles();
-	if (const auto stats = GetPrecompileStats(); stats.submitted != 0) {
-		PipelineCacheLog("Precompiles: {} programs handed to workers; {} programs and {} graphics "
-		                 "pipelines taken from them, {} programs compiled on the GPU thread, {} "
-		                 "results dropped",
-		                 stats.submitted, stats.hits, stats.pipeline_hits, stats.misses,
-		                 stats.wasted);
-	}
 	StopDriverCacheSaves();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
@@ -2512,6 +2509,20 @@ void PipelineCache::PrecompileDispatch(const HW::Shader& shaders, const HW::Shad
 	}
 }
 
+void PipelineCache::StopBackgroundBuilds() {
+	m_background_builds->Shutdown();
+	if (m_program_cache->precompiles != nullptr) {
+		m_program_cache->precompiles->Shutdown();
+	}
+	if (const auto stats = GetPrecompileStats(); stats.submitted != 0) {
+		PipelineCacheLog("Precompiles: {} programs handed to workers; {} programs and {} graphics "
+		                 "pipelines taken from them, {} programs compiled on the GPU thread, {} "
+		                 "results dropped",
+		                 stats.submitted, stats.hits, stats.pipeline_hits, stats.misses,
+		                 stats.wasted);
+	}
+}
+
 void PipelineCache::WaitForPrecompiles() {
 	if (m_program_cache->precompiles != nullptr) {
 		m_program_cache->precompiles->WaitIdle();
@@ -2519,9 +2530,12 @@ void PipelineCache::WaitForPrecompiles() {
 }
 
 PipelineCache::PrecompileStats PipelineCache::GetPrecompileStats() const {
-	auto stats   = m_program_cache->precompile_stats;
-	stats.wasted = m_program_cache->precompile_wasted.load(std::memory_order_relaxed);
-	return stats;
+	const auto& programs = *m_program_cache;
+	return {.submitted     = programs.precompile_submitted.load(std::memory_order_relaxed),
+	        .hits          = programs.precompile_hits.load(std::memory_order_relaxed),
+	        .misses        = programs.precompile_misses.load(std::memory_order_relaxed),
+	        .wasted        = programs.precompile_wasted.load(std::memory_order_relaxed),
+	        .pipeline_hits = programs.precompile_pipeline_hits.load(std::memory_order_relaxed)};
 }
 
 bool PipelineCache::PrefetchEnabled() const {
@@ -2863,7 +2877,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 			auto cached = std::make_unique<Pipeline>(found->second);
 			built_ahead.erase(found);
 			std::erase(m_program_cache->precompiled_graphics_order, content);
-			m_program_cache->precompile_stats.pipeline_hits++;
+			m_program_cache->precompile_pipeline_hits.fetch_add(1, std::memory_order_relaxed);
 			Common::FrameProfiler::Add(Common::FrameProfiler::Counter::PrecompilePipelineHits);
 			auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 			EXIT_IF(!inserted);
