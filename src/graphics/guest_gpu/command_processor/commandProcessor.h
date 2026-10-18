@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <chrono>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -46,6 +47,10 @@ private:
 	bool                      m_chain         = false;
 	bool                      m_suspended     = false;
 	bool                      m_made_progress = false;
+	// The packet this execution last suspended on, to report waits that never complete.
+	const uint32_t*                       m_stall_packet   = nullptr;
+	std::chrono::steady_clock::time_point m_stall_since;
+	bool                                  m_stall_reported = false;
 };
 
 class CommandProcessor {

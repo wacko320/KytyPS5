@@ -115,6 +115,32 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
+// Ordinary (unchecked) SRT reads are plain loads through the guest pointer. An unmapped address
+// (Wolverine reads through a null pointer) reads as zeros, as BDA loads of missing pages do,
+// instead of crashing the emulator.
+bool ReadOrdinaryGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+	uint64_t mapped = 0;
+	while (mapped < values.size_bytes()) {
+		const auto bytes = Libs::LibKernel::Memory::MappingBytesFrom(address + mapped);
+		if (bytes == 0) {
+			break;
+		}
+		mapped += bytes;
+	}
+	if (mapped < values.size_bytes()) {
+		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+		if (!warned.test_and_set(std::memory_order_relaxed)) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Warning: shader resource read from unmapped address 0x{:016x} reads as zero\n",
+			    address));
+		}
+		std::fill(values.begin(), values.end(), 0u);
+		return true;
+	}
+	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	return true;
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
@@ -383,6 +409,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
+		    .read_memory                = ReadOrdinaryGuestMemory,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {

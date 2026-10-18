@@ -363,9 +363,9 @@ struct TextureCacheTestAccess {
     return cache.m_download_images.contains(id);
   }
 
-  static void TrackDownload(TextureCache &cache, ImageId id) {
+  static void TrackDownload(TextureCache &cache, ImageId id, bool storage = false) {
     std::lock_guard lock(cache.m_lock);
-    cache.TrackImageDownload(id, cache.m_slot_images[id]);
+    cache.TrackImageDownload(id, cache.m_slot_images[id], storage);
   }
 
   static void AssociateStencil(TextureCache &cache, ImageId depth,
@@ -9089,11 +9089,23 @@ public:
                   command, linear_depth_desc.info.data.address,
                   linear_depth_desc.info.data.size, linear_depth_clear),
               "failed to create GPU-current padded linear depth contents");
+      // With render-target readback off, a linear image is read back only when it was bound
+      // as storage (how shaders hand results to the CPU).
+      TextureCacheTestAccess::TrackDownload(texture_cache, linear_depth_image);
+      Require(name, "linear target readback off",
+              !TextureCacheTestAccess::PendingDownload(texture_cache, linear_depth_image),
+              "a linear render target was read back with --readback-linear-images off");
+      TextureCacheTestAccess::TrackDownload(texture_cache, linear_depth_image, true);
+      Require(name, "linear storage readback",
+              TextureCacheTestAccess::PendingDownload(texture_cache, linear_depth_image),
+              "a linear storage image was not queued for readback");
       TextureCacheTestAccess::SetLinearReadback(texture_cache, true);
       TextureCacheTestAccess::TrackDownload(texture_cache, linear_depth_image);
+      TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
+      // The storage enrolment is read back with render-target readback off too (Rift Apart
+      // spins on a reprojection result written to a linear storage image).
       const auto linear_depth_tick = scheduler.CurrentTick();
       texture_cache.ProcessDownloadImages();
-      TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
       std::array<uint32_t, linear_depth_words> linear_depth_before{};
       std::memcpy(linear_depth_before.data(), memory + linear_depth_offset,
                   sizeof(linear_depth_before));
@@ -10823,6 +10835,82 @@ public:
     context.ShutdownGpu();
     Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
             "call fixture release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A cached buffer over two pages outlives the unmap of the second, whose backing goes with it
+  // (the unmap leaves the page pending). A sync over both pages then takes only the page still
+  // mapped: the CPU's new bytes there reach the GPU, and nothing reads the unmapped page.
+  void CheckPartialUnmapSync() {
+    constexpr const char *name = "PartialUnmapSync";
+    constexpr uintptr_t base = 0x000000020b200000ull;
+    constexpr uint64_t size = 0x100000;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    constexpr uint64_t kept = base + 0x40000;
+    constexpr uint64_t unmapped = kept + page;
+    constexpr u32 old_value = 0x0a110001u;
+    constexpr u32 new_value = 0x0a110002u;
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "fixture allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x3, 0x10, physical, size) == 0 && mapped == reinterpret_cast<void *>(base),
+        "fixture mapping failed");
+    std::memset(mapped, 0, size);
+    *reinterpret_cast<u32 *>(kept) = old_value;
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &cache = context.GetBufferCache();
+      const auto [buffer, offset] = cache.ObtainBuffer(kept, 2 * page, false);
+      const auto owner = BufferCacheTestAccess::PageOwner(cache, kept);
+      Require(name, "one buffer",
+              buffer != nullptr && owner &&
+                  owner == BufferCacheTestAccess::PageOwner(cache, unmapped),
+              "the binding did not create one buffer over both pages");
+      Require(name, "partial unmap", LibKernel::Memory::KernelMunmap(unmapped, page) == 0,
+              "unmapping the second page failed");
+      Require(name, "unmapped page pending", cache.IsRegionCpuModified(unmapped, page),
+              "the unmap did not leave the page pending");
+      Require(name, "buffer kept", owner == BufferCacheTestAccess::PageOwner(cache, kept),
+              "the cached buffer did not outlive the partial unmap");
+      *reinterpret_cast<volatile u32 *>(kept) = new_value;
+      // An image source over both pages (bindings are cut to the mapped range; image ranges are
+      // not): only the mapped page is synchronized, the unmapped one stays pending.
+      const auto [source, source_offset] = cache.ObtainBufferForImage(kept, 2 * page);
+      Require(name, "image source", source == buffer && source_offset == offset,
+              "the image source is not the cached buffer");
+      Require(name, "unmapped page untouched",
+              cache.IsRegionCpuModified(unmapped, page) && !cache.IsRegionCpuModified(kept, page),
+              "the image source synchronized the unmapped page, or not the mapped one");
+      // The GPU copy of the kept dword, read back, is the CPU's new value.
+      cache.CopyBuffer(kept + 0x100, kept, sizeof(u32), false, false);
+      cache.ReadMemory(kept + 0x100, sizeof(u32));
+      u32 uploaded = 0;
+      Require(name, "mapped part uploaded",
+              LibKernel::Memory::TryReadBacking(kept + 0x100, &uploaded, sizeof(uploaded)) &&
+                  uploaded == new_value,
+              "the GPU read " + Hex(uploaded) + " from the mapped page");
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap",
+            LibKernel::Memory::KernelMunmap(base, unmapped - base) == 0 &&
+                LibKernel::Memory::KernelMunmap(unmapped + page, base + size - unmapped - page) ==
+                    0,
+            "fixture unmap failed");
+    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "fixture release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -50635,6 +50723,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();
+    vulkan.CheckPartialUnmapSync();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
@@ -50896,6 +50985,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuSuspendPoint();
   vulkan.CheckGpuCommandLane();
   vulkan.CheckScalarLeafCall();
+  vulkan.CheckPartialUnmapSync();
   if (skipped_device_checks) {
     std::printf(
         "ShaderRecompilerComputeTests: device rasterization checks skipped, this "

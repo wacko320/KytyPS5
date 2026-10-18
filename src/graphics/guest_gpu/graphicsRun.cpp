@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <deque>
 #include <memory>
@@ -317,6 +318,26 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 
 	(void)poll;
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+		// A wait that never completes leaves the game stuck with no other trace; report it once
+		// after two seconds (a retried wait re-executes this packet).
+		struct StalledWait {
+			const void*                           addr = nullptr;
+			uint64_t                              ref  = 0;
+			std::chrono::steady_clock::time_point since;
+			bool                                  reported = false;
+		};
+		thread_local StalledWait stalled;
+		const auto               now = std::chrono::steady_clock::now();
+		if (stalled.addr != addr || stalled.ref != static_cast<uint64_t>(ref)) {
+			stalled = {addr, static_cast<uint64_t>(ref), now, false};
+		} else if (!stalled.reported && now - stalled.since > std::chrono::seconds(2)) {
+			stalled.reported = true;
+			LOGF("WaitRegMem stalled >2s: cp=%p addr=%p value=0x%" PRIx64 " mask=0x%" PRIx64
+			     " func=%" PRIu32 " ref=0x%" PRIx64 "\n",
+			     static_cast<const void*>(this), static_cast<const void*>(addr),
+			     static_cast<uint64_t>(*addr), static_cast<uint64_t>(mask), func,
+			     static_cast<uint64_t>(ref));
+		}
 		SuspendPm4();
 	}
 }
@@ -689,6 +710,14 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
 
+		if ((packet_header >> 30u) == 0u) {
+			const auto packet_dw = ((packet_header >> 16u) & 0x3fffu) + 2u;
+			EXIT_NOT_IMPLEMENTED(packet_dw > remaining_dw);
+			cursor.offset_dw += packet_dw;
+			execution.m_made_progress = true;
+			continue;
+		}
+
 		if (GraphicsRunDebugDumpEnabled()) {
 			LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
 			     " len=%" PRIu32 "\n",
@@ -744,6 +773,21 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
+			const auto now = std::chrono::steady_clock::now();
+			if (execution.m_stall_packet != packet) {
+				execution.m_stall_packet   = packet;
+				execution.m_stall_since    = now;
+				execution.m_stall_reported = false;
+			} else if (!execution.m_stall_reported &&
+			           now - execution.m_stall_since > std::chrono::seconds(2)) {
+				execution.m_stall_reported = true;
+				LOGF("PM4 execution %p suspended >2s on packet %p: op=0x%02" PRIx32
+				     " r=0x%02" PRIx32 " len=%" PRIu32 " dw=[%08" PRIx32 " %08" PRIx32
+				     " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 "]\n",
+				     static_cast<const void*>(&execution), static_cast<const void*>(packet),
+				     opcode, KYTY_PM4_R(packet_header), KYTY_PM4_LEN(packet_header),
+				     packet[0], packet[1], packet[2], packet[3], packet[4]);
+			}
 			return;
 		}
 		cursor.offset_dw += packet_dw;

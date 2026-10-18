@@ -397,8 +397,11 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	}
 }
 
-void TextureCache::TrackImageDownload(ImageId id, Image& image) {
-	if (m_readback_linear_images && !image.info.IsTiled()) {
+void TextureCache::TrackImageDownload(ImageId id, Image& image, bool storage) {
+	// Linear storage images are how shaders hand results to the CPU (Rift Apart's occlusion
+	// reprojection waits on one), so they are always read back after the submission. Linear
+	// render targets are only read back with --readback-linear-images.
+	if ((storage || m_readback_linear_images) && !image.info.IsTiled()) {
 		if (!image.IsGpuModified()) {
 			EXIT("TextureCache: cannot enroll a non-GPU-owned image for download\n");
 		}
@@ -960,7 +963,13 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	if (info.samples != 1 || destination.backing.samples != 1 ||
 	    info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
 	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block) {
-		EXIT("TextureCache: invalid depth upload\n");
+		EXIT("TextureCache: invalid depth upload: addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " format=%u bytes_per_block=%u element_bytes=%u samples=%u backing_samples=%u "
+		     "layers=%u extent=%ux%u stencil=%d\n",
+		     info.data.address, info.data.size, static_cast<uint32_t>(info.guest_format),
+		     info.bytes_per_block, Prospero::NumBytesPerElement(info.guest_format), info.samples,
+		     destination.backing.samples, info.resources.layers, info.extent.width,
+		     info.extent.height, static_cast<int>(static_cast<bool>(image.depth_id)));
 	}
 	const auto layers          = info.resources.layers;
 	const auto full_slice_size = info.linear_slice_stride;
@@ -1019,7 +1028,24 @@ void TextureCache::InitializeImage(ImageId id) {
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
-			EXIT("TextureCache: failed to obtain image upload source\n");
+			// Name the image and how much of its range is mapped.
+			const auto& info     = image.info;
+			uint64_t    readable = 0;
+			for (std::array<uint8_t, 4096> probe {}; readable < info.data.size;
+			     readable += probe.size()) {
+				if (!Libs::LibKernel::Memory::TryReadBacking(
+				        info.data.address + readable, probe.data(),
+				        std::min<uint64_t>(probe.size(), info.data.size - readable))) {
+					break;
+				}
+			}
+			EXIT("TextureCache: failed to obtain image upload source: vaddr=0x%016" PRIx64
+			     " size=0x%" PRIx64 " readable=0x%" PRIx64
+			     " type=%u format=%u extent=%ux%ux%u levels=%u layers=%u pitch=%u tile_mode=%u\n",
+			     info.data.address, info.data.size, readable, static_cast<uint32_t>(info.type),
+			     static_cast<uint32_t>(info.guest_format), info.extent.width, info.extent.height,
+			     info.extent.depth, info.resources.levels, info.resources.layers, info.pitch,
+			     static_cast<uint32_t>(info.tile_mode));
 		}
 		UploadImage(image, *source, source_offset);
 		image.ClearBufferModified();
@@ -1366,7 +1392,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
 			CommitGpuWrite(image);
-			TrackImageDownload(id, image);
+			TrackImageDownload(id, image, true);
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
@@ -1387,7 +1413,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	image.usage.render_target = true;
 	RefreshImage(id);
 	CommitGpuWrite(image);
-	TrackImageDownload(id, image);
+	TrackImageDownload(id, image, false);
 	return image.FindView(desc.view_info);
 }
 
@@ -1788,7 +1814,8 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	                                               1, &barrier, 0, nullptr);
 	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
-		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		// The guest may have unmapped part of the range since the download was recorded.
+		(void)LibKernel::Memory::WriteMappedBacking(range.address, mapped, range.size);
 	});
 	return true;
 }
@@ -1961,9 +1988,8 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::ProcessDownloadImages() {
-	if (!m_readback_linear_images) {
-		return;
-	}
+	// Not gated on --readback-linear-images: GPU-written linear storage images are enrolled
+	// without it (TrackImageDownload), as shaders hand the CPU results through them.
 	std::scoped_lock lock {m_lock};
 	for (const auto id: m_download_images) {
 		const auto owner = m_slot_images.try_get(id);

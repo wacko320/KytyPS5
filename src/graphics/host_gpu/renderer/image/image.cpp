@@ -707,7 +707,13 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.tiling        = vk::ImageTiling::eOptimal;
 	create.initialLayout = vk::ImageLayout::eUndefined;
 	create.usage         = ImageUsageFlags(graphics, info);
-	create.samples       = vulkan_sample_count(info.samples);
+	// Block images need extended usage only for storage through uncompressed views; sampling and
+	// copies are native. RADV rejects 3D block images that combine it with block-texel view
+	// compatibility.
+	if (info.IsBlock() && !(create.usage & vk::ImageUsageFlagBits::eStorage)) {
+		create.flags &= ~vk::ImageCreateFlags(vk::ImageCreateFlagBits::eExtendedUsage);
+	}
+	create.samples = vulkan_sample_count(info.samples);
 
 	vk::ImageFormatProperties properties {};
 	if (graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,

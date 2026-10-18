@@ -1246,6 +1246,46 @@ void TestFlexibleMapQueryAndWholeMunmap() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// GPU tracking protects pages Read or ReadWrite through ProtectGuestHostMemory; pages of an
+// executable guest mapping keep Execute so code on a tracked page does not fault on every fetch.
+void TestTrackedExecutablePagesKeepExecute() {
+	const char* test = "TrackedExecutablePagesKeepExecute";
+#if defined(__linux__)
+	const auto page = static_cast<uint64_t>(SceKernelPageSize);
+	const auto base =
+	    MapNamedFlexible(test, page, SceKernelProtCpuRw | SceKernelProtCpuExec, "prospero_exec");
+	const auto host_permissions = [&]() {
+		std::string permissions;
+		if (auto* maps = std::fopen("/proc/self/maps", "r"); maps != nullptr) {
+			char line[512];
+			while (std::fgets(line, sizeof(line), maps) != nullptr) {
+				unsigned long long begin = 0;
+				unsigned long long end   = 0;
+				char               perms[5] {};
+				if (std::sscanf(line, "%llx-%llx %4s", &begin, &end, perms) == 3 && base >= begin &&
+				    base < end) {
+					permissions = perms;
+					break;
+				}
+			}
+			std::fclose(maps);
+		}
+		return permissions;
+	};
+	using Common::VirtualMemory::Mode;
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base, page, Mode::Read) &&
+	          host_permissions().substr(0, 3) == "r-x",
+	      "a read-tracked executable page lost Execute");
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base, page, Mode::ReadWrite) &&
+	          host_permissions().substr(0, 3) == "rwx",
+	      "a released executable page lost Execute");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, page), "KernelMunmap");
+#endif
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestPartialFlexibleMunmapAndFindNext() {
 	const char* test     = "PartialFlexibleMunmapAndFindNext";
 	const auto  baseline = AvailableFlexibleMemory(test);
@@ -1621,6 +1661,29 @@ void TestDirectMapQueryOffsetAndPartialMunmap() {
 	      Libs::LibKernel::Memory::ClampRangeSize(base + SceKernelPageSize - 0xf30, 0x1560) ==
 	          0xf30,
 	      "ClampRangeSize did not stop at an unmapped span");
+	Check(test,
+	      Libs::LibKernel::Memory::MappingBytesFrom(base + 0x10) == SceKernelPageSize - 0x10 &&
+	          Libs::LibKernel::Memory::MappingBytesFrom(base + SceKernelPageSize) == 0,
+	      "MappingBytesFrom did not stop at the end of the mapping holding the address");
+
+	// A deferred publish writes the mapped parts of a range that lost its middle page.
+	std::array<uint8_t, SceKernelPageSize + 16> published {};
+	std::fill(published.begin(), published.end(), uint8_t {0xa5});
+	Check(test,
+	      Libs::LibKernel::Memory::WriteMappedBacking(base + SceKernelPageSize - 8,
+	                                                  published.data(), published.size()) == 16,
+	      "WriteMappedBacking should write only the mapped bytes around a hole");
+	uint64_t left_published  = 0;
+	uint64_t right_published = 0;
+	Check(test,
+	      Libs::LibKernel::Memory::TryReadBacking(base + SceKernelPageSize - 8, &left_published,
+	                                              sizeof(left_published)) &&
+	          Libs::LibKernel::Memory::TryReadBacking(base + SceKernelPageSize * 2,
+	                                                  &right_published,
+	                                                  sizeof(right_published)) &&
+	          left_published == 0xa5a5a5a5a5a5a5a5ull &&
+	          right_published == 0xa5a5a5a5a5a5a5a5ull,
+	      "WriteMappedBacking did not reach both mapped parts");
 
 	info = Query(test, base + SceKernelPageSize, SceKernelVqFindNext);
 	ExpectRange(test, info, base + SceKernelPageSize * 2, base + SceKernelPageSize * 4,
@@ -2492,6 +2555,78 @@ void TestDirectMemoryContentPersistsAcrossRemap() {
 	        "KernelMunmap(partial)");
 
 	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, MapSize),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestIdenticalFixedDirectRemapStaysMapped() {
+	const char* test = "IdenticalFixedDirectRemapStaysMapped";
+
+	constexpr uint64_t MapSize = SceKernelPageSize * 2;
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+	            MapSize * 2, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+
+	void* address = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapDirectMemory(&address, MapSize, SceKernelProtCpuRw,
+	                                                       0, phys_addr, SceKernelPageSize),
+	        "KernelMapDirectMemory(first)");
+	const auto base = reinterpret_cast<uint64_t>(address);
+
+	// The guest kernel replaces a fixed mapping atomically, so a thread writing the range while
+	// another repeats the same mapping never faults.
+	std::atomic<bool> stop {false};
+	std::thread       writer([&] {
+		uint64_t value = 0;
+		while (!stop.load(std::memory_order_relaxed)) {
+			for (uint64_t offset = 0; offset < MapSize; offset += sizeof(uint64_t)) {
+				*reinterpret_cast<volatile uint64_t*>(base + offset) = value++;
+			}
+		}
+	});
+	for (int i = 0; i < 200; i++) {
+		void* again = address;
+		CheckOk(test,
+		        Libs::LibKernel::Memory::KernelMapDirectMemory(
+		            &again, MapSize, SceKernelProtCpuRw, SceKernelMapFixed, phys_addr, 0),
+		        "KernelMapDirectMemory(identical fixed)");
+		if (again != address) {
+			Fail(test, "identical fixed remap moved the mapping");
+		}
+	}
+	stop.store(true, std::memory_order_relaxed);
+	writer.join();
+
+	// A fixed map of the same address onto other physical pages still replaces the mapping.
+	*reinterpret_cast<uint64_t*>(base) = 0x1111;
+	void* other_view = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapDirectMemory(
+	            &other_view, MapSize, SceKernelProtCpuRw, 0,
+	            phys_addr + static_cast<int64_t>(MapSize), SceKernelPageSize),
+	        "KernelMapDirectMemory(other view)");
+	*reinterpret_cast<uint64_t*>(other_view) = 0x2222;
+	void* moved = address;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapDirectMemory(
+	            &moved, MapSize, SceKernelProtCpuRw, SceKernelMapFixed,
+	            phys_addr + static_cast<int64_t>(MapSize), 0),
+	        "KernelMapDirectMemory(other offset fixed)");
+	if (*reinterpret_cast<const uint64_t*>(base) != 0x2222) {
+		Fail(test, "fixed remap onto other physical pages kept the old view");
+	}
+
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(other_view), MapSize),
+	        "KernelMunmap(other view)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, MapSize), "KernelMunmap");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, MapSize * 2),
 	        "KernelReleaseDirectMemory");
 
 	std::printf("[host]    %-48s ok\n", test);
@@ -4925,6 +5060,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFragmentedBackingUnmapRollback);
 	RunTest(TestRuntimeMemoryOwnerLifecycle);
 	RunTest(TestFlexibleMapQueryAndWholeMunmap);
+	RunTest(TestTrackedExecutablePagesKeepExecute);
 	RunTest(TestPartialFlexibleMunmapAndFindNext);
 	RunTest(TestFlexibleRangeEditsCoalesce);
 	RunTest(TestPageTableStatsTrackRangeEdits);
@@ -4954,6 +5090,7 @@ int main(int argc, char** argv) {
 	RunTest(TestLargeDirectMapAliasesAcrossChunks);
 	RunTest(TestHintlessDirectMapUsesCanonicalGuestBase);
 	RunTest(TestDirectMemoryContentPersistsAcrossRemap);
+	RunTest(TestIdenticalFixedDirectRemapStaysMapped);
 	RunTest(TestDirectMapUnmapReusesHostAddress);
 #if defined(__linux__)
 	RunTest(TestFixedDirectReplacementPreservesAccess);

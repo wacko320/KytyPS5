@@ -1352,6 +1352,72 @@ void DbgExit(int) { std::abort(); }
 
 } // namespace Common
 
+// A finite image's candidates include every Phi arm's descriptor, also those of arms the draw does
+// not take. A candidate whose descriptor cannot be read is a null image, not a failed stage.
+void TestUnreadableFiniteImageCandidateIsNull() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                     {Value(0x1000u), Value(0u)});
+  auto &srt = block.AppendNewInst(ValueOpcode::GetSrtResource);
+  for (uint32_t index = 0; index < 2; ++index) {
+    auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+        {Value(&handle), Value(index * 4u), Value(0u), Value(true)});
+    read.SetFlags(MemoryFlags{.index = 0});
+    DescriptorSource source;
+    source.dword_count = 8;
+    source.dwords.fill(Value(0u));
+    if (index == 0) {
+      program.srt_reads.push_back({Value(&read), index});
+      source.dwords[0] = Value(&block.AppendNewInst(ValueOpcode::ReadConst,
+                                                    {Value(&srt), Value(index)}));
+    } else {
+      // The other arm's table is read directly, as a Phi arm the draw does not take.
+      source.dwords[0] = Value(&read);
+    }
+    source.dwords[1] = Value(static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u);
+    source.dwords[3] = Value(Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u));
+    program.descriptor_sources.push_back(source);
+  }
+  DescriptorSource root;
+  root.dword_count = 8;
+  root.dwords.fill(Value(0u));
+  root.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = {0, 1};
+  program.descriptor_sources.push_back(root);
+  program.info.images.push_back({
+      .source = 2,
+      .resource_class = ImageResourceClass::Sampled,
+      .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
+      .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D});
+  auto plan = ExtractResourcePlan(program);
+  const SrtRuntime runtime{
+      .read_memory = +[](void *, uint64_t, std::span<uint32_t>) { return false; },
+      .read_specialization_memory = +[](void *, uint64_t address, std::span<uint32_t> words) {
+        // The second arm's table is not readable now.
+        if (words.size() != 1 || address != 0x1000u) return false;
+        words[0] = 0x100u;
+        return true;
+      }};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "an unreadable finite image candidate failed the materialization");
+  const auto offset = specialization.images[0].indirect_mapping_offset;
+  Check(snapshot.images.size() == 2 && snapshot.images[0].dwords[0] == 0x100u &&
+            snapshot.flattened_srt[offset] == 2 && snapshot.flattened_srt[offset + 4u] == 1u,
+        "finite image candidates were not mapped");
+  bool null_candidate = true;
+  for (const auto word : snapshot.images[1].dwords) null_candidate &= word == 0u;
+  Check(null_candidate, "an unreadable finite image candidate was not a null descriptor");
+}
+
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestNativeNestedSrtRefresh();
@@ -1366,6 +1432,7 @@ int main() {
   TestSharedControlPredicates();
   TestNestedExecPredicatesReuseReads();
   TestFiniteImageRefreshReusesScalarReads();
+  TestUnreadableFiniteImageCandidateIsNull();
   for (const bool independent_mask : {false, true})
     TestEmptyTraversalSkipsUnmappedDescriptor(independent_mask);
   TestEmptyTraversalSkipsUnmappedDescriptor(false, true);

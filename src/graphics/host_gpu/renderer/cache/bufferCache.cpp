@@ -236,8 +236,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-			                                      mapped + (copy.dstOffset - offset), copy.size);
+			// The guest may have unmapped part of the range since the download was recorded.
+			(void)Libs::LibKernel::Memory::WriteMappedBacking(
+			    buffer_address + copy.srcOffset, mapped + (copy.dstOffset - offset), copy.size);
 		}
 	};
 	if constexpr (async) {
@@ -435,19 +436,39 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	return id;
 }
 
+template <typename Func>
+void BufferCache::ForEachMappedPart(uint64_t start, uint64_t end, Func&& func) {
+	MappedParts parts;
+	if (!m_mapped_parts || m_mapped_parts(start, end - start, parts)) {
+		func(start, end);
+		return;
+	}
+	// The runs are listed first: func may take the mapped set's lock.
+	for (const auto& [begin, stop]: parts) {
+		func(begin, stop);
+	}
+}
+
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
-	std::vector<vk::BufferCopy> copies;
-	uint64_t                    total_size = 0;
-	vk::Buffer                  source;
-	m_memory_tracker.ForEachUploadRange(
-	    vaddr, size, is_written,
-	    [&](uint64_t address, uint64_t bytes) noexcept {
-		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
-		    total_size += bytes;
-	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
-	if (source) {
+	// Only the parts still mapped: a buffer can outlive an unmap of some of its pages, which the
+	// unmap left pending with no backing to copy from; they stay pending until mapped again.
+	// Each mapped run is one walk, its regions locked until its staging copy is taken, with its
+	// own barriers (a staging wrap may submit in between).
+	ForEachMappedPart(vaddr, vaddr + size, [&](uint64_t begin, uint64_t end) {
+		std::vector<vk::BufferCopy> copies;
+		uint64_t                    total_size = 0;
+		vk::Buffer                  source;
+		m_memory_tracker.ForEachUploadRange(
+		    begin, end - begin, is_written,
+		    [&](uint64_t address, uint64_t bytes) noexcept {
+			    copies.emplace_back(total_size, buffer.Offset(address), bytes);
+			    total_size += bytes;
+		    },
+		    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+		if (!source) {
+			return;
+		}
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -472,7 +493,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 		                       vk::PipelineStageFlagBits::eAllCommands,
 		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
-	}
+	});
 	if (is_texel_buffer && !is_written) {
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
 	}

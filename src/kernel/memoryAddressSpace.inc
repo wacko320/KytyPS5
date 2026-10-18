@@ -233,6 +233,38 @@ public:
 		return true;
 	}
 
+	// Writes the parts of the range a mapping holds, skipping the rest; the bytes written.
+	uint64_t WriteMappedBacking(uint64_t vaddr, const void* data, uint64_t size) {
+		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
+			return 0;
+		}
+		const auto*      source  = static_cast<const uint8_t*>(data);
+		std::shared_lock lock(m_mutex);
+		const auto       end     = vaddr + size;
+		auto             current = vaddr;
+		uint64_t         written = 0;
+		while (current < end) {
+			MapEntry entry {};
+			if (!FindContainingUnlocked(current, 1, &entry)) {
+				const auto next = m_maps.upper_bound(current);
+				if (next == m_maps.end() || next->first >= end) {
+					break;
+				}
+				current = next->first;
+				continue;
+			}
+			const auto bytes  = std::min(end, entry.vaddr + entry.size) - current;
+			const auto offset = entry.backing_offset + current - entry.vaddr;
+			if (RangeOk(offset, bytes)) {
+				std::memcpy(m_backing_base + offset, source + (current - vaddr),
+				            static_cast<size_t>(bytes));
+				written += bytes;
+			}
+			current += bytes;
+		}
+		return written;
+	}
+
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -777,6 +809,10 @@ public:
 
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 		return m_backing->TryWriteBacking(vaddr, data, size);
+	}
+
+	uint64_t WriteMappedBacking(uint64_t vaddr, const void* data, uint64_t size) {
+		return m_backing->WriteMappedBacking(vaddr, data, size);
 	}
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {

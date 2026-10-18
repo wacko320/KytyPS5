@@ -18,6 +18,17 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	// Buffers can outlive an unmap of some of their pages; synchronization skips those.
+	m_buffer_cache.SetMappedParts(
+	    [this](uint64_t vaddr, uint64_t size, BufferCache::MappedParts& out) {
+		    if (IsMapped(vaddr, size)) {
+			    return true;
+		    }
+		    out.clear();
+		    ForEachMappedRange(vaddr, size,
+		                       [&](uint64_t begin, uint64_t end) { out.emplace_back(begin, end); });
+		    return false;
+	    });
 }
 
 RenderContext::~RenderContext() {

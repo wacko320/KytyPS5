@@ -449,6 +449,33 @@ public:
 		return clamped_size;
 	}
 
+	uint64_t MappingBytesFrom(uint64_t virtual_addr) {
+		Common::LockGuard lock(m_mutex);
+		auto vma = FindContaining(virtual_addr);
+		if (vma == m_ranges.end() || !IsCommittedRangeType(vma->second.type)) {
+			return 0;
+		}
+		return End(vma->second.start, vma->second.size) - virtual_addr;
+	}
+
+	// Whether any committed range overlapping [start, start + size) is CPU-executable.
+	bool AnyExecutable(uint64_t start, uint64_t size) {
+		Common::LockGuard lock(m_mutex);
+		auto              vma = m_ranges.upper_bound(start);
+		if (vma != m_ranges.begin()) {
+			--vma;
+		}
+		const auto end = End(start, size);
+		for (; vma != m_ranges.end() && vma->second.start < end; ++vma) {
+			const auto& range = vma->second;
+			if (End(range.start, range.size) > start && IsCommittedRangeType(range.type) &&
+			    (range.protection & PROT_CPU_EXEC) != 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	uint64_t CountPageTableEntries(bool gpu) {
 		Common::LockGuard lock(m_mutex);
 		return gpu ? m_gpu_page_table_entries : m_cpu_page_table_entries;
@@ -853,6 +880,12 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
 }
 
+uint64_t WriteMappedBacking(uint64_t vaddr, const void* data, uint64_t size) {
+	return g_guest_address_space != nullptr
+	           ? g_guest_address_space->WriteMappedBacking(vaddr, data, size)
+	           : 0;
+}
+
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
@@ -869,6 +902,11 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		}
 	}
 	return TryReadBacking(vaddr, data, size);
+}
+
+uint64_t MappingBytesFrom(uint64_t vaddr) {
+	EXIT_IF(g_virtual_ranges == nullptr);
+	return g_virtual_ranges->MappingBytesFrom(vaddr);
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
@@ -888,11 +926,14 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	return clamped_size;
 }
 
-void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
+void WriteBacking(uint64_t vaddr, const void* data, uint64_t size,
+                  std::source_location site) noexcept {
 	if (!TryWriteBacking(vaddr, data, size)) {
+		// How much of the range is still mapped, from its start.
 		EXIT("Memory: required direct-backing write failed, addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 "\n",
-		     vaddr, size);
+		     " size=0x%016" PRIx64 " mapped from start=0x%016" PRIx64 ", from %s:%u\n",
+		     vaddr, size, MappingBytesFrom(vaddr), site.file_name(),
+		     static_cast<unsigned>(site.line()));
 	}
 }
 
@@ -3887,8 +3928,18 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 }
 
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-	return g_guest_address_space != nullptr &&
-	       g_guest_address_space->ProtectTransient(vaddr, size, mode);
+	if (g_guest_address_space == nullptr) {
+		return false;
+	}
+	// GPU tracking protects pages Read or ReadWrite; pages the guest executes keep Execute, or a
+	// thread running code on a tracked page faults on every instruction fetch while the fault
+	// handler restores only read and write.
+	if ((mode == VirtualMemory::Mode::Read || mode == VirtualMemory::Mode::ReadWrite) &&
+	    g_virtual_ranges != nullptr && g_virtual_ranges->AnyExecutable(vaddr, size)) {
+		mode = mode == VirtualMemory::Mode::Read ? VirtualMemory::Mode::ExecuteRead
+		                                         : VirtualMemory::Mode::ExecuteReadWrite;
+	}
+	return g_guest_address_space->ProtectTransient(vaddr, size, mode);
 }
 
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {

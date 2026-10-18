@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <functional>
 #include <map>
 #include <span>
 #include <utility>
@@ -89,6 +90,12 @@ public:
 	void               QueueBdaSync(uint64_t vaddr, uint64_t size) {
 		m_memory_tracker.QueueBdaSync(vaddr, size);
 	}
+	// parts(vaddr, size, out) returns true when the whole range is mapped; otherwise it lists the
+	// mapped sub-ranges in `out` as [begin, end) pairs, in address order.
+	using MappedParts = std::vector<std::pair<uint64_t, uint64_t>>;
+	void SetMappedParts(std::function<bool(uint64_t vaddr, uint64_t size, MappedParts& out)> parts) {
+		m_mapped_parts = std::move(parts);
+	}
 	void               RunGarbageCollector();
 
 private:
@@ -120,6 +127,10 @@ private:
 	template <bool insert>
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);
+	// Calls func(begin, end) for each mapped run of [start, end), once for the whole range when
+	// it is all mapped.
+	template <typename Func>
+	void ForEachMappedPart(uint64_t start, uint64_t end, Func&& func);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
 	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
@@ -133,6 +144,7 @@ private:
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	FaultManager                                      m_fault_manager;
+	std::function<bool(uint64_t, uint64_t, MappedParts&)> m_mapped_parts;
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;
 	Buffer                                            m_bda_zero_page;

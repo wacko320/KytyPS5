@@ -790,7 +790,11 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				return read_failed("table descriptor read", key, 0u, table_base, table_offset, descriptor_bytes);
 			}
 		} else if (!clean.EvaluateDescriptor(sources[entry], candidate)) {
-			return false;
+			// A finite image's candidates include every Phi arm's descriptor, also those this
+			// draw does not take, whose tables need not be readable now. One that cannot be read
+			// is null, as an invalid one is: sampling it returns zeros. Buffers keep the failure.
+			if (dword_count != 8u) return false;
+			candidate = {.dword_count = dword_count};
 		}
 		if (!normalize(candidate))
 			return normalization_failed(table_offset, key, indirect.table_stride, "key");

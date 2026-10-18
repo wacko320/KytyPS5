@@ -5,6 +5,8 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <source_location>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -131,12 +133,20 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, 
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
+// For a write published after the GPU work that made it: the guest may have unmapped part of
+// the range meanwhile, and those bytes have nowhere to go. Returns the bytes written.
+uint64_t               WriteMappedBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
-void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
+// Bytes from vaddr to the end of the one committed mapping holding it (0 when unmapped), without
+// continuing into adjacent mappings as ClampRangeSize does.
+[[nodiscard]] uint64_t MappingBytesFrom(uint64_t vaddr);
+// Exits when part of the range has no backing; `site` names the caller in the report.
+void WriteBacking(uint64_t vaddr, const void* data, uint64_t size,
+                  std::source_location site = std::source_location::current()) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
