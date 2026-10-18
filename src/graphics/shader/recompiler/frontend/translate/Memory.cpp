@@ -949,9 +949,45 @@ void Translator::DS_PERMUTE(const Decoder::Instruction& inst, bool backward) {
 void Translator::EmitMemory(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
 		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY: {
+			// Ray operands: the node pointer (one dword, two for BVH64), extent, origin xyz, then
+			// direction xyz and inverse direction xyz, as six F32 dwords or, with A16, six halves
+			// in three dwords. Any of the dwords after the first may come from NSA registers.
+			const uint32_t node_words = inst.opcode_id == 0xe7u ? 2u : 1u;
+			const bool     a16 = (inst.image_sample_flags & Decoder::ImageSampleFlagA16) != 0u;
+			const uint32_t dwords        = node_words + 4u + (a16 ? 3u : 6u);
+			const uint32_t nsa_registers = std::min(inst.image_nsa_dwords * 4u,
+			                                        Decoder::MaxImageNsaAddressComponents);
+			std::array<IR::Value, 13> ray {};
+			ray.fill(IR::Value(0u));
+			const auto raw = [&](uint32_t index) {
+				return index != 0u && index - 1u < nsa_registers
+				           ? IR::U32(ir.GetVectorReg(
+				                 static_cast<IR::VectorReg>(inst.image_nsa_addr[index - 1u])))
+				           : ReadRawU32(OffsetOperand(PlainOperand(inst.src0), index));
+			};
+			for (uint32_t index = 0; index < node_words + 4u; index++) {
+				ray[index] = raw(index);
+			}
+			for (uint32_t index = 0; index < 6u; index++) {
+				const auto first = node_words + 4u;
+				if (!a16) {
+					ray[first + index] = raw(first + index);
+					continue;
+				}
+				const auto bits = ir.Emit(IR::ValueOpcode::BitFieldUExtract,
+				                          {raw(first + index / 2u), IR::Value((index % 2u) * 16u),
+				                           IR::Value(16u)});
+				const auto half = ir.Emit(IR::ValueOpcode::BitCastF16U16,
+				                          {ir.Emit(IR::ValueOpcode::ConvertU16U32, {bits})});
+				ray[first + index] = ir.Emit(IR::ValueOpcode::BitCastU32F32,
+				                             {ir.Emit(IR::ValueOpcode::ConvertF32F16, {half})});
+			}
+			EXIT_IF(dwords > ray.size());
+			const auto address = ir.Emit(IR::ValueOpcode::MakeImageAddress,
+			                             {ray[0], ray[1], ray[2], ray[3], ray[4], ray[5], ray[6],
+			                              ray[7], ray[8], ray[9], ray[10], ray[11], ray[12]});
 			const auto result = ir.Emit(IR::ValueOpcode::BvhIntersect,
-			    {ConstructU32x4(inst.src1, 4), MakeImageAddress(inst, inst.src0), ir.GetExec()},
-			    inst.image_address_components - 10u);
+			    {ConstructU32x4(inst.src1, 4), address, ir.GetExec()}, node_words);
 			for (uint32_t component = 0; component < 4; ++component) {
 				WriteOperand(OffsetOperand(inst.dst, component),
 				    ir.Emit(IR::ValueOpcode::CompositeExtractU32x4, {result, IR::Value(component)}));

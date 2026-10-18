@@ -980,6 +980,10 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 			default: break;
 		}
 	}
+	if (inst.opcode == Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY && inst.image_nsa_dwords == 0u) {
+		// The ray's dwords are consecutive VGPRs from VADDR (fewer with A16).
+		include_vector(inst.src0, inst.image_address_components);
+	}
 	for (uint32_t index = 0; index + 1u < inst.image_address_components &&
 	                         index < Decoder::MaxImageNsaAddressComponents;
 	     index++) {

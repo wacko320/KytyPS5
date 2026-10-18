@@ -11306,7 +11306,8 @@ void TestMeshExportStorage() {
     // when its four vertex exports and primitive exports are shared arrays.
     Check(shared_bytes == 3840u * 4u + 192u * 4u + 8u && shared_bytes <= 28672u,
           "mesh staging must retain guest LDS, shared Layer and allocation within the host budget");
-    Check(private_bytes == (4u * 16u + 4u + 4u * 4u) * (64u / subgroup_size),
+    // Plus 4 bytes: the per-invocation missing BDA page (bda_missing_page).
+    Check(private_bytes == (4u * 16u + 4u + 4u * 4u) * (64u / subgroup_size) + 4u,
           "mesh vertex and primitive exports lost their separate logical-lane storage");
   }
 }

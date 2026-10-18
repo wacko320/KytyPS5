@@ -675,6 +675,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME shader_recompiler_loop_watchdog
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --loop-watchdog-only)
+	add_test(NAME shader_recompiler_ray_tracing
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --ray-tracing-only)
 	add_test(NAME shader_recompiler_correctness
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --case
 			ScalarApertureOperands GenericFlatReachesLdsAndScratch

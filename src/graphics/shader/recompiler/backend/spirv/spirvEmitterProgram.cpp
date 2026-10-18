@@ -99,6 +99,7 @@ void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState
 }
 
 void EmitReturn(ValueEmitContext& ctx) {
+	EmitBdaFaultReport(ctx.state);
 	EmitKillIfPixelValidMaskInactive(ctx.state);
 	if (ctx.state.object_primitive_id_variable != 0) {
 		auto& state = ctx.state;
@@ -791,6 +792,10 @@ void EmitProgram(EmitterState& state) {
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
+	}
+	if (state.bda_missing_page_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.bda_missing_page_variable,
+		                          ConstantU32(state, UINT32_MAX));
 	}
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);

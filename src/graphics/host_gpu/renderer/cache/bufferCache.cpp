@@ -141,6 +141,17 @@ void BufferCache::ChangeRegister(BufferId id) {
 	}
 }
 
+void BufferCache::EnsureBdaZeroEntry() {
+	if (m_bda_zero_entry_written) {
+		return;
+	}
+	m_bda_zero_entry_written = true;
+	m_bda_zero_page.Fill(0, m_bda_zero_page.Size(), 0);
+	const auto address = m_bda_zero_page.BufferDeviceAddress();
+	WriteDataBuffer(m_bda_pagetable_buffer, BDA_ZERO_ENTRY * sizeof(vk::DeviceAddress), &address,
+	                sizeof(address));
+}
+
 void BufferCache::TouchBuffer(const Buffer& buffer) {
 	if (!buffer.is_deleted) {
 		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
@@ -246,6 +257,10 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                              BDA_PAGETABLE_SIZE),
+      // A read of several dwords may run past the end of the page.
+      m_bda_zero_page(graphics, scheduler, MemoryUsage::DeviceLocal, 0,
+                      AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+                      CACHING_PAGESIZE + 256u),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),

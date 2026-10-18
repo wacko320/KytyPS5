@@ -391,10 +391,16 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (d16 && !supports_d16) {
 		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode does not support D16 data");
 	}
-	if (inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY &&
-	    (a16 || !r128 || inst.dmask != 0xfu || (nsa_dwords != 0u && nsa_dwords != 3u))) {
-		SetUnsupported(inst, Family::MIMG, opcode,
-		               "BVH intersection requires full-float ray DWORDs and R128/dmask:0xf");
+	if (inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY) {
+		// The ray is the node pointer (two dwords for BVH64), extent and origin, then direction
+		// and inverse direction as six F32 dwords or, with A16, six halves in three. NSA names a
+		// register for every dword after the first.
+		const uint32_t ray_dwords = (opcode == 0xe7u ? 2u : 1u) + 4u + (a16 ? 3u : 6u);
+		const uint32_t nsa_needed = (ray_dwords - 1u + 3u) / 4u;
+		if (!r128 || inst.dmask != 0xfu || (nsa_dwords != 0u && nsa_dwords != nsa_needed)) {
+			SetUnsupported(inst, Family::MIMG, opcode,
+			               "BVH intersection requires R128/dmask:0xf and a complete ray address");
+		}
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);

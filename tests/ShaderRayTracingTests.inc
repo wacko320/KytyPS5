@@ -46,9 +46,13 @@ void TestRayTracingInstructions() {
   Check(decoded.instructions.size() == 2 && decoded.instructions[0].opcode == D::Opcode::S_MOV_B32,
         "BVH-shaped scalar literal was decoded as an instruction");
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  for (const auto words : {std::array{0xf19c9f01u, 0x40081014u}, // BVH64 A16
-                           std::array{0xf1989f01u, 0x40081014u}, // BVH32 A16
-                           std::array{0xf1981f01u, 0x00081014u}, // not R128
+  // A16 rays (half direction and inverse direction) are supported.
+  for (const auto words : {std::array{0xf19c9f01u, 0x40081014u},   // BVH64 A16
+                           std::array{0xf1989f01u, 0x40081014u}}) { // BVH32 A16
+    const std::array a16{words[0], words[1], EncodeSopp(0x01)};
+    CheckSpirvBinaryValidates(RecompileForTest(a16, MakeCompileOptions(ShaderType::Compute)).spirv);
+  }
+  for (const auto words : {std::array{0xf1981f01u, 0x00081014u}, // not R128
                            std::array{0xf1989f01u, 0x80081014u}}) { // D16
     const std::array unsupported{words[0], words[1], EncodeSopp(0x01)};
     ExpectFatal([&]() { (void)RecompileForTest(unsupported, MakeCompileOptions(ShaderType::Compute)); },

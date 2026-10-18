@@ -1358,6 +1358,8 @@ struct TestCase {
   std::vector<std::pair<u32, u32>> storage_buffer_ranges;
   std::vector<BdaMapping> bda_mappings;
   std::optional<uint64_t> fault_free_address;
+  // Guest pages whose fault bits must be the only ones set after the dispatch.
+  std::vector<uint64_t> expected_fault_pages;
   u32 loop_watchdog_limit = 0;
   bool untracked_writes = false;
   bool expand_shader_data_storage = false;
@@ -17189,6 +17191,10 @@ public:
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr,
                           1, barriers.data(), 0, nullptr);
+      // After the fill's barrier: two unordered transfer writes to the entry could leave it 0.
+      cmd.updateBuffer(m_bda_pagetable_buffer.buffer,
+                       BufferCache::BDA_ZERO_ENTRY * sizeof(vk::DeviceAddress),
+                       sizeof(vk::DeviceAddress), &m_bda_zero_page.device_address);
       for (const auto &[guest_base, backing] : test.bda_mappings) {
         const auto page_offset = guest_base &
                                  (BufferCache::CACHING_PAGESIZE - 1);
@@ -17274,11 +17280,56 @@ public:
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
                           {}, 1, &readable, 0, nullptr, 0, nullptr);
     }
+    Buffer fault_readback;
+    if (!test.expected_fault_pages.empty()) {
+      Require(test.name, "dispatch", uses_bda, "fault expectations need a BDA test");
+      fault_readback = CreateHostBuffer(test.name, m_fault_buffer.size,
+                                        vk::BufferUsageFlagBits::eTransferDst, {});
+      vk::BufferMemoryBarrier barrier{};
+      barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+      barrier.srcAccessMask =
+          vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.buffer = m_fault_buffer.buffer;
+      barrier.offset = 0;
+      barrier.size = m_fault_buffer.size;
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                          vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1,
+                          &barrier, 0, nullptr);
+      const vk::BufferCopy copy{0, 0, m_fault_buffer.size};
+      cmd.copyBuffer(m_fault_buffer.buffer, fault_readback.buffer, 1, &copy);
+      barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      barrier.buffer = fault_readback.buffer;
+      barrier.size = fault_readback.size;
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                          vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
+                          &barrier, 0, nullptr);
+    }
     EndSubmitAndFree(test.name, "dispatch", cmd);
     if (test.fault_free_address) {
       Require(test.name, "fault check", ReadBuffer(test.name, fault_result, 1)[0] == 0u,
               "suppressed formatted access touched an unmapped page");
       DestroyBuffer(&fault_result);
+    }
+    if (fault_readback.buffer != nullptr) {
+      const auto faults = ReadBuffer(test.name, fault_readback,
+                                     static_cast<size_t>(fault_readback.size / 4u));
+      DestroyBuffer(&fault_readback);
+      size_t set = 0;
+      for (const auto word : faults) {
+        set += static_cast<size_t>(std::popcount(word));
+      }
+      for (const auto guest : test.expected_fault_pages) {
+        const auto page = BufferCache::PageIndex(guest);
+        Require(test.name, "fault buffer",
+                ((faults.at(page / 32u) >> (page % 32u)) & 1u) != 0,
+                "an expected page fault was not recorded");
+      }
+      Require(test.name, "fault buffer", set == test.expected_fault_pages.size(),
+              "the dispatch recorded unexpected page faults");
     }
     for (const auto view : sampled_mip_views) {
       m_device.destroyImageView(view, nullptr);
@@ -20534,6 +20585,7 @@ private:
       RequireVulkanSuccess(m_device.waitIdle(), "vkDeviceWaitIdle");
       DestroyBuffer(&m_fault_buffer);
       DestroyBuffer(&m_bda_pagetable_buffer);
+      DestroyBuffer(&m_bda_zero_page);
       if (m_runtime_context.allocator != nullptr) {
         m_renderer.reset();
         vmaDestroyAllocator(m_runtime_context.allocator);
@@ -20759,7 +20811,11 @@ private:
     m_bda_pagetable_buffer =
         CreateDeviceBuffer(shader_name, BufferCache::BDA_PAGETABLE_SIZE, usage);
     m_fault_buffer = CreateDeviceBuffer(
-        shader_name, BufferCache::CACHING_NUMPAGES / 8, usage | vk::BufferUsageFlagBits::eTransferSrc);
+        shader_name, BufferCache::CACHING_NUMPAGES / 8,
+        usage | vk::BufferUsageFlagBits::eTransferSrc);
+    // BufferCache::BDA_ZERO_ENTRY: the page that reads of missing BDA pages see.
+    m_bda_zero_page = CreateStorageBuffer(
+        shader_name, {}, BufferCache::CACHING_PAGESIZE / 4u + 64u, true);
   }
 
   Buffer CreateHostBuffer(const char *shader_name, vk::DeviceSize size,
@@ -20837,6 +20893,7 @@ private:
   vk::PhysicalDeviceMemoryProperties m_memory_properties{};
   Buffer m_bda_pagetable_buffer;
   Buffer m_fault_buffer;
+  Buffer m_bda_zero_page;
   GraphicContext m_runtime_context{};
   std::unique_ptr<RenderContext> m_renderer;
 };
@@ -34357,6 +34414,49 @@ TestCase FlatVirtualAddressRebasesGuestAllocation() {
   return test;
 }
 
+// A read of a missing page returns zeroes without branching: the page table's extra entry points
+// at a zeroed page. The miss is recorded once the invocation returns; addresses outside the page
+// table read zeroes too but are not guest pages, so they record nothing.
+TestCase BdaMissingPageReadsZeroAndFaults() {
+  using O = ShaderOpcode;
+
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr uint64_t MissingBase = GuestBase + 0x100000ull;
+  constexpr uint64_t OutsideTable = 0xffff000000000000ull;
+  std::vector<u32> code;
+  const auto load = [&](uint64_t address, u32 vdst) {
+    AppendVMovLiteral(&code, 20, static_cast<u32>(address));
+    AppendVMovLiteral(&code, 21, static_cast<u32>(address >> 32u));
+    code.push_back(EncodeFlat0(0x0c, 2, 0));
+    code.push_back(EncodeFlat1(vdst, 0x7d, 0, 20));
+  };
+  load(GuestBase + 4u, 0);
+  load(MissingBase + 8u, 1);
+  load(OutsideTable, 2);
+  // FLAT_LOAD_USHORT inside a dword, and across into the next one.
+  for (const u32 byte : {2u, 3u}) {
+    AppendVMovLiteral(&code, 20, static_cast<u32>(GuestBase + byte));
+    AppendVMovLiteral(&code, 21, static_cast<u32>(GuestBase >> 32u));
+    code.push_back(EncodeFlat0(0x0a, 2, 0));
+    code.push_back(EncodeFlat1(byte + 1u, 0x7d, 0, 20));
+  }
+  for (u32 vgpr = 0; vgpr < 5; vgpr++) {
+    AppendStoreVgpr(&code, vgpr, vgpr);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BdaMissingPageReadsZeroAndFaults";
+  test.code = std::move(code);
+  test.initial = {0xfeedfaceu, 0xcafebabeu, 0x5a5a5a5au, 0x12345678u, 0};
+  test.expected = {0xcafebabeu, 0, 0, 0xfeedu, 0xbefeu};
+  test.bda_mappings = {{GuestBase, 0}};
+  test.expected_fault_pages = {MissingBase};
+  test.opcodes = {O::V_MOV_B32, O::FLAT_LOAD_DWORD, O::FLAT_LOAD_USHORT,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase GlobalSignedImmediateRebasesBeforeSaddr() {
   using O = ShaderOpcode;
 
@@ -42454,6 +42554,7 @@ TestCase DispatcherIrreducibleControlFlow() {
 }
 
 #include "ShaderRayTracingGpuTests.inc"
+#include "ShaderRayTracingComputeTests.inc"
 
 // Generic FLAT addresses whose top 16 bits match the shared or private aperture reach LDS or
 // per-lane scratch at the low dword, as a traversal stack pushed through FLAT expects.
@@ -43243,11 +43344,13 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(GlobalLoadShortD16Captured(64));
   AddCase(FlatLoadShortD16AddressSegments);
   AddCase(FlatVirtualAddressRebasesGuestAllocation);
+  AddCase(BdaMissingPageReadsZeroAndFaults);
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
   AddCase(FlatSegmentIgnoresSaddrAndMasksOffsetMsb);
   AddCase(ScratchIsPrivatePerInvocation);
   cases.push_back(FlatStackApertures(32));
   cases.push_back(FlatStackApertures(64));
+  AddRayTracingCases(cases);
   cases.push_back(BvhIntersections(true, true, 1));
   cases.push_back(BvhIntersections(true, true, 0, true));
   for (bool barycentrics : {false, true}) {
@@ -49249,6 +49352,11 @@ int main(int argc, char **argv) {
       for (bool sorted : {false, true}) {
         RunCase(&vulkan, BvhIntersections(barycentrics, sorted));
       }
+    }
+    std::vector<TestCase> cases;
+    AddRayTracingCases(cases);
+    for (const auto &test : cases) {
+      RunCase(&vulkan, test);
     }
     return 0;
   }
