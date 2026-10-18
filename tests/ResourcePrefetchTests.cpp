@@ -3,6 +3,7 @@
 // loop with and without the workers.
 
 #include "graphics/host_gpu/renderer/cache/srtPageWatch.h"
+#include "graphics/host_gpu/renderer/pipeline/backgroundBuilds.h"
 #include "graphics/host_gpu/renderer/pipeline/resourcePrefetch.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -11,10 +12,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <random>
 #include <span>
 #include <thread>
@@ -1328,6 +1332,99 @@ void DbgExit(int) { std::abort(); }
 
 } // namespace Common
 
+
+// KeyedBuildQueue (pipeline builds ahead of their request): results are handed over by key, a
+// running build is waited for, a queued one is built by the requester, untaken results are
+// disposed of, and shutdown joins the workers.
+void TestKeyedBuildQueue() {
+  using Queue = Libs::Graphics::KeyedBuildQueue<int>;
+  std::mutex mutex;
+  std::condition_variable changed;
+  bool release = false;
+  uint32_t started = 0;
+  std::vector<int> disposed;
+  const auto gated = [&](int value) {
+    return [&, value] {
+      std::unique_lock lock(mutex);
+      ++started;
+      changed.notify_all();
+      changed.wait(lock, [&] { return release; });
+      return value;
+    };
+  };
+  {
+    Queue queue(1, 3, [&](int &value) { disposed.push_back(value); });
+    Check(queue.Submit(1, gated(10)), "first build was refused");
+    Check(!queue.Submit(1, [] { return 0; }), "a known key was built twice");
+    {
+      std::unique_lock lock(mutex);
+      changed.wait(lock, [&] { return started == 1; });
+    }
+    // The only worker is busy: the next build stays queued and its requester builds it.
+    const auto requester = std::this_thread::get_id();
+    std::thread::id built_on;
+    Check(queue.Submit(2, [&] {
+            built_on = std::this_thread::get_id();
+            return 20;
+          }),
+          "second build was refused");
+    Check(queue.Take(2) == 20 && built_on == requester,
+          "a queued build was not built by its requester");
+    Check(!queue.Take(2).has_value() && !queue.Take(99).has_value(),
+          "an unknown key returned a result");
+    std::optional<int> waited;
+    std::thread taker([&] { waited = queue.Take(1); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    Check(!waited.has_value(), "a running build was handed over before it finished");
+    {
+      std::lock_guard lock(mutex);
+      release = true;
+    }
+    changed.notify_all();
+    taker.join();
+    Check(waited == 10, "the requester did not wait for the running build");
+    // Finished results nobody takes: the oldest is disposed of when the queue is full.
+    for (const int key : {3, 4, 5}) {
+      Check(queue.Submit(key, [key] { return key * 10; }), "build was refused");
+      while (queue.GetStats().built < static_cast<uint64_t>(key - 1)) std::this_thread::yield();
+    }
+    Check(queue.Submit(6, [] { return 60; }) && disposed == std::vector<int>{30} &&
+              !queue.Contains(3) && queue.Contains(4),
+          "a full queue did not dispose of its oldest finished result");
+    const auto stats = queue.GetStats();
+    Check(stats.taken == 1 && stats.stolen == 1 && stats.disposed == 1,
+          "build queue statistics are wrong");
+    while (queue.GetStats().built < 5) std::this_thread::yield();
+  }
+  // Destruction shut the queue down: the untaken results were disposed of, in order.
+  Check(disposed == std::vector<int>{30, 40, 50, 60}, "shutdown did not dispose of results");
+  // Shutdown drops queued builds without running them and refuses new ones.
+  release = false;
+  started = 0;
+  bool ran_queued = false;
+  Queue queue(1, 4, {});
+  Check(queue.Submit(1, gated(1)), "gated build was refused");
+  {
+    std::unique_lock lock(mutex);
+    changed.wait(lock, [&] { return started == 1; });
+  }
+  Check(queue.Submit(2, [&] {
+          ran_queued = true;
+          return 2;
+        }),
+        "queued build was refused");
+  std::thread stopper([&] { queue.Shutdown(); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  {
+    std::lock_guard lock(mutex);
+    release = true;
+  }
+  changed.notify_all();
+  stopper.join();
+  Check(!ran_queued && !queue.Submit(3, [] { return 3; }) && !queue.Contains(2),
+        "shutdown ran a queued build or accepted a new one");
+}
+
 int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bench") == 0) {
     Bench();
@@ -1338,6 +1435,7 @@ int main(int argc, char **argv) {
     Bench();
     return 0;
   }
+  TestKeyedBuildQueue();
   TestReplicaEvaluatesLikeThePlan();
   TestOutputsDoNotDependOnPriorContents();
   TestSpeculationMatchesSerial();

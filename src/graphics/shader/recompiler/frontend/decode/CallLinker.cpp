@@ -415,8 +415,9 @@ CallAnalysis AnalyzeCalls(std::span<const uint32_t> code, uint32_t wave_size) {
 
 bool ReadCallTargets(const CallSite& site, std::span<const uint32_t> user_data,
                      const ReadGuestWords& read, std::vector<uint64_t>& targets,
-                     std::string& failure) {
+                     std::string& failure, uint64_t* table_base) {
 	targets.clear();
+	if (table_base != nullptr) *table_base = 0;
 	if (site.pointer_in_user_data) {
 		if (site.pointer_user_sgpr + 2u > user_data.size()) {
 			failure = "code pointer is outside the user SGPRs";
@@ -459,6 +460,7 @@ bool ReadCallTargets(const CallSite& site, std::span<const uint32_t> user_data,
 		failure = fmt::format("table 0x{:x} of 0x{:x} bytes has no code pointer", base, bytes);
 		return false;
 	}
+	if (table_base != nullptr) *table_base = base;
 	// A table can be megabytes: reuse the buffer (a fresh one costs a map, zeroing and an unmap)
 	// and the targets of recent tables whose bytes are unchanged.
 	struct ScannedTable {

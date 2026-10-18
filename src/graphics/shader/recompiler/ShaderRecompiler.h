@@ -9,6 +9,7 @@
 #include "graphics/shader/shader.h"
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -80,6 +81,10 @@ struct ShaderSource {
 	struct TableCalls {
 		Decoder::CallAnalysis              analysis;
 		std::vector<std::vector<uint64_t>> targets;
+		// Per site, the address of the table its targets were last read from (0: user SGPRs).
+		std::vector<uint64_t>              table_bases;
+		// The tables whose targets changed in the last refresh that relinked the program.
+		std::vector<uint64_t>              changed_tables;
 	};
 	std::vector<uint32_t> code;
 	Decoder::Program decoded;
@@ -99,6 +104,12 @@ struct ShaderSource {
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime);
 [[nodiscard]] TranslateResult TranslateProgram(const Decoder::Program& decoded,
 	                                           const CompileOptions& options);
+// A table-linked source's own copy, not yet linked: RefreshShaderSource links it for a runtime
+// without touching `source`. Requires source.table.
+[[nodiscard]] std::unique_ptr<ShaderSource> CloneTableSource(const ShaderSource& source);
+// Whether the last relink of `changed` was caused by a table `other` reads its call targets from:
+// `other` is then likely to need relinking against the same new callees.
+[[nodiscard]] bool SharesChangedCallTable(const ShaderSource& changed, const ShaderSource& other);
 
 [[nodiscard]] TranslateResult TranslateProgram(std::span<const uint32_t> code,
                                                const CompileOptions& options);

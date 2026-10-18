@@ -655,20 +655,27 @@ const Decoder::Program& RefreshTableCalls(ShaderSource& source, const IR::SrtRun
 	};
 	bool                  changed = !source.linked.has_value();
 	std::vector<uint64_t> targets;
+	std::vector<uint64_t> changed_tables;
+	table.table_bases.resize(table.analysis.sites.size());
 	for (size_t index = 0; index < table.analysis.sites.size(); ++index) {
 		const auto& site = table.analysis.sites[index];
 		std::string failure;
-		if (!Decoder::ReadCallTargets(site, runtime.user_data, read, targets, failure)) {
+		uint64_t    base = 0;
+		if (!Decoder::ReadCallTargets(site, runtime.user_data, read, targets, failure, &base)) {
 			EXIT("shader call at pc 0x%08x: %s\n", site.pc, failure.c_str());
 		}
+		table.table_bases[index] = base;
 		if (targets != table.targets[index]) {
 			table.targets[index] = targets;
 			changed              = true;
+			if (base != 0u && std::ranges::find(changed_tables, base) == changed_tables.end())
+				changed_tables.push_back(base);
 		}
 	}
 	if (!changed) {
 		return source.linked->decoded;
 	}
+	table.changed_tables = std::move(changed_tables);
 	auto program = Decoder::LinkCalls(source.code, table.analysis, table.targets, read);
 	if (!program.failure.empty()) {
 		EXIT("shader calls cannot be linked: %s\n", program.failure.c_str());
@@ -685,6 +692,27 @@ const Decoder::Program& RefreshTableCalls(ShaderSource& source, const IR::SrtRun
 }
 
 } // namespace
+
+std::unique_ptr<ShaderSource> CloneTableSource(const ShaderSource& source) {
+	EXIT_IF(!source.table || !source.call);
+	auto clone         = std::make_unique<ShaderSource>();
+	clone->code        = source.code;
+	clone->decoded     = source.decoded;
+	clone->decoded.code = clone->code;
+	clone->call        = source.call;
+	clone->table       = source.table;
+	clone->table_calls = source.table_calls;
+	clone->wave_size   = source.wave_size;
+	clone->revision    = source.revision;
+	return clone;
+}
+
+bool SharesChangedCallTable(const ShaderSource& changed, const ShaderSource& other) {
+	if (!changed.table || !other.table) return false;
+	return std::ranges::any_of(changed.table->changed_tables, [&](uint64_t base) {
+		return std::ranges::find(other.table->table_bases, base) != other.table->table_bases.end();
+	});
+}
 
 ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOptions& options) {
 	EXIT_IF(code.empty());

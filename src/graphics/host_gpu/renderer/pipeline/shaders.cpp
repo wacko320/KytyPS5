@@ -18,6 +18,8 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
+#include <xxhash.h>
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -242,6 +244,21 @@ bool UsesBindlessHeap(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
 }
 
 } // namespace
+
+uint64_t ComputePipelineBuildKey(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                 std::span<const uint32_t>                       spirv) {
+	std::vector<vk::DescriptorSetLayoutBinding> bindings;
+	AddLayoutBindings(bindings, program, vk::ShaderStageFlagBits::eCompute);
+	std::vector<uint32_t> layout {program.wave_size, UsesBindlessHeap(program) ? 1u : 0u,
+	                              static_cast<uint32_t>(spirv.size())};
+	for (const auto& binding: bindings) {
+		layout.push_back(binding.binding);
+		layout.push_back(static_cast<uint32_t>(binding.descriptorType));
+		layout.push_back(binding.descriptorCount);
+	}
+	return XXH3_64bits_withSeed(spirv.data(), spirv.size_bytes(),
+	                            XXH3_64bits(layout.data(), layout.size() * sizeof(uint32_t)));
+}
 
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&          rendering,

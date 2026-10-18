@@ -11418,6 +11418,93 @@ void TestTableCallsLinkThroughShaderSource() {
 #endif
 }
 
+// Two linked kernels reading their targets from one table: when the table changes under one, the
+// other is recognized as sharing it, and a clone links the other's new callees without touching it.
+void TestTableCallSiblingsShareChangedTables() {
+  using namespace ShaderRecompiler;
+  constexpr uint64_t CalleeA = 0x0000000100000000ull;
+  constexpr uint64_t CalleeB = 0x0000000200000000ull;
+  constexpr uint64_t Table = 0x0000000300000000ull;
+  constexpr uint64_t OtherTable = 0x0000000500000000ull;
+  constexpr uint64_t CalleeC = 0x0000000400000000ull;
+  // Two sites: one call is linked as a leaf, several through their tables.
+  std::vector<uint32_t> code;
+  for (const auto [offset, pair] : {std::pair{16u, 30u}, std::pair{24u, 32u}}) {
+    code.push_back(EncodeSmem0(0x09, 20, 0)); // s_buffer_load_dwordx2 s[20:21], s[0:3], offset
+    code.push_back(offset | (0x7du << 25u));
+    code.push_back(EncodeSopp(0x0c, 0));      // s_waitcnt 0
+    code.push_back(EncodeSop1(0x04, pair, 20)); // s_mov_b64 s[pair], s[20:21]
+    code.push_back(EncodeSop1(0x21, pair, pair)); // s_swappc_b64 s[pair], s[pair]
+  }
+  code.push_back(EncodeSopp(0x01));
+  std::map<uint64_t, uint32_t> memory;
+  for (const auto [callee, pair] : {std::pair{CalleeA, 30u}, std::pair{CalleeB, 30u},
+                                    std::pair{CalleeC, 32u}}) {
+    memory[callee] = EncodeSMovB32(40, 129);        // s_mov_b32 s40, 1
+    memory[callee + 4] = EncodeSop1(0x20, 0, pair); // s_setpc_b64 s[pair]
+  }
+  const auto set_pointer = [&](uint64_t table, uint32_t offset, uint64_t pointer) {
+    memory[table + offset] = static_cast<uint32_t>(pointer);
+    memory[table + offset + 4] = static_cast<uint32_t>(pointer >> 32u);
+  };
+  for (const auto table : {Table, OtherTable}) {
+    set_pointer(table, 16, CalleeA);
+    set_pointer(table, 24, CalleeC);
+  }
+  const auto read = [](void *data, uint64_t address, std::span<uint32_t> out) {
+    const auto &words = *static_cast<std::map<uint64_t, uint32_t> *>(data);
+    for (size_t i = 0; i < out.size(); ++i) {
+      const auto found = words.find(address + i * 4u);
+      out[i] = found != words.end() ? found->second : 0u;
+    }
+    return true;
+  };
+  const auto make_user_data = [](uint64_t table) {
+    std::array<uint32_t, 64> user_data{};
+    user_data[0] = static_cast<uint32_t>(table);
+    user_data[1] = static_cast<uint32_t>(table >> 32u);
+    user_data[2] = 64u;
+    user_data[3] = 3u << 28u;
+    return user_data;
+  };
+  const auto shared = make_user_data(Table);
+  const auto other = make_user_data(OtherTable);
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = shared;
+  options.table_calls = true;
+  const auto runtime = [&](const std::array<uint32_t, 64> &user_data) {
+    return IR::SrtRuntime{.user_data = user_data, .read_memory = read, .userdata = &memory,
+                          .read_specialization_memory = read};
+  };
+  auto first = PrepareShaderSource(code, options);
+  auto second = PrepareShaderSource(code, options);
+  auto unrelated = PrepareShaderSource(code, options);
+  (void)RefreshShaderSource(first, runtime(shared));
+  (void)RefreshShaderSource(second, runtime(shared));
+  (void)RefreshShaderSource(unrelated, runtime(other));
+  Check(first.table && unrelated.table &&
+            first.table->table_bases == std::vector<uint64_t>{Table, Table} &&
+            unrelated.table->table_bases == std::vector<uint64_t>{OtherTable, OtherTable},
+        "table calls did not record the tables their targets come from");
+  const auto old_key = second.linked->key;
+  set_pointer(Table, 16, CalleeB);
+  (void)RefreshShaderSource(first, runtime(shared));
+  Check(first.revision == 2 && first.table->changed_tables == std::vector<uint64_t>{Table},
+        "a relink did not record the table that changed");
+  Check(SharesChangedCallTable(first, second) && !SharesChangedCallTable(first, unrelated),
+        "sibling detection did not follow the changed table");
+  auto clone = CloneTableSource(second);
+  (void)RefreshShaderSource(*clone, runtime(shared));
+  Check(second.revision == 1 && second.linked->key == old_key &&
+            clone->linked->key == first.linked->key && clone->linked->key != old_key &&
+            clone->table->targets == std::vector<std::vector<uint64_t>>{{CalleeB}, {CalleeC}},
+        "a cloned sibling did not link the new callees on its own");
+  (void)RefreshShaderSource(second, runtime(shared));
+  Check(second.linked->key == clone->linked->key &&
+            second.linked->code == clone->linked->code,
+        "the sibling's own relink differs from the clone's");
+}
+
 // CompileOptions::table_calls: a call source whose paths reach different definitions is not one
 // uniform value, so the single-leaf search hands the call to table mode instead of exiting. Here a
 // 32-bit write of s11 on one path counts as a possible write of the SRT pair s[12:13] that the
@@ -17400,6 +17487,7 @@ int main() {
   TestGraphicsComputeGetreg();
   TestMemoryFedScalarLeafCall();
   TestTableCallsLinkThroughShaderSource();
+  TestTableCallSiblingsShareChangedTables();
   TestTableCallsTakeSourcesWithDifferingDefinitions();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();

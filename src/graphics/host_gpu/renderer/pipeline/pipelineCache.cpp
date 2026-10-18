@@ -31,7 +31,10 @@
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
+#include <functional>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
@@ -643,7 +646,17 @@ struct PipelineCache::ProgramCache {
 			return nullptr;
 		}
 
+		// A table-linked compute kernel's last dispatch, to link and build it ahead when a table
+		// it shares changes (BuildSiblingsAhead).
+		struct ComputeSeed {
+			std::vector<uint32_t>  user_data;
+			uint64_t               shader_base = 0;
+			uint64_t               hash        = 0;
+			ShaderComputeInputInfo input;
+		};
+
 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
+		std::unique_ptr<ComputeSeed>                    seed;
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
@@ -749,13 +762,131 @@ struct PipelineCache::ProgramCache {
 	};
 
 	static constexpr std::size_t MaxStaticKeyWords = 32 + ShaderVertexInputInfo::RES_MAX * 6;
+	// Linked kernels built ahead after one relink; the queue bounds the workers.
+	static constexpr uint32_t MaxSiblingBuilds = 4;
+
+	ShaderRecompiler::CompileOptions BaseOptions(ShaderType stage, uint64_t hash,
+	                                             std::span<const uint32_t> user_data,
+	                                             const char*               label) const {
+		ShaderRecompiler::CompileOptions options;
+		options.stage               = stage;
+		options.maintenance8_enabled = graphics.maintenance8_enabled;
+		options.shader_hash         = hash;
+		options.loop_watchdog_limit = Config::ShaderLoopLimit();
+		options.untracked_writes    = true;
+		options.bindless_images     = true;
+		options.table_calls         = true;
+		options.user_data           = user_data;
+		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+		options.early_dump  = options.dump_ir;
+		options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
+		options.dump_label  = label;
+		return options;
+	}
+
+	void RecordComputeSeed(SourceEntry& entry, const ShaderParams& params,
+	                       const ShaderComputeInputInfo& input_info) {
+		if (!entry.call_source || !entry.call_source->table) return;
+		if (!entry.seed) entry.seed = std::make_unique<SourceEntry::ComputeSeed>();
+		auto& seed = *entry.seed;
+		const auto user_data = std::span(params.user_data).first(params.user_data_count);
+		seed.user_data.assign(user_data.begin(), user_data.end());
+		seed.shader_base = params.Base();
+		seed.hash        = params.hash;
+		seed.input       = input_info;
+		seed.input.stage = {};
+	}
+
+	// `changed` just relinked because call tables changed. Linked compute kernels that read their
+	// targets from one of those tables (two passes of one ray-tracing frame) are likely to relink
+	// at their next dispatch against the same new callees: link them now from their last
+	// dispatch's user data, translate them here (guest reads stay on the GPU thread) and build
+	// their pipelines on a worker. Their own dispatch still links, translates and checks the
+	// result: it adopts the prebuilt pipeline only for the same ComputePipelineBuildKey
+	// (PipelineCache::GetComputePipeline), waiting for it if needed.
+	void BuildSiblingsAhead(const SourceEntry& changed) {
+		if (!submit_build) return;
+		uint32_t started = 0;
+		for (auto& [key, sibling]: programs) {
+			if (&sibling == &changed || key.stage != ShaderType::Compute || !sibling.seed ||
+			    !sibling.call_source || !sibling.call_source->table ||
+			    !ShaderRecompiler::SharesChangedCallTable(*changed.call_source,
+			                                              *sibling.call_source))
+				continue;
+			if (started++ == MaxSiblingBuilds) break;
+			BuildAhead(sibling, changed.resource_plan.shader_hash);
+		}
+	}
+
+	void BuildAhead(const SourceEntry& sibling, uint64_t trigger_hash) {
+		const auto& seed   = *sibling.seed;
+		auto        source = ShaderRecompiler::CloneTableSource(*sibling.call_source);
+		ShaderRecompiler::IR::SrtRuntime runtime {
+		    .user_data                  = seed.user_data,
+		    .shader_base                = seed.shader_base,
+		    .read_memory                = ReadOrdinaryGuestMemory,
+		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .gpu_written                = Libs::LibKernel::Memory::IsGpuWrittenUnread,
+		};
+		runtime.workgroup_counts = seed.input.workgroup_counts;
+		ShaderRecompiler::RefreshShaderSource(*source, runtime);
+		if (sibling.call_source->linked && source->linked->key == sibling.call_source->linked->key)
+			return; // its tables did not change for it
+		auto                 input = seed.input;
+		ShaderStageInputInfo stage_input {};
+		stage_input.compute = &input;
+		auto options = BaseOptions(ShaderType::Compute, seed.hash, seed.user_data,
+		                           "ShaderRecompiler CS");
+		options.input_info         = stage_input;
+		options.wave_size          = input.wave_size;
+		options.bindless_image_pcs = sibling.bindless_pcs;
+		ShaderRecompiler::IR::ResourceSnapshot       snapshot;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		ShaderRecompiler::TranslateResult            translated;
+		// As Get: tables that cannot be specialized move to the bindless heap.
+		for (uint32_t attempt = 0;; attempt++) {
+			translated = ShaderRecompiler::TranslateProgram(source->linked->decoded, options);
+			translated.program.source_reads = source->reads;
+			const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			std::vector<uint32_t> pcs;
+			bool                  materialized = false;
+			{
+				const CheckedReadScope checked_reads;
+				const ShaderRecompiler::IR::SpecializationFailureReports quiet(false);
+				materialized = ShaderRecompiler::IR::MaterializeResources(
+				    plan, runtime, snapshot, specialization, &pcs);
+			}
+			if (materialized) break;
+			bool added = false;
+			for (const auto pc: pcs) {
+				if (std::ranges::find(options.bindless_image_pcs, pc) ==
+				    options.bindless_image_pcs.end()) {
+					options.bindless_image_pcs.push_back(pc);
+					added = true;
+				}
+			}
+			if (!added || attempt == 3) return;
+		}
+		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
+		                                               std::move(specialization), 0);
+		auto program = std::make_shared<const ShaderRecompiler::IR::CompiledShaderInfo>(
+		    std::move(result.program).TakeCompiledInfo());
+		const auto key = ComputePipelineBuildKey(*program, result.spirv);
+		if (submit_build(key, std::make_shared<const std::vector<uint32_t>>(std::move(result.spirv)),
+		                 std::move(program))) {
+			std::printf("Shader 0x%016" PRIx64 ": a shared call table changed; building linked "
+			            "kernel 0x%016" PRIx64 " ahead (key 0x%016" PRIx64 ")\n",
+			            trigger_hash, seed.hash, key);
+		}
+	}
 
 	Permutation CompilePermutation(const char*                                  stage_name,
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword,
-	                               std::span<const uint32_t> function_code) {
+	                               std::span<const uint32_t> function_code,
+	                               bool                      record_build_key = false) {
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
 		                                         Common::DebugCounters::Counter::ShaderCompileNs,
 		                                         Common::DebugCounters::Peak::ShaderCompileNs);
@@ -775,12 +906,17 @@ struct PipelineCache::ProgramCache {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
-		return {
+		Permutation permutation {
 		    .function_code  = {function_code.begin(), function_code.end()},
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
 		    .handle         = {.id = ++next_shader_id, .module = module},
 		};
+		if (record_build_key) {
+			build_keys[permutation.handle.id] =
+			    ComputePipelineBuildKey(permutation.program, result.spirv);
+		}
+		return permutation;
 	}
 
 	template <typename InputInfo>
@@ -825,8 +961,14 @@ struct PipelineCache::ProgramCache {
 			auto& cached = entry->second;
 			plan_generation = cached.plan_generation;
 			Permutation* permutation = nullptr;
+			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+				RecordComputeSeed(cached, params, input_info);
+			}
 			if (cached.call_source) {
 				source_changed = cached.RefreshCallSource(runtime);
+				if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+					if (source_changed) BuildSiblingsAhead(cached);
+				}
 				if (!source_changed)
 					permutation = cached.FindPermutation<true>(runtime, push_data_cursor,
 					                                           prefetcher.get());
@@ -862,21 +1004,9 @@ struct PipelineCache::ProgramCache {
 			case ShaderType::Compute: label = "ShaderRecompiler CS"; stage_name = "cs"; break;
 			default: EXIT("invalid pipeline shader stage\n");
 		}
-		ShaderRecompiler::CompileOptions options;
-		options.stage       = stage;
-		options.maintenance8_enabled = graphics.maintenance8_enabled;
-		options.shader_hash = params.hash;
-		options.loop_watchdog_limit = Config::ShaderLoopLimit();
-		options.untracked_writes    = true;
-		options.bindless_images     = true;
-		options.table_calls         = true;
-		options.user_data   = user_data;
-		options.back_code      = params.back_code;
-		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-		options.early_dump  = options.dump_ir;
-		options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
-		options.dump_label  = label;
-		options.input_info  = stage_input;
+		auto options       = BaseOptions(stage, params.hash, user_data, label);
+		options.back_code  = params.back_code;
+		options.input_info = stage_input;
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
@@ -923,6 +1053,9 @@ struct PipelineCache::ProgramCache {
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
 			ResetReplicas(entry->second, translated.program);
 			current = entry->second.call_source.get();
+			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+				RecordComputeSeed(entry->second, params, input_info);
+			}
 			materialize();
 		} else if (source_changed || plan_generation != entry->second.plan_generation) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
@@ -936,9 +1069,12 @@ struct PipelineCache::ProgramCache {
 				return permutation->handle;
 			}
 		}
+		const bool table_linked_compute = stage == ShaderType::Compute &&
+		                                  entry->second.call_source &&
+		                                  entry->second.call_source->table.has_value();
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
-		    entry->second.FunctionCode()));
+		    entry->second.FunctionCode(), table_linked_compute));
 		entry->second.permutations.back().plan_generation = entry->second.plan_generation;
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
@@ -985,6 +1121,13 @@ struct PipelineCache::ProgramCache {
 	uint64_t                                                    next_shader_id = 0;
 	// The entry the last Get materialized, for Learn.
 	SourceEntry* last_materialized = nullptr;
+	// BuildSiblingsAhead's hand-off to PipelineCache's background builds; false when refused.
+	std::function<bool(uint64_t key, std::shared_ptr<const std::vector<uint32_t>> spirv,
+	                   std::shared_ptr<const ShaderRecompiler::IR::CompiledShaderInfo> program)>
+	    submit_build;
+	// ComputePipelineBuildKey of table-linked compute programs, by ShaderProgram::id, until
+	// GetComputePipeline takes it.
+	std::unordered_map<uint64_t, uint64_t> build_keys;
 	std::array<std::unordered_map<uint64_t, Prediction>,
 	           static_cast<size_t>(PrefetchSlot::Count)>
 	    predictions;
@@ -998,9 +1141,42 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	// Two workers: a relink rarely has more than one sibling, and each build holds a large
+	// compiler working set. Finished pipelines nobody takes are destroyed.
+	m_background_builds = std::make_unique<KeyedBuildQueue<Pipeline>>(
+	    2u, 2u * ProgramCache::MaxSiblingBuilds, [this](Pipeline& pipeline) {
+		    m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+		    m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+		    m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+	    });
+	m_program_cache->submit_build =
+	    [this](uint64_t key, std::shared_ptr<const std::vector<uint32_t>> spirv,
+	           std::shared_ptr<const ShaderRecompiler::IR::CompiledShaderInfo> program) {
+		    return m_background_builds->Submit(key, [this, spirv, program]() {
+			    Pipeline   pipeline;
+			    const auto module = CompileSPV(*spirv, m_graphics.device);
+			    EXIT_IF(module == nullptr);
+			    const ShaderRecompiler::IR::ResourceSnapshot resources;
+			    ShaderComputeInputInfo                       input;
+			    input.stage = {.program = program.get(), .resources = &resources};
+			    {
+				    Common::DebugCounters::ScopedTimer timer(
+				        Common::DebugCounters::Counter::PipelinesCreated,
+				        Common::DebugCounters::Counter::PipelineCreateNs,
+				        Common::DebugCounters::Peak::PipelineCreateNs);
+				    CreatePipelineInternal(m_graphics, pipeline, input, module, m_driver_cache);
+			    }
+			    m_driver_cache_dirty.store(true, std::memory_order_relaxed);
+			    m_graphics.device.destroyShaderModule(module, nullptr);
+			    return pipeline;
+		    });
+	    };
 }
 
 PipelineCache::~PipelineCache() {
+	// Workers use the device and the driver cache: they stop before either goes.
+	m_background_builds->Shutdown();
+	StopDriverCacheSaves();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -1096,18 +1272,61 @@ void PipelineCache::CheckpointDriverCache() {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
-	m_driver_cache_dirty = true;
-	if (std::chrono::steady_clock::now() >= m_next_driver_cache_save) {
-		Save();
+	m_driver_cache_dirty.store(true, std::memory_order_relaxed);
+	const auto now = std::chrono::steady_clock::now();
+	if (now < m_next_driver_cache_save) {
+		return;
+	}
+	m_next_driver_cache_save = now + DriverCacheSaveInterval;
+	{
+		std::lock_guard lock(m_save_state_mutex);
+		if (m_save_stop) {
+			return;
+		}
+		m_save_requested = true;
+		if (!m_save_thread.joinable()) {
+			m_save_thread = std::thread([this] {
+				LowerBackgroundBuildPriority();
+				std::unique_lock state(m_save_state_mutex);
+				for (;;) {
+					m_save_wake.wait(state, [this] { return m_save_requested || m_save_stop; });
+					if (m_save_stop) {
+						return;
+					}
+					m_save_requested = false;
+					state.unlock();
+					Save();
+					state.lock();
+				}
+			});
+		}
+	}
+	m_save_wake.notify_one();
+}
+
+void PipelineCache::StopDriverCacheSaves() {
+	{
+		std::lock_guard lock(m_save_state_mutex);
+		m_save_stop = true;
+	}
+	m_save_wake.notify_one();
+	if (m_save_thread.joinable()) {
+		m_save_thread.join();
 	}
 }
 
 void PipelineCache::Save() {
-	if (m_driver_cache == nullptr || !m_driver_cache_dirty) {
+	std::lock_guard save(m_save_mutex);
+	// A pipeline added while this save reads the cache sets the flag again for the next one.
+	if (m_driver_cache == nullptr || !m_driver_cache_dirty.exchange(false)) {
 		return;
 	}
-	m_next_driver_cache_save = std::chrono::steady_clock::now() + DriverCacheSaveInterval;
+	if (!WriteDriverCache()) {
+		m_driver_cache_dirty.store(true, std::memory_order_relaxed);
+	}
+}
 
+bool PipelineCache::WriteDriverCache() {
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
@@ -1128,7 +1347,7 @@ void PipelineCache::Save() {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {:.2f} MB)",
 		                 vk::to_string(result), static_cast<double>(size) / 1'000'000.0);
-		return;
+		return false;
 	}
 	payload.resize(size);
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
@@ -1136,7 +1355,7 @@ void PipelineCache::Save() {
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-		return;
+		return false;
 	}
 	auto temp_path = m_driver_cache_path;
 	temp_path += ".tmp";
@@ -1157,12 +1376,12 @@ void PipelineCache::Save() {
 	if (!written || error) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
-		return;
+		return false;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
 	                 static_cast<double>(payload.size()) / 1'000'000.0,
 	                 Common::PathToString(m_driver_cache_path));
-	m_driver_cache_dirty = false;
+	return true;
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -1624,7 +1843,20 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	auto cached = std::make_unique<Pipeline>();
-	{
+	auto& build_keys = m_program_cache->build_keys;
+	std::optional<Pipeline> prebuilt;
+	if (const auto key = build_keys.find(compute_program.id); key != build_keys.end()) {
+		prebuilt = m_background_builds->Take(key->second);
+		if (prebuilt) {
+			std::printf("Compute program %" PRIu64 ": using the pipeline built ahead (key 0x%016" PRIx64
+			            ")\n",
+			            compute_program.id, key->second);
+		}
+		build_keys.erase(key);
+	}
+	if (prebuilt) {
+		*cached = *prebuilt;
+	} else {
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);

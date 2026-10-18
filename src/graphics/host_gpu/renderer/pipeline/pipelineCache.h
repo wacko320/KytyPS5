@@ -4,16 +4,21 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/pipeline/backgroundBuilds.h"
 #include "graphics/host_gpu/renderer/pipeline/resourcePrefetch.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 
@@ -101,12 +106,15 @@ struct ShaderProgram {
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
 
-// The owning renderer serializes access, including saves while the GPU is running.
+// The owning renderer serializes access. Save may run on any thread: the periodic driver cache
+// save runs on a thread of its own while the GPU thread goes on.
 class PipelineCache {
 public:
 	explicit PipelineCache(GraphicContext& graphics);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
+	// Writes the driver cache if a pipeline was added since the last save. Any thread; saves
+	// do not overlap.
 	void Save();
 
 	struct Pipeline {
@@ -193,15 +201,34 @@ private:
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
+	// Compute pipelines built ahead on worker threads: a linked kernel that shares a call table
+	// with one that just relinked (ProgramCache::BuildSiblingsAhead). Keyed by
+	// ComputePipelineBuildKey.
+	std::unique_ptr<KeyedBuildQueue<Pipeline>> m_background_builds;
 	std::filesystem::path         m_driver_cache_path;
+	// GPU thread only (CheckpointDriverCache).
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
-	bool                          m_driver_cache_dirty = false;
+	// Set by every pipeline insert into the driver cache, on the GPU thread or a background
+	// build's worker; cleared by the Save that writes it.
+	std::atomic<bool>             m_driver_cache_dirty {false};
+	// One Save at a time: the periodic one on m_save_thread, and the ones at exit.
+	std::mutex                    m_save_mutex;
+	// The periodic save runs on its own thread, so vkGetPipelineCacheData and the file write
+	// stay off the GPU thread and out of the render lock.
+	std::mutex                    m_save_state_mutex;
+	std::condition_variable       m_save_wake;
+	bool                          m_save_requested = false;
+	bool                          m_save_stop      = false;
+	std::thread                   m_save_thread;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
+	void StopDriverCacheSaves();
+	// Save under m_save_mutex: false when the cache could not be read or written.
+	bool WriteDriverCache();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
@@ -219,6 +246,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+// Identifies what CreatePipelineInternal builds for a compute program from this SPIR-V: equal keys
+// create equal pipelines.
+uint64_t ComputePipelineBuildKey(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                 std::span<const uint32_t>                       spirv);
 
 } // namespace Libs::Graphics
 

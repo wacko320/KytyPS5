@@ -46,10 +46,11 @@ bool MayContainCalls(std::span<const uint32_t> code);
 // wave_size sizes the lane masks VALU compares write to SGPRs.
 CallAnalysis AnalyzeCalls(std::span<const uint32_t> code, uint32_t wave_size);
 
-// Reads the distinct non-null code pointers the site's table holds for this dispatch.
+// Reads the distinct non-null code pointers the site's table holds for this dispatch. table_base,
+// when given, receives the table's address (0 for a pointer passed in user SGPRs).
 bool ReadCallTargets(const CallSite& site, std::span<const uint32_t> user_data,
                      const ReadGuestWords& read, std::vector<uint64_t>& targets,
-                     std::string& failure);
+                     std::string& failure, uint64_t* table_base = nullptr);
 
 struct LinkedProgram {
 	std::vector<uint32_t>   code;
