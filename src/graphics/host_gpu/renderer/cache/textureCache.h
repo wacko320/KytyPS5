@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <bitset>
+#include <atomic>
 #include <map>
 #include <type_traits>
 #include <unordered_set>
@@ -76,6 +77,13 @@ public:
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
+	// Bytes of the registered images, now and at most since start (any thread, relaxed).
+	[[nodiscard]] uint64_t ImageBytes() const noexcept {
+		return m_image_bytes.load(std::memory_order_relaxed);
+	}
+	[[nodiscard]] uint64_t ImagePeakBytes() const noexcept {
+		return m_image_peak_bytes.load(std::memory_order_relaxed);
+	}
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
 
@@ -174,6 +182,8 @@ private:
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;
+	std::atomic<uint64_t>                             m_image_bytes {0};
+	std::atomic<uint64_t>                             m_image_peak_bytes {0};
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;

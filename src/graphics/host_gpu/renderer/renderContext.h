@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <chrono>
 #include <memory>
 #include <span>
 #include <shared_mutex>
@@ -69,6 +70,7 @@ public:
 	// A shader that reports through the fault buffer (the loop watchdog) was recorded.
 	void               RequestFaultProcessing() { m_fault_process_pending = true; }
 	void               RunGarbageCollector();
+	void               ProfileLevels();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -97,6 +99,7 @@ private:
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_logged = false;
+	std::chrono::steady_clock::time_point m_levels_sampled {};
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

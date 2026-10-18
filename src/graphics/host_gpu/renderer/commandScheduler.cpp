@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/frameProfiler.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 
@@ -10,6 +11,8 @@
 #include <optional>
 
 namespace Libs::Graphics {
+
+using Common::FrameProfiler::WaitSite;
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
@@ -94,8 +97,8 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
 
-CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
-    : m_master(graphics), m_context(context), m_graphics(graphics),
+CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics, bool present)
+    : m_master(graphics), m_context(context), m_graphics(graphics), m_timestamps(graphics, present),
       m_command_pool(graphics, m_master), m_command(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
 
@@ -126,7 +129,7 @@ void CommandScheduler::Shutdown() {
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
+	m_master.Wait(CurrentTick() - 1, WaitSite::SchedulerShutdown);
 	PopPendingOperations();
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
@@ -176,23 +179,23 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 	BeginNext();
 }
 
-void CommandScheduler::FlushAndWait() {
+void CommandScheduler::FlushAndWait(WaitSite site, std::source_location location) {
 	const auto tick = Submit();
-	m_master.Wait(tick);
+	m_master.Wait(tick, site, location);
 	BeginNext();
 }
 
-void CommandScheduler::Finish() {
+void CommandScheduler::Finish(WaitSite site, std::source_location location) {
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
+	m_master.Wait(CurrentTick() - 1, site, location);
 	BeginNext();
 	PopPendingOperations();
 }
 
-void CommandScheduler::Wait(uint64_t tick) {
+void CommandScheduler::Wait(uint64_t tick, WaitSite site, std::source_location location) {
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
@@ -201,10 +204,10 @@ void CommandScheduler::Wait(uint64_t tick) {
 		// resources are released only at the next GPU operation boundary.
 		const auto submitted_tick = Submit();
 		EXIT_IF(submitted_tick != tick);
-		m_master.Wait(tick);
+		m_master.Wait(tick, site, location);
 		BeginNext();
 	} else {
-		m_master.Wait(tick);
+		m_master.Wait(tick, site, location);
 	}
 }
 
@@ -221,7 +224,7 @@ void CommandScheduler::PopPendingOperations() {
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
 		}
-		WaitPriorityOperations(operation.tick);
+		WaitPriorityOperations(operation.tick, WaitSite::PendingOperations);
 		RunOperation(std::move(operation.callback));
 	}
 }
@@ -276,7 +279,8 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_active      = true;
 			m_priority_active_tick = operation.tick;
 		}
-		m_master.Wait(operation.tick);
+		m_master.Wait(operation.tick, WaitSite::PriorityFence);
+		Common::FrameProfiler::Rec(Common::FrameProfiler::Event::Fence, operation.tick);
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
 		}
@@ -296,15 +300,21 @@ void CommandScheduler::DrainPriorityOperations() {
 	    lock, [this] { return m_priority_operations.empty() && !m_priority_active; });
 }
 
-void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
+void CommandScheduler::WaitPriorityOperations(uint64_t tick, WaitSite site,
+                                              std::source_location location) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
-	m_operation_available.wait(lock, [this, tick] {
+	const auto done = [this, tick] {
 		const bool active_before_or_at = m_priority_active && m_priority_active_tick <= tick;
 		const bool queued_before_or_at =
 		    !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
 		return !active_before_or_at && !queued_before_or_at;
-	});
+	};
+	if (done()) {
+		return;
+	}
+	const Common::FrameProfiler::ScopedWait profile(true, site, location, tick);
+	m_operation_available.wait(lock, done);
 }
 
 void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {
@@ -333,13 +343,29 @@ CommandBuffer& CommandScheduler::Current() {
 
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
-	m_command.m_buffer = m_command_pool.Commit();
-	m_command.Begin();
-	m_dynamic_state.Invalidate();
+	BeginRecording();
 	return m_command;
 }
 
+void CommandScheduler::BeginRecording() {
+	m_command.m_buffer = m_command_pool.Commit();
+	m_command.Begin();
+	m_dynamic_state.Invalidate();
+	// Reads the timestamps of command buffers already known complete: never a wait.
+	m_timestamps.Poll(m_master.KnownGpuTick());
+	m_timestamps.Begin(m_command.m_buffer);
+}
+
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	struct ProfiledSubmit {
+		explicit ProfiledSubmit(uint64_t tick): t0(Common::FrameProfiler::Start()) {
+			Common::FrameProfiler::RecIf(t0, Common::FrameProfiler::Event::VkSubmit, tick);
+		}
+		~ProfiledSubmit() {
+			Common::FrameProfiler::RecIf(t0, Common::FrameProfiler::Event::VkSubmitEnd);
+		}
+		const uint64_t t0;
+	} const profile(CurrentTick());
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
@@ -354,6 +380,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		                                   vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0,
 		                                   nullptr, 0, nullptr);
 	}
+	// Timestamps are written outside a render pass.
+	m_command.EndRendering();
+	const auto timing = m_timestamps.End(m_command.m_buffer);
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
@@ -382,7 +411,13 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
-		result = graphics.queue.submit(1, &submit_info, nullptr);
+		const uint64_t submit_t0 = Common::FrameProfiler::Start();
+		result                   = graphics.queue.submit(1, &submit_info, nullptr);
+		if (submit_t0 != 0) {
+			const auto ticks = Common::FrameProfiler::Ticks() - submit_t0;
+			Common::FrameProfiler::Add(Common::FrameProfiler::Counter::VkSubmitTime, ticks);
+			Common::FrameProfiler::Max(Common::FrameProfiler::Counter::VkSubmitLongest, ticks);
+		}
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
@@ -394,6 +429,14 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
+	m_timestamps.Submitted(timing, tick);
+	if (profile.t0 != 0) {
+		using Common::FrameProfiler::Counter;
+		// SubmitsCommand is the rest of QueueSubmits (the capture reads the debug counters).
+		if (m_command.m_registers == nullptr) {
+			Common::FrameProfiler::Add(Counter::SubmitsOther);
+		}
+	}
 	m_command.m_buffer = nullptr;
 	return tick;
 }

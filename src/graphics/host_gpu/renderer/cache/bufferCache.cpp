@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/frameProfiler.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -22,6 +23,9 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+namespace FrameProfiler = Common::FrameProfiler;
+using FrameProfiler::WaitSite;
 
 namespace {
 
@@ -119,6 +123,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
+		m_buffer_bytes += buffer.Size();
 		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);
@@ -134,6 +139,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_buffers.erase(found);
 		EXIT_IF(buffer.Size() > m_total_used_memory);
 		m_total_used_memory -= buffer.Size();
+		m_buffer_bytes -= buffer.Size();
 		m_lru_cache.Free(buffer.lru_id);
 		m_bda_pagetable_buffer.Fill(table_offset,
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
@@ -245,8 +251,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		m_scheduler.DeferPriorityOperation(std::move(publish));
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
-		m_scheduler.Wait(tick);
-		m_scheduler.WaitPriorityOperations(tick);
+		m_scheduler.Wait(tick, WaitSite::ReadbackGpuThread);
+		m_scheduler.WaitPriorityOperations(tick, WaitSite::ReadbackGpuThread);
 		publish();
 	}
 	return true;
@@ -411,6 +417,8 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	}
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	FrameProfiler::Add(FrameProfiler::Counter::BufferJoins);
+	FrameProfiler::Add(FrameProfiler::Counter::BufferJoinedBytes, overlap.Size());
 	DeleteBuffer(overlap_id);
 }
 
@@ -420,6 +428,12 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
+	if (FrameProfiler::Active()) {
+		FrameProfiler::Add(FrameProfiler::Counter::BufferCreations);
+		FrameProfiler::Add(FrameProfiler::Counter::BufferCreatedBytes, overlap.end - overlap.begin);
+		FrameProfiler::Max(FrameProfiler::Counter::BufferLargestCreated,
+		                   overlap.end - overlap.begin);
+	}
 
 	const auto id = m_slot_buffers.insert(
 	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
@@ -707,8 +721,8 @@ void BufferCache::RunGarbageCollector() {
 
 	// Publish all queued downloads before releasing their tracked pages and owners.
 	const auto completion_tick = m_scheduler.CurrentTick();
-	m_scheduler.Wait(completion_tick);
-	m_scheduler.WaitPriorityOperations(completion_tick);
+	m_scheduler.Wait(completion_tick, WaitSite::GarbageCollector);
+	m_scheduler.WaitPriorityOperations(completion_tick, WaitSite::GarbageCollector);
 	for (const auto id: dirty_buffers) {
 		auto& buffer = m_slot_buffers[id];
 		m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());

@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/pageManager.h"
 
 #include "common/alignment.h"
+#include "common/frameProfiler.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
@@ -203,9 +204,20 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
+		namespace FrameProfiler   = Common::FrameProfiler;
+		const uint64_t profile_t0 = FrameProfiler::Start();
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));
+		}
+		if (profile_t0 != 0) {
+			const auto ticks = FrameProfiler::Ticks() - profile_t0;
+			const auto role  = FrameProfiler::CurrentRole();
+			FrameProfiler::Add(FrameProfiler::Counter::PageProtectCallsRender, role);
+			FrameProfiler::Add(FrameProfiler::Counter::PageProtectTimeRender, role, ticks);
+			// Lets a caller measure the share of its own work spent in protection changes.
+			FrameProfiler::t_protect_calls++;
+			FrameProfiler::t_protect_ticks += ticks;
 		}
 	}
 

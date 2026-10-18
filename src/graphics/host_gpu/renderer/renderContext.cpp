@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/frameProfiler.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
@@ -49,7 +50,7 @@ void RenderContext::ShutdownGpu() {
 	}
 	if (m_video_out != nullptr) {
 		if (m_command_scheduler.Active()) {
-			m_command_scheduler.Finish();
+			m_command_scheduler.Finish(Common::FrameProfiler::WaitSite::GpuShutdown);
 		}
 		m_command_scheduler.DrainPriorityOperations();
 		m_video_out = nullptr;
@@ -73,10 +74,18 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	if (Common::FrameProfiler::Active()) {
+		using Common::FrameProfiler::Counter;
+		Common::FrameProfiler::Add(access == PageFaultAccess::Write ? Counter::GuestWriteFaultsRender
+		                                                            : Counter::GuestReadFaultsRender,
+		                           Common::FrameProfiler::CurrentRole());
+	}
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
+		const Common::FrameProfiler::ScopedCause cause(
+		    Common::FrameProfiler::ReadbackCause::FaultRead);
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
@@ -119,10 +128,17 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
 		     m_command_scheduler.HasPendingPriorityOperations())) {
 			const auto tick = m_command_scheduler.CurrentTick();
-			m_command_scheduler.Finish();
-			m_command_scheduler.WaitPriorityOperations(tick);
+			Common::FrameProfiler::Add(Common::FrameProfiler::Counter::UnmapDrains);
+			m_command_scheduler.Finish(Common::FrameProfiler::WaitSite::UnmapDrain);
+			m_command_scheduler.WaitPriorityOperations(tick,
+			                                           Common::FrameProfiler::WaitSite::UnmapDrain);
 		}
-		m_buffer_cache.InvalidateMemory(vaddr, size);
+		{
+			// Labels the readback of an invalidation inside an unmap.
+			const Common::FrameProfiler::ScopedCause cause(
+			    Common::FrameProfiler::ReadbackCause::Unmap);
+			m_buffer_cache.InvalidateMemory(vaddr, size);
+		}
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
@@ -158,7 +174,36 @@ void RenderContext::PrepareBda() {
 	m_fault_process_pending = true;
 }
 
+// Samples the mapping, buffer and texture sizes for a running frame-profiler capture, at most
+// every 250 ms.
+void RenderContext::ProfileLevels() {
+	using Common::FrameProfiler::Level;
+	using Common::FrameProfiler::SetLevelValue;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - m_levels_sampled < std::chrono::milliseconds(250)) {
+		return;
+	}
+	m_levels_sampled = now;
+	uint64_t mapped  = 0;
+	{
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.ForEach([&](uint64_t begin, uint64_t end) { mapped += end - begin; });
+	}
+	SetLevelValue(Level::MappedBytes, mapped);
+	SetLevelValue(Level::BufferBytes, m_buffer_cache.BufferBytes());
+	SetLevelValue(Level::BufferCount, m_buffer_cache.BufferCount());
+	SetLevelValue(Level::TextureBytes, m_texture_cache.ImageBytes());
+	SetLevelValue(Level::TexturePeakBytes, m_texture_cache.ImagePeakBytes());
+	if (m_graphics.CanReportMemoryUsage()) {
+		SetLevelValue(Level::DeviceUsageBytes, m_graphics.GetDeviceMemoryUsage());
+	}
+	SetLevelValue(Level::DeviceBudgetBytes, m_graphics.GetTotalMemoryBudget());
+}
+
 void RenderContext::RunGarbageCollector() {
+	if (Common::FrameProfiler::Active()) {
+		ProfileLevels();
+	}
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();

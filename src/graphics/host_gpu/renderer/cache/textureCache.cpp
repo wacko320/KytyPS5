@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/frameProfiler.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -219,6 +220,11 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
+	const auto bytes = m_image_bytes.fetch_add(image.AccountedSize(), std::memory_order_relaxed) +
+	                   image.AccountedSize();
+	if (bytes > m_image_peak_bytes.load(std::memory_order_relaxed)) {
+		m_image_peak_bytes.store(bytes, std::memory_order_relaxed);
+	}
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
@@ -243,6 +249,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 		EXIT("TextureCache: image accounting underflow\n");
 	}
 	m_total_used_memory -= accounted;
+	m_image_bytes.fetch_sub(accounted, std::memory_order_relaxed);
 	image.registered = false;
 }
 
@@ -1090,6 +1097,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+		const Common::FrameProfiler::ScopedCause cause(
+		    Common::FrameProfiler::ReadbackCause::Metadata);
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
 	const auto slice_size = range.size / layers;

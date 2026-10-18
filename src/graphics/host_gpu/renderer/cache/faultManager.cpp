@@ -76,7 +76,7 @@ FaultManager::~FaultManager() {
 
 void FaultManager::ProcessFaultBuffer() {
 	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {
-		m_scheduler.Wait(wait_tick);
+		m_scheduler.Wait(wait_tick, Common::FrameProfiler::WaitSite::FaultBufferReuse);
 		m_scheduler.PopPendingOperations();
 	}
 

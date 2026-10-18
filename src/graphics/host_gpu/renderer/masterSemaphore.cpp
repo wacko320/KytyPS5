@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/frameProfiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 namespace Libs::Graphics {
@@ -36,7 +37,8 @@ void MasterSemaphore::Refresh() {
 	}
 }
 
-void MasterSemaphore::Wait(uint64_t tick) {
+void MasterSemaphore::Wait(uint64_t tick, Common::FrameProfiler::WaitSite site,
+                           std::source_location location) {
 	if (IsFree(tick)) {
 		return;
 	}
@@ -45,6 +47,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		return;
 	}
 
+	const Common::FrameProfiler::ScopedWait profile(false, site, location, tick);
 	vk::SemaphoreWaitInfo wait_info {};
 	wait_info.semaphoreCount = 1;
 	wait_info.pSemaphores    = &m_semaphore;

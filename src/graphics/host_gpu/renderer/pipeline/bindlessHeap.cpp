@@ -99,7 +99,7 @@ BindlessHeap::BindlessHeap(GraphicContext& graphics, CommandScheduler& scheduler
 
 BindlessHeap::~BindlessHeap() {
 	for (const auto& pending: m_pending_pools) {
-		m_scheduler.Wait(pending.tick);
+		m_scheduler.Wait(pending.tick, Common::FrameProfiler::WaitSite::BindlessHeapTeardown);
 		m_graphics.device.destroyDescriptorPool(pending.pool, nullptr);
 	}
 	if (m_current_pool != nullptr) {
@@ -206,7 +206,7 @@ void BindlessHeap::Reserve() {
 	const auto region  = m_next_miss_region;
 	m_next_miss_region = (m_next_miss_region + 1u) % MissRegions;
 	if (m_miss_ticks[region] != 0) {
-		m_scheduler.Wait(m_miss_ticks[region]);
+		m_scheduler.Wait(m_miss_ticks[region], Common::FrameProfiler::WaitSite::BindlessMissRegion);
 		m_scheduler.PopPendingOperations();
 	}
 	const auto miss_offset = region * MissStride;

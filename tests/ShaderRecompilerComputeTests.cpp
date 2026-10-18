@@ -2306,6 +2306,113 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+
+  // Two command buffers that each fill a 64 MiB buffer 8 times (512 MiB of writes, at least
+  // 0.1 ms at 5 TB/s): both are timed at completion with non-zero intervals in submission order,
+  // the busy time covers their union and stays within their span, and a labelled region is timed
+  // inside one.
+  void CheckGpuTimestamps() {
+    const char *name = "GpuTimestamps";
+    EnsureRuntimeContext();
+    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &timestamps = scheduler.Timestamps();
+    if (!timestamps.Enabled()) {
+      scheduler.Finish();
+      const auto stats = timestamps.GetStats();
+      Require(name, "no timestamps",
+              stats.command_buffers == 0 && stats.busy_ns == 0 &&
+                  timestamps.RecentIntervals().empty(),
+              "a device without timestamps reported GPU time");
+      std::printf("[host]    %-32s ok (no timestamps on this queue)\n", name);
+      return;
+    }
+    constexpr uint64_t spin_bytes = 64ull << 20;
+    constexpr uint32_t spin_fills = 8;
+    constexpr uint64_t min_spin_ns = 100'000;
+    Libs::Graphics::Buffer spin(m_runtime_context, scheduler,
+                                MemoryUsage::DeviceLocal, 0, AllFlags,
+                                spin_bytes);
+    scheduler.Finish();
+    const auto before = timestamps.GetStats();
+    std::array<uint64_t, 2> ticks{};
+    for (uint32_t i = 0; i < ticks.size(); i++) {
+      const auto native = scheduler.Current().Handle();
+      if (i == 1) {
+        timestamps.BeginRegion(native, GpuRegion::FlatCopy);
+      }
+      for (uint32_t fill = 0; fill < spin_fills; fill++) {
+        spin.Fill(0, spin_bytes, fill + i);
+      }
+      if (i == 1) {
+        timestamps.EndRegion(native, GpuRegion::FlatCopy);
+      }
+      ticks[i] = scheduler.CurrentTick();
+      scheduler.Flush();
+    }
+    // Waits for both; beginning the next command buffer reads their timestamps.
+    scheduler.Finish();
+    const auto after = timestamps.GetStats();
+    const auto intervals = timestamps.RecentIntervals();
+    std::array<const GpuTimestamps::Interval *, 2> timed{};
+    for (const auto &interval : intervals) {
+      for (uint32_t i = 0; i < ticks.size(); i++) {
+        if (interval.tick == ticks[i]) {
+          timed[i] = &interval;
+        }
+      }
+    }
+    Require(name, "both timed",
+            timed[0] != nullptr && timed[1] != nullptr &&
+                after.command_buffers >= before.command_buffers + 2,
+            "a completed command buffer was not timed");
+    const auto &first = *timed[0];
+    const auto &second = *timed[1];
+    Require(name, "non-zero",
+            first.begin_ns != 0 && second.begin_ns != 0 &&
+                first.end_ns - first.begin_ns >= min_spin_ns &&
+                second.end_ns - second.begin_ns >= min_spin_ns,
+            "a command buffer of 512 MiB of fills took less than 0.1 ms");
+    Require(name, "ordered",
+            first.end_ns > first.begin_ns && second.end_ns > second.begin_ns &&
+                first.begin_ns <= second.begin_ns && first.end_ns <= second.end_ns,
+            "timestamps of consecutive command buffers are out of order");
+    const auto union_ns = (first.end_ns - first.begin_ns) +
+                          (second.end_ns - std::max(second.begin_ns, first.end_ns));
+    Require(name, "busy union",
+            after.busy_ns - before.busy_ns >= union_ns,
+            "busy time does not cover the union of the timed command buffers");
+    // And no more than the span of every command buffer timed since: a sum of overlapping
+    // intervals would exceed it.
+    uint64_t span_begin = UINT64_MAX;
+    uint64_t span_end = 0;
+    uint32_t span_count = 0;
+    for (const auto &interval : intervals) {
+      if (interval.tick >= ticks[0]) {
+        span_begin = std::min(span_begin, interval.begin_ns);
+        span_end = std::max(span_end, interval.end_ns);
+        span_count++;
+      }
+    }
+    Require(name, "busy bound",
+            span_count == after.command_buffers - before.command_buffers &&
+                after.busy_ns - before.busy_ns <= span_end - span_begin,
+            "busy time exceeds the span of the timed command buffers");
+    const auto flat = static_cast<uint32_t>(GpuRegion::FlatCopy);
+    const auto region_ns = after.region_ns[flat] - before.region_ns[flat];
+    Require(name, "region",
+            region_ns >= min_spin_ns &&
+                region_ns <= second.end_ns - second.begin_ns,
+            "a labelled region was not timed inside its command buffer");
+    std::printf("[host]    %-32s ok (%.3f, %.3f ms; region %.3f ms)\n", name,
+                static_cast<double>(first.end_ns - first.begin_ns) / 1e6,
+                static_cast<double>(second.end_ns - second.begin_ns) / 1e6,
+                static_cast<double>(region_ns) / 1e6);
+  }
+
   void CheckSchedulerTimeline() {
     EnsureRuntimeContext();
     CommandScheduler scheduler(Renderer(), m_runtime_context);
@@ -50354,6 +50461,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--scheduler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckSchedulerTimeline();
+    vulkan.CheckGpuTimestamps();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--host-image-allocation-only") == 0) {
@@ -50968,6 +51076,7 @@ int main(int argc, char **argv) {
   CheckWave64WholeWaveResults();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
+  vulkan.CheckGpuTimestamps();
   vulkan.CheckHostImageAllocation();
   vulkan.CheckDescriptorHeapLargeSet();
   vulkan.CheckGpuMappedRangeLifecycle();

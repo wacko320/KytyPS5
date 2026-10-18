@@ -48,7 +48,8 @@ public:
 	FramePool(WindowContext& window, CommandScheduler& scheduler)
 	    : m_window(window), m_scheduler(scheduler) {}
 	~FramePool() {
-		m_scheduler.Wait(m_scheduler.CurrentTick() - 1);
+		m_scheduler.Wait(m_scheduler.CurrentTick() - 1,
+		                 Common::FrameProfiler::WaitSite::FramePoolTeardown);
 		for (auto& frame: m_frames) {
 			m_window.graphic_ctx.device.destroyImageView(frame->view, nullptr);
 			if (frame->image.image != nullptr) {
@@ -119,7 +120,7 @@ public:
 		frame->busy = true;
 		m_mutex.Unlock();
 
-		m_scheduler.Wait(frame->present_tick);
+		m_scheduler.Wait(frame->present_tick, Common::FrameProfiler::WaitSite::PresentFrameReuse);
 		return frame;
 	}
 
@@ -317,7 +318,7 @@ private:
 struct Presenter::Impl {
 	explicit Impl(WindowContext& owner)
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
-	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
+	      present_scheduler(renderer, owner.graphic_ctx, true), frames(owner, present_scheduler) {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());

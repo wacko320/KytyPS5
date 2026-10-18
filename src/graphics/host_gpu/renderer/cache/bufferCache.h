@@ -97,6 +97,9 @@ public:
 		m_mapped_parts = std::move(parts);
 	}
 	void               RunGarbageCollector();
+	// GPU thread: the registered buffers.
+	[[nodiscard]] uint64_t BufferBytes() const noexcept { return m_buffer_bytes; }
+	[[nodiscard]] size_t   BufferCount() const noexcept { return m_buffers.size(); }
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -161,6 +164,8 @@ private:
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
+	// Bytes of the registered buffers (m_total_used_memory becomes the device's usage).
+	uint64_t                                          m_buffer_bytes       = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;

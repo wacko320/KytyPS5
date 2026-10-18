@@ -4,12 +4,14 @@
 #include "common/common.h"
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/dynamicState.h"
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
 #include <mutex>
 #include <queue>
+#include <source_location>
 #include <thread>
 #include <vector>
 
@@ -17,7 +19,10 @@ namespace Libs::Graphics {
 
 class CommandScheduler {
 public:
-	CommandScheduler(RenderContext& context, GraphicContext& graphics);
+	using WaitSite = Common::FrameProfiler::WaitSite;
+
+	// `present`: the presentation scheduler (its GPU time is counted apart).
+	CommandScheduler(RenderContext& context, GraphicContext& graphics, bool present = false);
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
@@ -26,17 +31,23 @@ public:
 	void           EndRendering();
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
-	void           FlushAndWait();
-	void           Finish();
+	// Each wait takes the frame profiler's site; unlabelled callers are listed by location.
+	void           FlushAndWait(WaitSite             site     = WaitSite::Other,
+	                            std::source_location location = std::source_location::current());
+	void           Finish(WaitSite             site     = WaitSite::Other,
+	                      std::source_location location = std::source_location::current());
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
-	void                      Wait(uint64_t tick);
+	void                      Wait(uint64_t tick, WaitSite site = WaitSite::Other,
+	                               std::source_location location = std::source_location::current());
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
-	void                      WaitPriorityOperations(uint64_t tick);
+	void                      WaitPriorityOperations(
+	                         uint64_t tick, WaitSite site = WaitSite::Other,
+	                         std::source_location location = std::source_location::current());
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
@@ -54,6 +65,8 @@ public:
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] DynamicState&    GetDynamicState() noexcept { return m_dynamic_state; }
+	// GPU execution time of this scheduler's command buffers (labelled regions: Current()).
+	[[nodiscard]] GpuTimestamps&   Timestamps() noexcept { return m_timestamps; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 
@@ -87,6 +100,7 @@ private:
 	};
 
 	void BeginNext();
+	void BeginRecording();
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
@@ -94,6 +108,7 @@ private:
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
+	GpuTimestamps                m_timestamps;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
 	DynamicState                 m_dynamic_state;

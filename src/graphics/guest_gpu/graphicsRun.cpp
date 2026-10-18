@@ -249,7 +249,7 @@ void CommandProcessor::BufferFlush() {
 
 void CommandProcessor::BufferWait() {
 	BufferInit();
-	GetScheduler().Finish();
+	GetScheduler().Finish(Common::FrameProfiler::WaitSite::Pm4BufferWait);
 }
 
 void CommandProcessor::ResetDeCe() {
@@ -1446,7 +1446,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 }
 
 void CommandProcessor::SynchronizeGpu() {
-	GetScheduler().Finish();
+	GetScheduler().Finish(Common::FrameProfiler::WaitSite::Pm4SynchronizeGpu);
 }
 
 bool GuestGpu::IsGpuThread() noexcept {

@@ -2,9 +2,11 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MASTERSEMAPHORE_H_
 
 #include "common/common.h"
+#include "common/waitSite.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <atomic>
+#include <source_location>
 
 namespace Libs::Graphics {
 
@@ -29,7 +31,10 @@ public:
 	[[nodiscard]] vk::Semaphore Handle() const noexcept { return m_semaphore; }
 
 	void Refresh();
-	void Wait(uint64_t tick);
+	// The site labels the wait for the frame profiler; unlabelled callers are listed by location.
+	void Wait(uint64_t                        tick,
+	          Common::FrameProfiler::WaitSite site     = Common::FrameProfiler::WaitSite::Other,
+	          std::source_location            location = std::source_location::current());
 
 private:
 	GraphicContext&       m_graphics;

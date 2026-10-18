@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include "common/assert.h"
+#include "common/frameProfiler.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -93,6 +94,10 @@ static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	GetGpuResources().MapMemory(vaddr, size);
+	if (Common::FrameProfiler::Active()) {
+		Common::FrameProfiler::Add(Common::FrameProfiler::Counter::GpuMapCalls);
+		Common::FrameProfiler::Add(Common::FrameProfiler::Counter::GpuMapBytes, size);
+	}
 }
 
 static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
@@ -101,6 +106,10 @@ static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
 #endif
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return;
+	}
+	if (Common::FrameProfiler::Active()) {
+		Common::FrameProfiler::Add(Common::FrameProfiler::Counter::GpuUnmapCalls);
+		Common::FrameProfiler::Add(Common::FrameProfiler::Counter::GpuUnmapBytes, size);
 	}
 	GetGpuResources().UnmapMemory(vaddr, size);
 }
@@ -4008,6 +4017,18 @@ static int ProtectMemory(const void* addr, size_t len, int prot) {
 		}
 	}
 	g_virtual_ranges->Protect(aligned_addr, aligned_len, prot);
+	if (Common::FrameProfiler::Active() && IsGpuAddressRange(aligned_addr, aligned_len)) {
+		using Common::FrameProfiler::Counter;
+		const bool has_gpu = (prot & (PROT_GPU_READ | PROT_GPU_WRITE)) != 0;
+		for (const auto& old_range: old_ranges) {
+			const bool had_gpu = (old_range.protection & (PROT_GPU_READ | PROT_GPU_WRITE)) != 0;
+			if (had_gpu != has_gpu) {
+				Common::FrameProfiler::Add(
+				    has_gpu ? Counter::GpuProtectAddBytes : Counter::GpuProtectRemoveBytes,
+				    old_range.size);
+			}
+		}
+	}
 
 	LOGF("\t prot: %s -> %s\n", magic_enum::enum_name(old_mode), magic_enum::enum_name(mode));
 

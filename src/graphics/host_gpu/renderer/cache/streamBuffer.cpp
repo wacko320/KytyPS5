@@ -320,9 +320,10 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 		if (!Scheduler().IsFree(watch.tick) && !allow_wait) {
 			return false;
 		}
-		Scheduler().Wait(watch.tick);
+		Scheduler().Wait(watch.tick, Common::FrameProfiler::WaitSite::StreamBufferReuse);
 		if (Usage() == MemoryUsage::Download) {
-			Scheduler().WaitPriorityOperations(watch.tick);
+			Scheduler().WaitPriorityOperations(watch.tick,
+			                                   Common::FrameProfiler::WaitSite::StreamBufferReuse);
 		}
 		wait_bound = watch.upper_bound;
 		++wait_cursor;

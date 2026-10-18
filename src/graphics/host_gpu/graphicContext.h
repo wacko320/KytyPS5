@@ -35,6 +35,8 @@ struct GraphicContext {
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
+	// Vulkan 1.2 hostQueryReset: timestamp pools are reset on the host, not in command buffers.
+	bool                               host_query_reset_enabled              = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
