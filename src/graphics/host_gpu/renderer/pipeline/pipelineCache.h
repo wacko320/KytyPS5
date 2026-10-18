@@ -167,6 +167,8 @@ public:
 	void BeginPrefetchBatch();
 	void FlushPrefetch();
 	[[nodiscard]] ResourcePrefetcher::Stats GetPrefetchStats() const;
+	// Guest programs translated to IR so far: a new shader, a relinked call, a bindless retry.
+	[[nodiscard]] uint64_t TranslationCount() const;
 	// See ResourcePrefetcher::MemoryOps::replay_check: on from the start in debug builds.
 	void SetPrefetchReplayCheck(bool enabled);
 

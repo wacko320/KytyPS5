@@ -682,6 +682,17 @@ struct PipelineCache::ProgramCache {
 		// the plan. Empty when the plan is not speculated.
 		std::vector<std::unique_ptr<ShaderRecompiler::IR::ResourcePlan>> replicas;
 		std::vector<const ShaderRecompiler::IR::ResourcePlan*>           replica_views;
+		// Plans of table-linked programs the call source linked before, by linked-code key: a
+		// table that switches between target sets (one per frame, say) relinks to code it has
+		// translated before, and gets that code's plan back instead of a new translation.
+		struct LinkedPlan {
+			std::vector<uint32_t>                                            key;
+			uint32_t                                                         plan_generation = 0;
+			ShaderRecompiler::IR::ResourcePlan                               plan;
+			std::vector<std::unique_ptr<ShaderRecompiler::IR::ResourcePlan>> replicas;
+		};
+		static constexpr size_t     MaxLinkedPlans = 4;
+		std::vector<LinkedPlan>     linked_plans;
 	};
 
 	// How a stage's MaterializeResources input follows from its registers, learned from the
@@ -695,6 +706,48 @@ struct PipelineCache::ProgramCache {
 		// A GS back half receives its user-data address in s0:s1.
 		bool prefix_is_gs_address = false;
 	};
+
+	// A table-linked entry relinked from `previous_key` to its current code: keeps the plan of
+	// the code it leaves, and takes back the plan of the code it returns to. True when the
+	// entry's plan now belongs to its current code (no translation needed).
+	bool SwapLinkedPlan(SourceEntry& entry, std::vector<uint32_t> previous_key) {
+		const auto key   = entry.FunctionCode();
+		auto&      plans = entry.linked_plans;
+		const auto found = std::ranges::find_if(plans, [&](const SourceEntry::LinkedPlan& plan) {
+			return plan.plan_generation == entry.plan_generation && std::ranges::equal(plan.key, key);
+		});
+		if (found == plans.end() && previous_key.empty()) {
+			return false;
+		}
+		// Prefetch workers may still evaluate the replicas that move.
+		if (prefetcher != nullptr && !entry.replicas.empty()) {
+			prefetcher->ClearAndWait();
+		}
+		entry.replica_views.clear();
+		SourceEntry::LinkedPlan left {.key             = std::move(previous_key),
+		                              .plan_generation = entry.plan_generation,
+		                              .plan            = std::move(entry.resource_plan),
+		                              .replicas        = std::move(entry.replicas)};
+		entry.replicas.clear();
+		const bool restored = found != plans.end();
+		if (restored) {
+			entry.resource_plan = std::move(found->plan);
+			entry.replicas      = std::move(found->replicas);
+			plans.erase(found);
+			entry.resource_plan.source_reads = entry.call_source->reads;
+			for (const auto& replica: entry.replicas) {
+				replica->source_reads = entry.call_source->reads;
+				entry.replica_views.push_back(replica.get());
+			}
+		}
+		if (!left.key.empty()) {
+			if (plans.size() >= SourceEntry::MaxLinkedPlans) {
+				plans.erase(plans.begin());
+			}
+			plans.push_back(std::move(left));
+		}
+		return restored;
+	}
 
 	// After the entry's plan was (re)extracted from `program`: one copy per worker. Workers may
 	// still be evaluating the old copies, so the prefetcher drops and waits for their jobs.
@@ -978,9 +1031,18 @@ struct PipelineCache::ProgramCache {
 				RecordComputeSeed(cached, params, input_info);
 			}
 			if (cached.call_source) {
+				std::vector<uint32_t> previous_key;
+				if (cached.call_source->linked) {
+					const auto key = cached.FunctionCode();
+					previous_key.assign(key.begin(), key.end());
+				}
 				source_changed = cached.RefreshCallSource(runtime);
 				if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 					if (source_changed) BuildSiblingsAhead(cached);
+				}
+				// Code linked before: its plan comes back, and no translation is needed.
+				if (source_changed && SwapLinkedPlan(cached, std::move(previous_key))) {
+					source_changed = false;
 				}
 				if (!source_changed) {
 					// A cached plan's evaluation writes only outputs the next one rewrites: a
@@ -1045,6 +1107,7 @@ struct PipelineCache::ProgramCache {
 		if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
 		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
 		const auto translate = [&]() {
+			++translations;
 			if (entry != programs.end()) options.bindless_image_pcs = entry->second.bindless_pcs;
 			ShaderRecompiler::TranslateResult result;
 			if (current != nullptr) {
@@ -1156,6 +1219,7 @@ struct PipelineCache::ProgramCache {
 	uint64_t next_prefetch_draw = 0;
 	// Declared last: its workers evaluate the plans above, so it stops first.
 	std::unique_ptr<ResourcePrefetcher> prefetcher;
+	uint64_t                            translations = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
@@ -1638,6 +1702,10 @@ void PipelineCache::SetPrefetchReplayCheck(bool enabled) {
 ResourcePrefetcher::Stats PipelineCache::GetPrefetchStats() const {
 	return m_program_cache->prefetcher != nullptr ? m_program_cache->prefetcher->GetStats()
 	                                              : ResourcePrefetcher::Stats {};
+}
+
+uint64_t PipelineCache::TranslationCount() const {
+	return m_program_cache->translations;
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {

@@ -11377,6 +11377,109 @@ public:
   }
 
 
+  void CheckRelinkedCallReusesPlan() {
+    constexpr const char* name = "RelinkedCallReusesPlan";
+    constexpr uintptr_t base = 0x0000000204900000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr auto table = base + 0x100;
+    constexpr auto first = base + 0x1000;
+    constexpr auto second = base + 0x2000;
+    constexpr auto output = base + 0x4000;
+    std::vector<u32> code{
+        EncodeSMovB32(20, InlineU32(0)),
+        0xbeea03ffu, static_cast<u32>(base), 0xbeeb03ffu, static_cast<u32>(base >> 32u),
+        0xf4080135u, 0xfa000000u, 0xbf8cc07fu, 0xf4240382u, 0xfa000020u,
+        0xbf8cc07fu, 0xbf130e80u, 0xbf840004u, 0xf4240402u, 0xfa000028u,
+        0xbf8cc07fu, 0xbe8e210eu, EncodeVop1(0x01, 1, 20),
+        EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(1, 0, 0)};
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "call fixture allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x3, 0x10, physical, size) == 0 && mapped == reinterpret_cast<void*>(base),
+        "call fixture mapping failed");
+    std::memset(mapped, 0, size);
+    const ShaderBufferResource table_desc{{static_cast<u32>(table),
+        static_cast<u32>(table >> 32u) | (16u << 16u), 8, 0x5204u}};
+    LibKernel::Memory::WriteBacking(base, table_desc.fields, sizeof(table_desc.fields));
+    // Two different leaves: each pointer links its own code (a table switching between two
+    // target sets each frame).
+    const std::array leaf{EncodeSMovB32(20, 255), 41u, EncodeSop1(0x21, 125, 14)};
+    const std::array other{EncodeSMovB32(20, 255), 73u, EncodeSop1(0x21, 125, 14)};
+    LibKernel::Memory::WriteBacking(first, leaf.data(), sizeof(leaf));
+    LibKernel::Memory::WriteBacking(second, other.data(), sizeof(other));
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto& cache = context.GetBufferCache();
+      auto& shaders = processor.GetShCtx();
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                           .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 4});
+      ShaderBufferResource out{};
+      out.UpdateAddress48(output);
+      out.fields[2] = 4;
+      out.fields[3] = DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      for (u32 i = 0; i < 4; ++i)
+        shaders.SetCsUserSgpr(i, out.fields[i], HW::UserSgprType::Unknown);
+      // Linking back to code translated before takes its plan back: only the first link of
+      // each leaf translates the program.
+      std::array<uint64_t, 2> ids{};
+      const auto translations = context.GetPipelineCache().TranslationCount();
+      for (const auto address : {first, second, first, second, first}) {
+        const bool is_first = address == first;
+        Require(name, "refresh function pointer", context.InvalidateMemory(table + 0x20, 8),
+                "function table escaped mapped memory");
+        const uint64_t target = address | 3u;
+        LibKernel::Memory::WriteBacking(table + 0x20, &target, sizeof(target));
+        ShaderComputeInputInfo input{};
+        const auto program = context.GetPipelineCache().GetComputeProgram(
+            shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+        auto& id = ids[is_first ? 0 : 1];
+        if (id == 0) id = program.id;
+        Require(name, "permutation per leaf", program.id == id && ids[0] != ids[1],
+                "a relinked leaf did not get its own permutation back");
+        Require(name, "current code dependency",
+                std::ranges::find(input.stage.resources->specialization_reads,
+                    std::pair<uint64_t, uint64_t>{address, sizeof(leaf)}) !=
+                    input.stage.resources->specialization_reads.end(),
+                "a restored plan kept the other leaf's code dependency");
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+        cache.ReadMemory(output, sizeof(u32));
+        u32 actual = 0;
+        Require(name, "leaf execution",
+                LibKernel::Memory::TryReadBacking(output, &actual, sizeof(actual)) &&
+                    actual == (is_first ? 41u : 73u),
+                "the dispatch did not run the leaf its pointer selects");
+      }
+      Require(name, "translations",
+              context.GetPipelineCache().TranslationCount() - translations == 2u,
+              fmt::format("{} translations for two leaves linked five times",
+                          context.GetPipelineCache().TranslationCount() - translations));
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "call fixture release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+
   // Guest memory for the buffer-coherence tests: a fresh RenderContext whose GPU thread runs
   // body(context, processor) with the range mapped. Writes before the body are the CPU's.
   template <typename Before, typename Body>
@@ -57600,6 +57703,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckGpuCommandLane();
     vulkan.CheckScalarLeafCall();
+    vulkan.CheckRelinkedCallReusesPlan();
     CheckAgcSystemTable(vulkan.RuntimeRenderer());
     CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
@@ -58212,6 +58316,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuSuspendPoint();
   vulkan.CheckGpuCommandLane();
   vulkan.CheckScalarLeafCall();
+  vulkan.CheckRelinkedCallReusesPlan();
   vulkan.CheckPartialUnmapSync();
   vulkan.CheckWritebackAfterSplitSubmit(false);
   vulkan.CheckWritebackAfterSplitSubmit(true);
