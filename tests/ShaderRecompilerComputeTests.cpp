@@ -16662,13 +16662,19 @@ public:
         Require(name, "partial native metadata fill",
                 retains_painted_texel(),
                 "a nonuniform metadata allocation cleared the whole target");
+        const auto readbacks_before_refill = texture_cache.GetColorClearStats().readbacks;
         fill_metadata(metadata_words);
+        // GPU-written metadata stays GPU-owned under the GPU fast-clear check, which reads
+        // nothing back: what the refill must not cost is a readback.
+        const bool refill_gpu_owned =
+            resources.GetBufferCache().IsRegionGpuModified(dcc_address, metadata_size);
+        bind();
         if (fill_case.goat) {
-          Require(name, "repeated Goat fill stays CPU-owned",
-                  !resources.GetBufferCache().IsRegionGpuModified(dcc_address, metadata_size),
+          Require(name, "repeated Goat fill needs no readback",
+                  !refill_gpu_owned ||
+                      texture_cache.GetColorClearStats().readbacks == readbacks_before_refill,
                   "re-clearing expanded metadata required another GPU readback");
         }
-        bind();
         Require(name, "complete fill after partial fill",
                 read_texel() == expected,
                 "completing the metadata overwrite did not restore its clear");
