@@ -92,16 +92,13 @@ struct MemoryInfo {
 	}
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
-		if (typed) return false;
-		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
-		if (data_bits == 16u) return !formatted && opcode == ValueOpcode::LoadBufferU16;
+		if (data_bits == 8u) return !formatted && !typed && opcode == ValueOpcode::LoadBufferU8;
+		if (data_bits == 16u) return !formatted && !typed && opcode == ValueOpcode::LoadBufferU16;
+		// Formatted and typed loads decode the format at run time (LoadIndirectFormatted).
 		return data_bits == 32u &&
-		       (formatted ? opcode == ValueOpcode::LoadBufferU32
-		                  : opcode == ValueOpcode::ReadConstBuffer ||
-		                        opcode == ValueOpcode::LoadBufferU32 ||
-		                        opcode == ValueOpcode::LoadBufferU32x2 ||
-		                        opcode == ValueOpcode::LoadBufferU32x3 ||
-		                        opcode == ValueOpcode::LoadBufferU32x4);
+		       ((!formatted && !typed && opcode == ValueOpcode::ReadConstBuffer) ||
+		        opcode == ValueOpcode::LoadBufferU32 || opcode == ValueOpcode::LoadBufferU32x2 ||
+		        opcode == ValueOpcode::LoadBufferU32x3 || opcode == ValueOpcode::LoadBufferU32x4);
 	}
 
 	// Raw DWORD stores through a V# only the GPU knows.

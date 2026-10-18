@@ -31985,7 +31985,8 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.wave_size = wave;
   test.has_compute_info = true;
-  test.required_spirv = {"PhysicalStorageBuffer", "OpLoopMerge", formatted ? "OpSwitch" : "Volatile"};
+  test.required_spirv = {"PhysicalStorageBuffer", "OpLoopMerge",
+                         formatted ? "convert_indirect_buffer_format" : "Volatile"};
   if (!formatted) test.forbidden_spirv = {"convert_indirect_buffer_format",
                                          "indirect_buffer_format_geometry"};
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::V_LSHLREV_B32,
@@ -32018,6 +32019,99 @@ TestCase BufferLoadUbyteGpuSelectedDescriptors() {
 
 TestCase BufferLoadUbyteGpuSelectedDescriptors64() {
   return BufferLoadGpuSelectedDescriptors(64u, ShaderOpcode::BUFFER_LOAD_UBYTE);
+}
+
+// BUFFER_LOAD_FORMAT_XYZW and TBUFFER_LOAD_FORMAT_XYZ through V#s read from memory at a
+// GPU-computed offset: the format (the V#'s, or the instruction's for typed loads) and dst_sel are
+// decoded at run time by the shared conversion functions. Out of range, dst_sel constants still apply and typed loads
+// read 0.
+TestCase IndirectFormattedBufferLoads() {
+  using O = ShaderOpcode;
+  using F = Prospero::BufferFormat;
+  const auto word3 = [](u32 x, u32 y, u32 z, u32 w, F format) {
+    return x | (y << 3u) | (z << 6u) | (w << 9u) | (static_cast<u32>(format) << 12u);
+  };
+  constexpr auto typed_format = static_cast<u32>(F::k16_16Float);
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 31, 80);
+  AppendBufferLoadDword(&code, 30, 31);           // v30 = 0, known only to the GPU
+  code.push_back(EncodeVop1(0x02, 40, Vgpr(30))); // v_readfirstlane_b32 s40, v30
+  for (const auto [sgpr, offset] : {std::pair{41u, 64u}, {42u, 96u}, {43u, 112u}}) {
+    AppendSMovLiteral(&code, sgpr, offset);
+    code.push_back(EncodeSop2(0x00, sgpr, sgpr, 40)); // s_add_u32 sN, offset, s40
+  }
+  for (const auto [sdata, soffset] : {std::pair{20u, 41u}, {24u, 42u}, {28u, 43u}}) {
+    code.push_back(EncodeSmem0(0x0a, sdata, 0)); // s_buffer_load_dwordx4 s[N:N+3], s[0:3], sM
+    code.push_back(EncodeSmem1(0, soffset));
+  }
+  AppendVMovU32(&code, 1, 0);
+  AppendVMovU32(&code, 15, 2);
+  AppendVMovU32(&code, 19, 4);
+  // buffer_load_format_xyzw v[2:5], v1, s[20:23] idxen
+  code.push_back(EncodeMubuf0(0x03, 0, true, false));
+  code.push_back(EncodeMubuf1(2, 5, 1));
+  // buffer_load_format_xyzw v[6:9], v1, s[24:27] idxen
+  code.push_back(EncodeMubuf0(0x03, 0, true, false));
+  code.push_back(EncodeMubuf1(6, 6, 1));
+  // tbuffer_load_format_xyz v[12:14], v1 and v[16:18], v15 (out of range), s[28:31] idxen
+  for (const auto [vdata, vaddr] : {std::pair{12u, 1u}, {16u, 15u}}) {
+    code.push_back(EncodeMtbuf0(0x02, typed_format & 0xfu, typed_format >> 4u, 0, true, false));
+    code.push_back(EncodeMtbuf1(0x02, vdata, 7, vaddr));
+  }
+  // buffer_load_format_xyzw v[20:23], v19 (out of range), s[20:23] idxen
+  code.push_back(EncodeMubuf0(0x03, 0, true, false));
+  code.push_back(EncodeMubuf1(20, 5, 19));
+  for (u32 i = 0; i < 8u; i++) {
+    AppendStoreVgpr(&code, 2 + i, i);
+  }
+  for (const auto [vgpr, word] : {std::pair{12u, 32u}, {13u, 33u}, {14u, 34u},
+                                  {16u, 35u}, {17u, 36u}, {18u, 37u},
+                                  {20u, 38u}, {21u, 39u}, {22u, 40u}, {23u, 41u}}) {
+    AppendStoreVgpr(&code, vgpr, word);
+  }
+  AppendEnd(&code);
+
+  std::vector<u32> initial(80, 0u);
+  // V# at dword 16: 8_8_8_8 unorm at guest 0x100, dst_sel (y, w, 1, x).
+  initial[16] = 0x100u;
+  initial[17] = 4u << 16u;
+  initial[18] = 4u;
+  initial[19] = word3(5, 7, 1, 4, F::k8_8_8_8UNorm);
+  // V# at dword 24: 32_32_32 float at guest 0x110, dst_sel (y, x, z, 1).
+  initial[24] = 0x110u;
+  initial[25] = 12u << 16u;
+  initial[26] = 1u;
+  initial[27] = word3(5, 4, 6, 1, F::k32_32_32Float);
+  // V# at dword 28 for the typed loads: two 4-byte records at guest 0x120.
+  initial[28] = 0x120u;
+  initial[29] = 4u << 16u;
+  initial[30] = 2u;
+  initial[31] = word3(4, 5, 6, 7, F::k32UInt);
+  initial[64] = 0x00ffff00u; // x = 0, y = 1, z = 1, w = 0
+  initial[68] = 0x3fc00000u; // 1.5
+  initial[69] = 0xc0000000u; // -2
+  initial[70] = 0x40500000u; // 3.25
+  initial[72] = 0x3c004000u; // half (2, 1)
+
+  TestCase test;
+  test.name = "IndirectFormattedBufferLoads";
+  test.code = std::move(code);
+  test.initial = initial;
+  test.expected = initial;
+  const std::array<u32, 8> loaded{0x3f800000u, 0u,          0x3f800000u, 0u,
+                                  0xc0000000u, 0x3fc00000u, 0x40500000u, 0x3f800000u};
+  std::copy(loaded.begin(), loaded.end(), test.expected.begin());
+  const std::array<u32, 10> more{0x40000000u, 0x3f800000u, 0u, 0u, 0u, 0u,
+                                 0u, 0u, 0x3f800000u, 0u};
+  std::copy(more.begin(), more.end(), test.expected.begin() + 32);
+  test.opcodes = {O::V_MOV_B32,           O::BUFFER_LOAD_DWORD,   O::V_READFIRSTLANE_B32,
+                  O::S_MOV_B32,           O::S_ADD_U32,           O::S_BUFFER_LOAD_DWORDX4,
+                  O::BUFFER_LOAD_FORMAT_XYZW, O::TBUFFER_LOAD_FORMAT_XYZ,
+                  O::BUFFER_STORE_DWORD,  O::S_ENDPGM};
+  test.bda_mappings = {{0, 0}};
+  test.required_spirv = {"convert_indirect_buffer_format"};
+  return test;
 }
 
 void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
@@ -38548,8 +38642,9 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
         std::vector<u32> stores;
         u32 bda_function = 0, conversion_function = 0, geometry_function = 0, function = 0;
         u32 bda_calls = 0, conversion_calls = 0, conversion_definitions = 0;
-        u32 geometry_calls = 0, geometry_definitions = 0, geometry_switches = 0;
-        bool geometry_pure = true, geometry_cases = true;
+        u32 geometry_calls = 0, geometry_definitions = 0, format_switches = 0;
+        bool geometry_pure = true;
+        u32 format_locals = 0;
         for (size_t offset = 5; offset < compiled.spirv.size();) {
           const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
           const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
@@ -38567,20 +38662,14 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
             conversion_definitions += function == conversion_function;
             geometry_definitions += function == geometry_function;
           }
-          if (function == geometry_function && function != 0u) {
-            geometry_pure &= opcode != spv::OpLoad && opcode != spv::OpStore &&
-                             opcode != spv::OpFunctionCall;
-            if (opcode == spv::OpSwitch) {
-              ++geometry_switches;
-              constexpr u32 formats = u32(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
-              geometry_cases &= words.size() == 3u + 2u * formats;
-              if (words.size() == 3u + 2u * formats) {
-                geometry_cases &= words[2] == words[4]; // Invalid formats use format zero.
-                for (u32 format = 0; format < formats; ++format)
-                  geometry_cases &= words[3u + 2u * format] == format;
-              }
-            }
+          // Both format functions read a constant table: no switch over the formats.
+          if (function != 0u && (function == geometry_function || function == conversion_function)) {
+            format_switches += opcode == spv::OpSwitch;
+            // Their tables are module-scope: a local table is copied into every inlined call.
+            format_locals += opcode == spv::OpVariable;
           }
+          if (function == geometry_function && function != 0u)
+            geometry_pure &= opcode != spv::OpStore && opcode != spv::OpFunctionCall;
           if (opcode == spv::OpFunctionCall) {
             if (words[3] == bda_function) ++bda_calls;
             if (words[3] == conversion_function) ++conversion_calls;
@@ -38595,8 +38684,10 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
                 "formatted loads must call one conversion function across virtual halves");
         Require(test.name, "one shared pure format geometry",
                 geometry_definitions == 1u && geometry_calls == conversion_calls &&
-                    geometry_switches == 1u && geometry_cases && geometry_pure,
-                "format geometry duplicated, lost a format/default or acquired memory accesses");
+                    format_switches == 0u && geometry_pure,
+                "format geometry duplicated, switched over formats or acquired stores or calls");
+        Require(test.name, "module-scope format tables", format_locals == 0u,
+                "a format function declares a local table, copied into every call site");
         Require(test.name, "one shared indirect store per virtual half",
                 std::ranges::count_if(stores, [&](u32 pointer) { return nonuniform.contains(pointer); }) ==
                     (wave > vulkan.SubgroupSize() ? 2 : 1),
@@ -43256,6 +43347,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadUshortGpuSelectedDescriptors64);
   AddCase(BufferLoadUbyteGpuSelectedDescriptors);
   AddCase(BufferLoadUbyteGpuSelectedDescriptors64);
+  AddCase(IndirectFormattedBufferLoads);
   AddCase(BufferStoresGpuSelectedDescriptor);
   AddCase(BufferStoreDwordx4DropsOnlyOutOfBoundsTail);
   AddCase(BufferLoadFormatXyzwRejectsPartialRecord);

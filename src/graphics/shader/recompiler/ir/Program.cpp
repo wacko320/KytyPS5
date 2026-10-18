@@ -484,7 +484,7 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				    !(program.untracked_writes && (memory.SupportsIndirectBufferStore(inst.GetOpcode()) ||
 				                                   memory.SupportsIndirectBufferAtomic(inst.GetOpcode())))) {
 					return Fail("indirect buffer requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, "
-					            "or formatted X load");
+					            "or formatted or typed load");
 				}
 				const auto access = BufferAccessOf(inst.GetOpcode());
 				const bool packed_formatted =

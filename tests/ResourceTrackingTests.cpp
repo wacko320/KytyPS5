@@ -4808,6 +4808,34 @@ void TestDenseBufferTracking() {
              "resource tracking allowed a second mutation pass");
 }
 
+// A written buffer whose V# the host knows except a GPU-computed NUM_RECORDS binds as a tracked
+// buffer with DynamicExtentRecords records, not as a GPU-selected (untracked) one, when untracked
+// writes are accepted. Without them it stays fatal (TestBoundedRelativeRegisterWrites).
+void TestDynamicExtentBufferWrite() {
+  Fixture fixture;
+  // A count the host cannot evaluate (here the workgroup ID stands in for a GPU-computed one).
+  const auto count = fixture.Emit(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(0u)});
+  MemoryInfo raw;
+  raw.kind = ResourceKind::Buffer;
+  const auto list = fixture.Buffer(
+      {fixture.UserData(4), fixture.UserData(5), count, fixture.UserData(7)}, 8);
+  const auto store = fixture.AddMemory(raw, 12);
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+               {list, Value(0u), Value(0u), Value(0u), Value(7u), Value(true)},
+               store);
+  fixture.program.untracked_writes = true;
+  fixture.PlanAndTrack();
+  const auto &program = fixture.program;
+  Check(program.memory_info[store.index].kind == ResourceKind::Buffer &&
+            program.info.buffers.size() == 1u && !program.has_address_writes,
+        "a GPU-sized written buffer was not bound as a tracked buffer");
+  const auto &source = program.descriptor_sources[program.info.buffers[0].source];
+  Check(source.dwords[2].IsImmediate() && source.dwords[2].U32() == DynamicExtentRecords,
+        "a GPU-sized written buffer did not bind DynamicExtentRecords records");
+}
+
 void TestScalarAndVectorBufferAlias() {
   Fixture fixture;
   const auto d0 = fixture.UserData(0);
@@ -8284,6 +8312,7 @@ int main() {
     };
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
+    Run("dynamic extent buffer write", TestDynamicExtentBufferWrite);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);

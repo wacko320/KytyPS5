@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <bit>
+#include <cinttypes>
+#include <cstdio>
 #include <fmt/format.h>
 #include <map>
 #include <numeric>
@@ -3698,6 +3700,32 @@ private:
 		return true;
 	}
 
+	// A written buffer whose V# the host knows except NUM_RECORDS, such as a list sized by a
+	// GPU-computed count, binds with DynamicExtentRecords records instead. Writes between the real
+	// count and that bound are not discarded; shaders that size a list this way normally bound
+	// their writes by the same count. The binding still tells the host the written range, unlike
+	// the GPU-selected store below, so it is tried first. Part of untracked_writes: the bound is a
+	// guess, not the V#'s.
+	bool TryDynamicExtentBuffer(const Inst& handle, uint32_t base_reg, uint32_t pc,
+	                            uint32_t& source) {
+		DescriptorSource descriptor;
+		MakeSource(handle, 4, false, false, base_reg, descriptor, pc);
+		uint32_t bad_dword = 0;
+		if (ValidateSource(descriptor, bad_dword) || bad_dword != 2u) {
+			return false;
+		}
+		descriptor.dwords[2] = Value(DynamicExtentRecords);
+		if (!ValidateSource(descriptor, bad_dword)) {
+			return false;
+		}
+		source = InternSource(descriptor);
+		std::fprintf(stderr,
+		             "Warning: shader 0x%016" PRIx64 " pc 0x%08x writes a buffer sized on the GPU; "
+		             "binding %u records\n",
+		             m_program.shader_hash, pc, DynamicExtentRecords);
+		return true;
+	}
+
 	void ValidateAddressHandle(Value value, uint32_t pc) const {
 		const auto* handle = value.Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource) {
@@ -3892,7 +3920,10 @@ private:
 			if (indirect != nullptr) {
 				source = indirect->source;
 			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
-			               memory.resource * 4u, handle, source)) {
+			               memory.resource * 4u, handle, source) &&
+			           !(m_program.untracked_writes && buffer != BufferAccess::Read &&
+			             memory.kind == ResourceKind::Buffer &&
+			             TryDynamicExtentBuffer(*handle, memory.resource * 4u, flags.pc, source))) {
 				// A store or atomic through a V# the host cannot evaluate goes through the BDA
 				// page table; the host does not track the pages it writes.
 				if (m_program.untracked_writes && buffer != BufferAccess::Read &&
@@ -3908,7 +3939,7 @@ private:
 				    !memory.SupportsIndirectBufferLoad(op)) {
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X load");
+					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted or typed load");
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_info.uses_dma                         = true;
